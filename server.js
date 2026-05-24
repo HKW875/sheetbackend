@@ -77,11 +77,7 @@ app.get('/', (req, res) => {
 // ================================================================
 // DATABASE
 // ================================================================
-mongoose.connect(process.env.MONGO_URI || 'mongodb://localhost:27017/sheetforge', {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-  serverSelectionTimeoutMS: 10000, // 10s timeout
-})
+mongoose.connect(process.env.MONGO_URI)
 .then(async () => {
   console.log('✅ MongoDB connected');
   await seedProviders();
