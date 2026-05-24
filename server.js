@@ -36,11 +36,11 @@ const PORT = process.env.PORT || 5000;
 // MIDDLEWARE
 // ================================================================
 app.use(helmet({ contentSecurityPolicy: false }));
-app.use(cors({ origin: process.env.CLIENT_URL || 'https://sheetbackend-9rpx.onrender.com', credentials: true }));
+app.use(cors({ origin: process.env.CLIENT_URL || 'http://localhost:3000', credentials: true }));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 app.use(morgan('dev'));
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(__dirname));
 
 // Serve the main HTML SPA
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
@@ -51,8 +51,10 @@ app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
 mongoose.connect(process.env.MONGO_URI || 'mongodb://localhost:27017/sheetforge', {
   useNewUrlParser: true,
   useUnifiedTopology: true,
-}).then(() => console.log('✅  MongoDB connected'))
-  .catch(err => console.error('❌  MongoDB error:', err.message));
+}).then(async () => {
+  console.log('✅  MongoDB connected');
+  await seedProviders();
+}).catch(err => console.error('❌  MongoDB error:', err.message));
 
 // ================================================================
 // CLOUDINARY CONFIG
@@ -879,11 +881,10 @@ app.use((req, res) => res.status(404).json({ error: 'Route not found' }));
 // ================================================================
 // START
 // ================================================================
-app.listen(PORT, async () => {
+app.listen(PORT, () => {
   console.log(`\n🚀  SheetForge server running at http://localhost:${PORT}`);
   console.log(`📁  Static files served from: ${__dirname}`);
   console.log(`🔑  JWT Secret: ${process.env.JWT_SECRET ? 'Set via env' : 'Using default (set JWT_SECRET in .env for production)'}`);
-  await seedProviders();
 });
 
 module.exports = app;
