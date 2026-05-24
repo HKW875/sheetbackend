@@ -42,15 +42,36 @@ app.use((req, res, next) => {
 // MIDDLEWARE
 // ================================================================
 app.use(helmet({ contentSecurityPolicy: false }));
-app.use(cors({ origin: process.env.CLIENT_URL || 'https://sheetfg.hkw875.workers.dev/', credentials: true }));
+
+// CORS — supports comma-separated CLIENT_URL env var for multiple origins
+const allowedOrigins = (process.env.CLIENT_URL || '')
+  .split(',')
+  .map(o => o.trim())
+  .filter(Boolean);
+
+app.use(cors({
+  origin: function(origin, callback) {
+    // Allow requests with no origin (same-origin, Postman, curl)
+    if (!origin) return callback(null, true);
+    // Allow any origin if none configured (dev mode)
+    if (allowedOrigins.length === 0) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    callback(new Error(`CORS: Origin ${origin} not allowed`));
+  },
+  credentials: true,
+}));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 app.use(morgan('dev'));
 
-// Serve the main HTML SPA
+// Serve index.html from disk if it exists alongside server.js
 app.get('/', (req, res) => {
-  res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  res.send(INDEX_HTML);
+  const htmlPath = path.join(__dirname, 'index.html');
+  if (fs.existsSync(htmlPath)) {
+    res.sendFile(htmlPath);
+  } else {
+    res.json({ status: 'SheetForge API running', version: '1.0.0' });
+  }
 });
 
 // ================================================================
@@ -59,6 +80,7 @@ app.get('/', (req, res) => {
 mongoose.connect(process.env.MONGO_URI || 'mongodb://localhost:27017/sheetforge', {
   useNewUrlParser: true,
   useUnifiedTopology: true,
+  serverSelectionTimeoutMS: 10000, // 10s timeout
 })
 .then(async () => {
   console.log('✅ MongoDB connected');
@@ -66,9 +88,10 @@ mongoose.connect(process.env.MONGO_URI || 'mongodb://localhost:27017/sheetforge'
 })
 .catch(err => {
   console.error('❌ MongoDB connection failed:', err.message);
-  console.error('→ If using local MongoDB, ensure mongodb is running');
-  console.error('→ If using Atlas, check your MONGO_URI in .env');
-  process.exit(1); // Fail fast so you know immediately
+  console.error('→ If using local MongoDB, ensure mongod is running: sudo systemctl start mongod');
+  console.error('→ If using Atlas, check MONGO_URI in your .env file');
+  // Exit so container restarts and retries rather than silently failing
+  process.exit(1);
 });
 
 // ================================================================
@@ -451,6 +474,9 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 app.get('/api/auth/me', protect, (req, res) => res.json({ user: req.user }));
+
+// Logout (client should discard the token; this endpoint is for completeness)
+app.post('/api/auth/logout', (req, res) => res.json({ message: 'Logged out successfully' }));
 
 // ================================================================
 // ROUTES — DESIGNS
