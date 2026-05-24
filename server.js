@@ -49,7 +49,7 @@ const allowedOrigins = (process.env.CLIENT_URL || '')
   .map(o => o.trim())
   .filter(Boolean);
 
-app.use(cors({
+const corsOptions = {
   origin: function(origin, callback) {
     // Allow requests with no origin (same-origin, Postman, curl)
     if (!origin) return callback(null, true);
@@ -59,7 +59,13 @@ app.use(cors({
     callback(new Error(`CORS: Origin ${origin} not allowed`));
   },
   credentials: true,
-}));
+  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization'],
+};
+
+// Handle OPTIONS preflight for ALL routes before any other middleware
+app.options('*', cors(corsOptions));
+app.use(cors(corsOptions));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 app.use(morgan('dev'));
@@ -77,18 +83,35 @@ app.get('/', (req, res) => {
 // ================================================================
 // DATABASE
 // ================================================================
-mongoose.connect(process.env.MONGO_URI)
-.then(async () => {
-  console.log('✅ MongoDB connected');
-  await seedProviders();
-})
-.catch(err => {
-  console.error('❌ MongoDB connection failed:', err.message);
-  console.error('→ If using local MongoDB, ensure mongod is running: sudo systemctl start mongod');
-  console.error('→ If using Atlas, check MONGO_URI in your .env file');
-  // Exit so container restarts and retries rather than silently failing
-  process.exit(1);
-});
+// Track DB readiness — routes that need DB will return 503 until connected
+let dbReady = false;
+
+if (!process.env.MONGO_URI) {
+  console.error('❌ MONGO_URI is not set. Check your .env file or Render environment variables.');
+} else {
+  mongoose.connect(process.env.MONGO_URI)
+    .then(async () => {
+      console.log('✅ MongoDB connected');
+      dbReady = true;
+      await seedProviders();
+    })
+    .catch(err => {
+      console.error('❌ MongoDB connection failed:', err.message);
+      console.error('→ If using Atlas, check MONGO_URI in your Render environment variables.');
+      console.error('→ Ensure your Atlas cluster Network Access allows connections from 0.0.0.0/0 (Render IPs).');
+      // Server stays alive so CORS preflight and health checks still respond
+    });
+}
+
+// Middleware: reject DB-dependent requests when MongoDB is not connected
+const requireDB = (req, res, next) => {
+  if (!dbReady) {
+    return res.status(503).json({
+      error: 'Database not connected. Check MONGO_URI in your Render environment variables.',
+    });
+  }
+  next();
+};
 
 // ================================================================
 // CLOUDINARY CONFIG
@@ -422,7 +445,7 @@ const generateDWGPreview = async (analysis, material, thickness) => {
 // ================================================================
 // ROUTES — AUTH
 // ================================================================
-app.post('/api/auth/register', async (req, res) => {
+app.post('/api/auth/register', requireDB, async (req, res) => {
   try {
     const { firstName, lastName, email, password, role, company, country } = req.body;
     if (!firstName || !lastName || !email || !password)
@@ -442,7 +465,7 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', requireDB, async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
@@ -469,7 +492,7 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-app.get('/api/auth/me', protect, (req, res) => res.json({ user: req.user }));
+app.get('/api/auth/me', requireDB, protect, (req, res) => res.json({ user: req.user }));
 
 // Logout (client should discard the token; this endpoint is for completeness)
 app.post('/api/auth/logout', (req, res) => res.json({ message: 'Logged out successfully' }));
@@ -479,7 +502,7 @@ app.post('/api/auth/logout', (req, res) => res.json({ message: 'Logged out succe
 // ================================================================
 
 // Upload a rough design file
-app.post('/api/designs/upload', protect, upload.single('file'), async (req, res) => {
+app.post('/api/designs/upload', requireDB, protect, upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
   try {
     const { partName, material, thickness, notes } = req.body;
@@ -505,7 +528,7 @@ app.post('/api/designs/upload', protect, upload.single('file'), async (req, res)
 });
 
 // Get all designs for current user
-app.get('/api/designs', protect, async (req, res) => {
+app.get('/api/designs', requireDB, protect, async (req, res) => {
   try {
     const { status, search, sort = '-createdAt', limit = 20, page = 1 } = req.query;
     const query = { owner: req.user._id };
@@ -525,7 +548,7 @@ app.get('/api/designs', protect, async (req, res) => {
 });
 
 // Get single design
-app.get('/api/designs/:id', protect, async (req, res) => {
+app.get('/api/designs/:id', requireDB, protect, async (req, res) => {
   try {
     const design = await Design.findOne({ _id: req.params.id, owner: req.user._id });
     if (!design) return res.status(404).json({ error: 'Design not found' });
@@ -536,7 +559,7 @@ app.get('/api/designs/:id', protect, async (req, res) => {
 });
 
 // Update design metadata
-app.patch('/api/designs/:id', protect, async (req, res) => {
+app.patch('/api/designs/:id', requireDB, protect, async (req, res) => {
   try {
     const allowed = ['partName', 'material', 'thickness', 'notes'];
     const updates = {};
@@ -553,7 +576,7 @@ app.patch('/api/designs/:id', protect, async (req, res) => {
 });
 
 // Approve a DWG
-app.patch('/api/designs/:id/approve', protect, async (req, res) => {
+app.patch('/api/designs/:id/approve', requireDB, protect, async (req, res) => {
   try {
     const design = await Design.findOneAndUpdate(
       { _id: req.params.id, owner: req.user._id, status: 'ready' },
@@ -568,7 +591,7 @@ app.patch('/api/designs/:id/approve', protect, async (req, res) => {
 });
 
 // Delete design
-app.delete('/api/designs/:id', protect, async (req, res) => {
+app.delete('/api/designs/:id', requireDB, protect, async (req, res) => {
   try {
     const design = await Design.findOne({ _id: req.params.id, owner: req.user._id });
     if (!design) return res.status(404).json({ error: 'Design not found' });
@@ -591,7 +614,7 @@ app.delete('/api/designs/:id', protect, async (req, res) => {
 // ================================================================
 
 // Trigger AI analysis + DWG conversion for a design
-app.post('/api/convert/:id', protect, async (req, res) => {
+app.post('/api/convert/:id', requireDB, protect, async (req, res) => {
   let design;
   try {
     design = await Design.findOne({ _id: req.params.id, owner: req.user._id });
@@ -632,7 +655,7 @@ app.post('/api/convert/:id', protect, async (req, res) => {
 });
 
 // Get conversion status (polling endpoint)
-app.get('/api/convert/:id/status', protect, async (req, res) => {
+app.get('/api/convert/:id/status', requireDB, protect, async (req, res) => {
   try {
     const design = await Design.findOne({ _id: req.params.id, owner: req.user._id }).lean();
     if (!design) return res.status(404).json({ error: 'Not found' });
@@ -643,7 +666,7 @@ app.get('/api/convert/:id/status', protect, async (req, res) => {
 });
 
 // Serve DWG preview PNG for viewer
-app.get('/api/designs/:id/preview', protect, async (req, res) => {
+app.get('/api/designs/:id/preview', requireDB, protect, async (req, res) => {
   try {
     const design = await Design.findOne({ _id: req.params.id, owner: req.user._id });
     if (!design?.dwg?.path) return res.status(404).json({ error: 'Preview not available' });
@@ -657,7 +680,7 @@ app.get('/api/designs/:id/preview', protect, async (req, res) => {
 // ================================================================
 // ROUTES — CLOUDINARY SAVE
 // ================================================================
-app.post('/api/cloud/save/:id', protect, async (req, res) => {
+app.post('/api/cloud/save/:id', requireDB, protect, async (req, res) => {
   try {
     const design = await Design.findOne({ _id: req.params.id, owner: req.user._id });
     if (!design) return res.status(404).json({ error: 'Design not found' });
@@ -708,7 +731,7 @@ app.post('/api/cloud/save/:id', protect, async (req, res) => {
 });
 
 // List all cloud-saved assets for user
-app.get('/api/cloud/assets', protect, async (req, res) => {
+app.get('/api/cloud/assets', requireDB, protect, async (req, res) => {
   try {
     const designs = await Design.find({
       owner  : req.user._id,
@@ -724,7 +747,7 @@ app.get('/api/cloud/assets', protect, async (req, res) => {
 // ================================================================
 // ROUTES — QUOTES
 // ================================================================
-app.post('/api/quotes', protect, async (req, res) => {
+app.post('/api/quotes', requireDB, protect, async (req, res) => {
   try {
     const { designId, specs } = req.body;
     if (!designId) return res.status(400).json({ error: 'designId is required' });
@@ -766,7 +789,7 @@ app.post('/api/quotes', protect, async (req, res) => {
   }
 });
 
-app.get('/api/quotes', protect, async (req, res) => {
+app.get('/api/quotes', requireDB, protect, async (req, res) => {
   try {
     const quotes = await Quote.find({ requester: req.user._id })
       .populate('design', 'partName material')
@@ -779,7 +802,7 @@ app.get('/api/quotes', protect, async (req, res) => {
   }
 });
 
-app.get('/api/quotes/:id', protect, async (req, res) => {
+app.get('/api/quotes/:id', requireDB, protect, async (req, res) => {
   try {
     const quote = await Quote.findOne({ _id: req.params.id, requester: req.user._id })
       .populate('design')
@@ -794,7 +817,7 @@ app.get('/api/quotes/:id', protect, async (req, res) => {
 // ================================================================
 // ROUTES — PROVIDERS
 // ================================================================
-app.get('/api/providers', async (req, res) => {
+app.get('/api/providers', requireDB, async (req, res) => {
   try {
     const { region, material, sort = '-rating', limit = 20 } = req.query;
     const query = { isActive: true };
@@ -807,7 +830,7 @@ app.get('/api/providers', async (req, res) => {
   }
 });
 
-app.get('/api/providers/:id', async (req, res) => {
+app.get('/api/providers/:id', requireDB, async (req, res) => {
   try {
     const provider = await Provider.findById(req.params.id).lean();
     if (!provider) return res.status(404).json({ error: 'Provider not found' });
@@ -818,7 +841,7 @@ app.get('/api/providers/:id', async (req, res) => {
 });
 
 // Register as a CNC provider
-app.post('/api/providers', protect, restrictTo('provider', 'admin'), async (req, res) => {
+app.post('/api/providers', requireDB, protect, restrictTo('provider', 'admin'), async (req, res) => {
   try {
     const provider = await Provider.create({ ...req.body, user: req.user._id });
     res.status(201).json({ provider });
@@ -830,7 +853,7 @@ app.post('/api/providers', protect, restrictTo('provider', 'admin'), async (req,
 // ================================================================
 // ROUTES — ORDERS
 // ================================================================
-app.post('/api/orders', protect, async (req, res) => {
+app.post('/api/orders', requireDB, protect, async (req, res) => {
   try {
     const { designId, providerId, quoteId, specs, pricing } = req.body;
     const order = await Order.create({
@@ -853,7 +876,7 @@ app.post('/api/orders', protect, async (req, res) => {
   }
 });
 
-app.get('/api/orders', protect, async (req, res) => {
+app.get('/api/orders', requireDB, protect, async (req, res) => {
   try {
     const { status } = req.query;
     const query = { buyer: req.user._id };
@@ -869,7 +892,7 @@ app.get('/api/orders', protect, async (req, res) => {
   }
 });
 
-app.patch('/api/orders/:id/status', protect, async (req, res) => {
+app.patch('/api/orders/:id/status', requireDB, protect, async (req, res) => {
   try {
     const { status, note } = req.body;
     const order = await Order.findOne({ _id: req.params.id, buyer: req.user._id });
