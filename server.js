@@ -385,7 +385,7 @@ const cleanupFile = async (filePath) => {
 // REAL CV + AI PIPELINE — imports
 // ================================================================
 const Anthropic   = require('@anthropic-ai/sdk');
-const DxfWriter   = require('@tarikjabiri/dxf').DxfWriter;  // real DXF writer
+const { DxfWriter } = require('@tarikjabiri/dxf');  // AutoCAD DXF R2000 writer (v2 stable)
 
 const anthropicClient = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -1416,7 +1416,7 @@ async function seedProviders() {
 // ERROR HANDLING
 // ================================================================
 app.use((err, req, res, next) => {
-  if (err instanceof multer.MulterError) {
+  if (err instanceof multer.MulterError || err?.code?.startsWith('LIMIT_')) {
     if (err.code === 'LIMIT_FILE_SIZE')
       return res.status(400).json({ error: 'File too large. Maximum size is 50MB.' });
   }
