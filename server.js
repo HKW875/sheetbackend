@@ -59,10 +59,17 @@ app.get('/', (req, res) => {
 mongoose.connect(process.env.MONGO_URI || 'mongodb://localhost:27017/sheetforge', {
   useNewUrlParser: true,
   useUnifiedTopology: true,
-}).then(async () => {
-  console.log('✅  MongoDB connected');
+})
+.then(async () => {
+  console.log('✅ MongoDB connected');
   await seedProviders();
-}).catch(err => console.error('❌  MongoDB error:', err.message));
+})
+.catch(err => {
+  console.error('❌ MongoDB connection failed:', err.message);
+  console.error('→ If using local MongoDB, ensure mongod is running');
+  console.error('→ If using Atlas, check your MONGO_URI in .env');
+  process.exit(1); // Fail fast so you know immediately
+});
 
 // ================================================================
 // CLOUDINARY CONFIG
