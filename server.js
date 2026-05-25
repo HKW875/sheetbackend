@@ -3,7 +3,7 @@
 // ─── SheetForge — server.js ───────────────────────────────────────────────────
 // Single-file Express backend. No TypeScript, no build step.
 // Run:  node server.js
-// Env:  DATABASE_URL, JWT_SECRET (optional), PORT (optional),
+// Env:  MONGO_URI (required), JWT_SECRET (optional), PORT (optional),
 //       CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET (optional)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -12,186 +12,179 @@ const cors       = require("cors");
 const multer     = require("multer");
 const bcrypt     = require("bcryptjs");
 const jwt        = require("jsonwebtoken");
-const { Pool }   = require("pg");
+const mongoose   = require("mongoose");
 const { v4: uuidv4 } = require("uuid");
 const { spawn }  = require("child_process");
 const path       = require("path");
 const fs         = require("fs");
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const PORT       = process.env.PORT || 3000;
+const PORT       = process.env.PORT     || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || "sheetforge_jwt_secret_2026";
-const BASE_PATH  = process.env.BASE_PATH || "/api";
+const BASE_PATH  = process.env.BASE_PATH  || "/api";
+const MONGO_URI  = process.env.MONGO_URI  || "mongodb://127.0.0.1:27017/sheetforge";
 
-// ── Database ──────────────────────────────────────────────────────────────────
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+// ── Mongoose Schemas & Models ─────────────────────────────────────────────────
+const { Schema, model, Types } = mongoose;
 
-async function query(sql, params) {
-  const client = await pool.connect();
-  try {
-    return await client.query(sql, params);
-  } finally {
-    client.release();
-  }
-}
+const UserSchema = new Schema({
+  firstName:  { type: String, required: true },
+  lastName:   { type: String, required: true },
+  email:      { type: String, required: true, unique: true, lowercase: true },
+  password:   { type: String, required: true },
+  role:       { type: String, default: "designer" },
+  company:    String,
+  country:    String,
+  isVerified: { type: Boolean, default: false },
+}, { timestamps: true });
 
-// Create tables if they do not exist
+const DesignSchema = new Schema({
+  ownerId:   { type: Schema.Types.ObjectId, ref: "User", required: true },
+  partName:  { type: String, required: true },
+  status:    { type: String, default: "uploaded" },
+  material:  String,
+  thickness: Number,
+  notes:     String,
+  originalFile: {
+    filename:  String,
+    mimetype:  String,
+    size:      Number,
+    localPath: String,
+    url:       String,
+  },
+  aiAnalysis: {
+    edges:        Number,
+    bendLines:    Number,
+    holes:        Number,
+    holesDiameter:Number,
+    slots:        Number,
+    cutouts:      Number,
+    width:        Number,
+    height:       Number,
+    thickness:    Number,
+    profileType:  String,
+    tolerance:    String,
+    confidence:   Number,
+    rawText:      String,
+    notes:        String,
+    completedAt:  Date,
+  },
+  dwg: {
+    filename:    String,
+    previewUrl:  String,
+    dxfUrl:      String,
+    svgUrl:      String,
+    entities:    Number,
+    fileSize:    Number,
+    generatedAt: Date,
+  },
+  cloudinary: {
+    publicId:   String,
+    url:        String,
+    uploadedAt: Date,
+  },
+  approvedAt: Date,
+}, { timestamps: true });
+
+const ProviderSchema = new Schema({
+  companyName:    { type: String, required: true },
+  country:        String,
+  region:         String,
+  flag:           String,
+  specialty:      String,
+  capacity:       String,
+  certifications: { type: [String], default: [] },
+  leadTimeDays:   { min: { type: Number, default: 5 }, max: { type: Number, default: 14 } },
+  rating:         { type: Number, default: 4.5 },
+  totalReviews:   { type: Number, default: 0 },
+  totalOrders:    { type: Number, default: 0 },
+  materials:      { type: [String], default: [] },
+  operations:     { type: [String], default: [] },
+  pricingBase:    { type: Number, default: 100 },
+  isVerified:     { type: Boolean, default: false },
+  isActive:       { type: Boolean, default: true },
+}, { timestamps: true });
+
+const QuoteSchema = new Schema({
+  designId:     { type: Schema.Types.ObjectId, ref: "Design", required: true },
+  requesterId:  { type: Schema.Types.ObjectId, ref: "User",   required: true },
+  status:       { type: String, default: "open" },
+  specs: {
+    length:     Number,
+    width:      Number,
+    thickness:  Number,
+    quantity:   { type: Number, default: 1 },
+    material:   String,
+    operations: { type: [String], default: [] },
+    finish:     String,
+    leadTime:   Number,
+    notes:      String,
+  },
+  bids:      { type: Array, default: [] },
+  expiresAt: Date,
+}, { timestamps: true });
+
+const OrderSchema = new Schema({
+  orderNumber:  { type: String, required: true },
+  buyerId:      { type: Schema.Types.ObjectId, ref: "User" },
+  providerId:   { type: Schema.Types.ObjectId, ref: "Provider" },
+  designId:     { type: Schema.Types.ObjectId, ref: "Design" },
+  quoteId:      { type: Schema.Types.ObjectId, ref: "Quote" },
+  status:       { type: String, default: "confirmed" },
+  specs: {
+    quantity:   Number,
+    material:   String,
+    thickness:  Number,
+    operations: { type: [String], default: [] },
+    finish:     String,
+  },
+  pricing: {
+    unitPrice: Number,
+    quantity:  Number,
+    subtotal:  Number,
+    shipping:  Number,
+    total:     Number,
+    currency:  { type: String, default: "USD" },
+  },
+  tracking: {
+    carrier:    String,
+    trackingNo: String,
+    url:        String,
+  },
+  timeline:          { type: Array, default: [] },
+  estimatedDelivery: Date,
+}, { timestamps: true });
+
+const User     = model("User",     UserSchema);
+const Design   = model("Design",   DesignSchema);
+const Provider = model("Provider", ProviderSchema);
+const Quote    = model("Quote",    QuoteSchema);
+const Order    = model("Order",    OrderSchema);
+
+// ── DB init & seed ────────────────────────────────────────────────────────────
 async function initDb() {
-  await query(`
-    CREATE TABLE IF NOT EXISTS users (
-      id          SERIAL PRIMARY KEY,
-      first_name  TEXT NOT NULL,
-      last_name   TEXT NOT NULL,
-      email       TEXT UNIQUE NOT NULL,
-      password    TEXT NOT NULL,
-      role        TEXT NOT NULL DEFAULT 'designer',
-      company     TEXT,
-      country     TEXT,
-      is_verified BOOLEAN DEFAULT false,
-      created_at  TIMESTAMPTZ DEFAULT NOW(),
-      updated_at  TIMESTAMPTZ DEFAULT NOW()
-    );
+  await mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 10000 });
+  console.log("MongoDB connected.");
 
-    CREATE TABLE IF NOT EXISTS designs (
-      id                      SERIAL PRIMARY KEY,
-      owner_id                INTEGER REFERENCES users(id) ON DELETE CASCADE,
-      part_name               TEXT NOT NULL,
-      status                  TEXT NOT NULL DEFAULT 'uploaded',
-      material                TEXT,
-      thickness               NUMERIC,
-      notes                   TEXT,
-      original_filename       TEXT,
-      original_mimetype       TEXT,
-      original_size           INTEGER,
-      original_local_path     TEXT,
-      original_url            TEXT,
-      ai_edges                INTEGER,
-      ai_bend_lines           INTEGER,
-      ai_holes                INTEGER,
-      ai_holes_diameter       NUMERIC,
-      ai_slots                INTEGER,
-      ai_cutouts              INTEGER,
-      ai_width                NUMERIC,
-      ai_height               NUMERIC,
-      ai_thickness            NUMERIC,
-      ai_profile_type         TEXT,
-      ai_tolerance            TEXT,
-      ai_confidence           NUMERIC,
-      ai_raw_text             TEXT,
-      ai_notes                TEXT,
-      ai_completed_at         TIMESTAMPTZ,
-      dwg_filename            TEXT,
-      dwg_preview_url         TEXT,
-      dwg_dxf_url             TEXT,
-      dwg_svg_url             TEXT,
-      dwg_entities            INTEGER,
-      dwg_file_size           INTEGER,
-      dwg_generated_at        TIMESTAMPTZ,
-      cloudinary_public_id    TEXT,
-      cloudinary_url          TEXT,
-      cloudinary_uploaded_at  TIMESTAMPTZ,
-      approved_at             TIMESTAMPTZ,
-      created_at              TIMESTAMPTZ DEFAULT NOW(),
-      updated_at              TIMESTAMPTZ DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS providers (
-      id             SERIAL PRIMARY KEY,
-      company_name   TEXT NOT NULL,
-      country        TEXT,
-      region         TEXT,
-      flag           TEXT,
-      specialty      TEXT,
-      capacity       TEXT,
-      certifications JSONB DEFAULT '[]',
-      lead_time_min  INTEGER DEFAULT 5,
-      lead_time_max  INTEGER DEFAULT 14,
-      rating         NUMERIC DEFAULT 4.5,
-      total_reviews  INTEGER DEFAULT 0,
-      total_orders   INTEGER DEFAULT 0,
-      materials      JSONB DEFAULT '[]',
-      operations     JSONB DEFAULT '[]',
-      pricing_base   NUMERIC DEFAULT 100,
-      is_verified    BOOLEAN DEFAULT false,
-      is_active      BOOLEAN DEFAULT true,
-      created_at     TIMESTAMPTZ DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS quotes (
-      id               SERIAL PRIMARY KEY,
-      design_id        INTEGER REFERENCES designs(id),
-      requester_id     INTEGER REFERENCES users(id),
-      status           TEXT DEFAULT 'open',
-      specs_length     NUMERIC,
-      specs_width      NUMERIC,
-      specs_thickness  NUMERIC,
-      specs_quantity   INTEGER DEFAULT 1,
-      specs_material   TEXT,
-      specs_operations JSONB DEFAULT '[]',
-      specs_finish     TEXT,
-      specs_lead_time  INTEGER,
-      specs_notes      TEXT,
-      bids             JSONB DEFAULT '[]',
-      expires_at       TIMESTAMPTZ,
-      created_at       TIMESTAMPTZ DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS orders (
-      id                 SERIAL PRIMARY KEY,
-      order_number       TEXT NOT NULL,
-      buyer_id           INTEGER REFERENCES users(id),
-      provider_id        INTEGER REFERENCES providers(id),
-      design_id          INTEGER REFERENCES designs(id),
-      quote_id           INTEGER REFERENCES quotes(id),
-      status             TEXT DEFAULT 'confirmed',
-      specs_quantity     INTEGER DEFAULT 1,
-      specs_material     TEXT,
-      specs_thickness    NUMERIC,
-      specs_operations   JSONB DEFAULT '[]',
-      specs_finish       TEXT,
-      pricing_unit_price NUMERIC,
-      pricing_quantity   INTEGER,
-      pricing_subtotal   NUMERIC,
-      pricing_shipping   NUMERIC,
-      pricing_total      NUMERIC,
-      pricing_currency   TEXT DEFAULT 'USD',
-      tracking_carrier   TEXT,
-      tracking_no        TEXT,
-      tracking_url       TEXT,
-      timeline           JSONB DEFAULT '[]',
-      estimated_delivery TIMESTAMPTZ,
-      created_at         TIMESTAMPTZ DEFAULT NOW(),
-      updated_at         TIMESTAMPTZ DEFAULT NOW()
-    );
-  `);
-
-  // Seed providers if empty
-  const { rows } = await query("SELECT COUNT(*) FROM providers");
-  if (Number(rows[0].count) === 0) {
-    const providers = [
-      ["PrecisionCut GmbH","Germany","Bavaria","🇩🇪","Laser Cutting & Bending","High Volume",["ISO 9001","DIN EN 1090"],3,7,4.9,312,1840,["Steel","Aluminum","Stainless","Copper"],["Laser Cut","Press Brake","Welding","Powder Coat"],85,true],
-      ["Shanghai MetalWorks","China","Yangtze Delta","🇨🇳","Sheet Metal Fabrication","Mass Production",["ISO 9001","IATF 16949"],5,12,4.6,891,4200,["Steel","Aluminum","Brass","Titanium"],["Stamping","Deep Drawing","CNC Milling","Anodize"],42,true],
-      ["Makino Metal Works","Japan","Osaka","🇯🇵","High-Precision Stamping","Medium Volume",["JIS Q 9001","NADCAP"],7,14,4.8,204,980,["Titanium","Inconel","Stainless","Copper"],["EDM","Fine Blanking","Lapping","Plating"],140,true],
-      ["TechForm Industries","USA","Michigan","🇺🇸","Aerospace Components","Custom/Low Volume",["AS9100D","ITAR","NADCAP"],10,21,4.7,156,620,["Aluminum 6061","Titanium","Steel 4130","Inconel"],["5-Axis CNC","EDM","CMM Inspection","Anodize"],180,true],
-      ["Formex UK","United Kingdom","West Midlands","🇬🇧","Structural Fabrication","Medium Volume",["ISO 9001","CE Marking"],5,10,4.5,278,1100,["Mild Steel","Stainless 316","Aluminum"],["MIG Welding","Laser Cut","Guillotine","Paint"],95,true],
-      ["IndiaCNC Solutions","India","Pune","🇮🇳","CNC Machining & Turning","High Volume",["ISO 9001","OHSAS"],4,9,4.4,432,2300,["Steel","Aluminum","Brass","Cast Iron"],["CNC Turning","VMC Milling","Surface Grind","Zinc Plate"],35,true],
-      ["Waterjet Nordic","Sweden","Stockholm","🇸🇪","Waterjet & Plasma","Custom",["ISO 9001","EN 1090-2"],3,8,4.8,189,740,["Stone","Glass","Composites","Steel","Aluminum"],["Waterjet","Plasma Cut","Deburr","Anodize"],120,true],
-      ["FabTech Brazil","Brazil","São Paulo","🇧🇷","General Metal Fabrication","High Volume",["ISO 9001","ABNT NBR"],6,14,4.3,267,890,["Steel","Aluminum","Stainless"],["Laser Cut","Press Brake","MIG Weld","Primer"],55,false],
-    ];
-    for (const p of providers) {
-      await query(
-        `INSERT INTO providers (company_name,country,region,flag,specialty,capacity,certifications,lead_time_min,lead_time_max,rating,total_reviews,total_orders,materials,operations,pricing_base,is_verified)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
-        [p[0],p[1],p[2],p[3],p[4],p[5],JSON.stringify(p[6]),p[7],p[8],p[9],p[10],p[11],JSON.stringify(p[12]),JSON.stringify(p[13]),p[14],p[15]]
-      );
-    }
+  const count = await Provider.countDocuments();
+  if (count === 0) {
+    await Provider.insertMany([
+      { companyName:"PrecisionCut GmbH",   country:"Germany",        region:"Bavaria",         flag:"🇩🇪", specialty:"Laser Cutting & Bending",    capacity:"High Volume",       certifications:["ISO 9001","DIN EN 1090"],  leadTimeDays:{min:3,max:7},   rating:4.9, totalReviews:312, totalOrders:1840, materials:["Steel","Aluminum","Stainless","Copper"],            operations:["Laser Cut","Press Brake","Welding","Powder Coat"], pricingBase:85,  isVerified:true },
+      { companyName:"Shanghai MetalWorks", country:"China",          region:"Yangtze Delta",   flag:"🇨🇳", specialty:"Sheet Metal Fabrication",    capacity:"Mass Production",   certifications:["ISO 9001","IATF 16949"], leadTimeDays:{min:5,max:12},  rating:4.6, totalReviews:891, totalOrders:4200, materials:["Steel","Aluminum","Brass","Titanium"],              operations:["Stamping","Deep Drawing","CNC Milling","Anodize"], pricingBase:42,  isVerified:true },
+      { companyName:"Makino Metal Works",  country:"Japan",          region:"Osaka",           flag:"🇯🇵", specialty:"High-Precision Stamping",    capacity:"Medium Volume",     certifications:["JIS Q 9001","NADCAP"],   leadTimeDays:{min:7,max:14},  rating:4.8, totalReviews:204, totalOrders:980,  materials:["Titanium","Inconel","Stainless","Copper"],          operations:["EDM","Fine Blanking","Lapping","Plating"],         pricingBase:140, isVerified:true },
+      { companyName:"TechForm Industries", country:"USA",            region:"Michigan",        flag:"🇺🇸", specialty:"Aerospace Components",       capacity:"Custom/Low Volume", certifications:["AS9100D","ITAR","NADCAP"],leadTimeDays:{min:10,max:21}, rating:4.7, totalReviews:156, totalOrders:620,  materials:["Aluminum 6061","Titanium","Steel 4130","Inconel"],  operations:["5-Axis CNC","EDM","CMM Inspection","Anodize"],    pricingBase:180, isVerified:true },
+      { companyName:"Formex UK",           country:"United Kingdom", region:"West Midlands",   flag:"🇬🇧", specialty:"Structural Fabrication",    capacity:"Medium Volume",     certifications:["ISO 9001","CE Marking"], leadTimeDays:{min:5,max:10},  rating:4.5, totalReviews:278, totalOrders:1100, materials:["Mild Steel","Stainless 316","Aluminum"],            operations:["MIG Welding","Laser Cut","Guillotine","Paint"],    pricingBase:95,  isVerified:true },
+      { companyName:"IndiaCNC Solutions",  country:"India",          region:"Pune",            flag:"🇮🇳", specialty:"CNC Machining & Turning",   capacity:"High Volume",       certifications:["ISO 9001","OHSAS"],      leadTimeDays:{min:4,max:9},   rating:4.4, totalReviews:432, totalOrders:2300, materials:["Steel","Aluminum","Brass","Cast Iron"],             operations:["CNC Turning","VMC Milling","Surface Grind","Zinc Plate"], pricingBase:35, isVerified:true },
+      { companyName:"Waterjet Nordic",     country:"Sweden",         region:"Stockholm",       flag:"🇸🇪", specialty:"Waterjet & Plasma",         capacity:"Custom",            certifications:["ISO 9001","EN 1090-2"], leadTimeDays:{min:3,max:8},   rating:4.8, totalReviews:189, totalOrders:740,  materials:["Stone","Glass","Composites","Steel","Aluminum"],   operations:["Waterjet","Plasma Cut","Deburr","Anodize"],        pricingBase:120, isVerified:true },
+      { companyName:"FabTech Brazil",      country:"Brazil",         region:"São Paulo",       flag:"🇧🇷", specialty:"General Metal Fabrication", capacity:"High Volume",       certifications:["ISO 9001","ABNT NBR"],  leadTimeDays:{min:6,max:14},  rating:4.3, totalReviews:267, totalOrders:890,  materials:["Steel","Aluminum","Stainless"],                     operations:["Laser Cut","Press Brake","MIG Weld","Primer"],    pricingBase:55,  isVerified:false },
+    ]);
     console.log("Providers seeded.");
   }
 }
 
 // ── Auth helpers ──────────────────────────────────────────────────────────────
 function generateToken(id, role) {
-  return jwt.sign({ id, role }, JWT_SECRET, { expiresIn: "7d" });
+  return jwt.sign({ id: String(id), role }, JWT_SECRET, { expiresIn: "7d" });
 }
 
 function protect(req, res, next) {
@@ -207,11 +200,121 @@ function protect(req, res, next) {
   }
 }
 
+// ── Format helpers ────────────────────────────────────────────────────────────
 function fmtUser(u) {
   return {
-    id: String(u.id), firstName: u.first_name, lastName: u.last_name,
-    email: u.email, role: u.role, company: u.company, country: u.country,
-    isVerified: u.is_verified, createdAt: u.created_at,
+    id:         String(u._id),
+    firstName:  u.firstName,
+    lastName:   u.lastName,
+    email:      u.email,
+    role:       u.role,
+    company:    u.company,
+    country:    u.country,
+    isVerified: u.isVerified,
+    createdAt:  u.createdAt,
+  };
+}
+
+function fmtDesign(d) {
+  const a = d.aiAnalysis || {};
+  return {
+    id:        String(d._id),
+    partName:  d.partName,
+    status:    d.status,
+    material:  d.material,
+    thickness: d.thickness,
+    notes:     d.notes,
+    originalFile: d.originalFile?.filename ? {
+      filename: d.originalFile.filename,
+      mimetype: d.originalFile.mimetype,
+      size:     d.originalFile.size,
+      url:      d.originalFile.url,
+    } : null,
+    aiAnalysis: {
+      edges:         a.edges,
+      bendLines:     a.bendLines,
+      holes:         a.holes,
+      holesDiameter: a.holesDiameter,
+      slots:         a.slots,
+      cutouts:       a.cutouts,
+      width:         a.width,
+      height:        a.height,
+      thickness:     a.thickness,
+      profileType:   a.profileType,
+      tolerance:     a.tolerance,
+      confidence:    a.confidence != null ? parseFloat((a.confidence * 100).toFixed(1)) : null,
+      rawText:       a.rawText,
+      notes:         a.notes,
+      completedAt:   a.completedAt,
+    },
+    dwg: d.dwg?.filename ? {
+      filename:    d.dwg.filename,
+      previewUrl:  d.dwg.previewUrl,
+      dxfUrl:      d.dwg.dxfUrl,
+      svgUrl:      d.dwg.svgUrl,
+      entities:    d.dwg.entities,
+      fileSize:    d.dwg.fileSize,
+      generatedAt: d.dwg.generatedAt,
+    } : null,
+    cloudinary: d.cloudinary?.url ? {
+      publicId:   d.cloudinary.publicId,
+      url:        d.cloudinary.url,
+      uploadedAt: d.cloudinary.uploadedAt,
+    } : null,
+    createdAt: d.createdAt,
+    updatedAt: d.updatedAt,
+  };
+}
+
+function fmtProvider(p) {
+  return {
+    id:             String(p._id),
+    companyName:    p.companyName,
+    country:        p.country,
+    region:         p.region,
+    flag:           p.flag,
+    specialty:      p.specialty,
+    capacity:       p.capacity,
+    certifications: p.certifications || [],
+    leadTimeDays:   { min: p.leadTimeDays?.min, max: p.leadTimeDays?.max },
+    rating:         p.rating,
+    totalReviews:   p.totalReviews,
+    totalOrders:    p.totalOrders,
+    materials:      p.materials || [],
+    operations:     p.operations || [],
+    pricingBase:    p.pricingBase,
+    isVerified:     p.isVerified,
+    isActive:       p.isActive,
+  };
+}
+
+function fmtQuote(q) {
+  return {
+    id:       String(q._id),
+    designId: String(q.designId),
+    status:   q.status,
+    specs:    q.specs || {},
+    bids:     q.bids  || [],
+    expiresAt: q.expiresAt,
+    createdAt: q.createdAt,
+  };
+}
+
+function fmtOrder(o, providerName) {
+  return {
+    id:           String(o._id),
+    orderNumber:  o.orderNumber,
+    designId:     String(o.designId),
+    providerId:   String(o.providerId),
+    providerName: providerName || "Unknown Provider",
+    status:       o.status,
+    specs:        o.specs    || {},
+    pricing:      o.pricing  || {},
+    tracking:     o.tracking || {},
+    timeline:          o.timeline || [],
+    estimatedDelivery: o.estimatedDelivery,
+    createdAt:         o.createdAt,
+    updatedAt:         o.updatedAt,
   };
 }
 
@@ -254,30 +357,29 @@ const PIPELINE_STEPS = [
 ];
 
 const STEP_DETAILS = {
-  "Grayscale Conversion":        "RGB → single-channel luminance",
-  "Blur & Noise Reduction":      "Gaussian kernel 5×5, σ=1.4",
-  "Adaptive Thresholding":       "Block size 11, C=2",
-  "Morphological Cleanup":       "Erosion + dilation, kernel 3×3",
-  "Deskew & Alignment":          "Hough-based angle correction",
-  "Contrast Enhancement":        "CLAHE, clip limit 2.0",
-  "Canny Edge Detection":        "Thresholds: low=50, high=150",
+  "Grayscale Conversion":           "RGB → single-channel luminance",
+  "Blur & Noise Reduction":         "Gaussian kernel 5×5, σ=1.4",
+  "Adaptive Thresholding":          "Block size 11, C=2",
+  "Morphological Cleanup":          "Erosion + dilation, kernel 3×3",
+  "Deskew & Alignment":             "Hough-based angle correction",
+  "Contrast Enhancement":           "CLAHE, clip limit 2.0",
+  "Canny Edge Detection":           "Thresholds: low=50, high=150",
   "Douglas-Peucker Simplification": "Epsilon 2.0px, contours simplified",
-  "OCR Dimension Extraction":    "Tesseract v5 — dimensions extracted",
-  "YOLO Feature Recognition":    "YOLOv8n — holes, slots, cutouts",
-  "Coordinate System Mapping":   "Pixel → mm @ 96dpi scale",
-  "Vector Path Extraction":      "Potrace + spline fitting",
-  "DXF Entity Generation":       "ezdxf R2010 entities created",
-  "File Export":                 "DXF + SVG + PNG preview saved",
+  "OCR Dimension Extraction":       "Tesseract v5 — dimensions extracted",
+  "YOLO Feature Recognition":       "YOLOv8n — holes, slots, cutouts",
+  "Coordinate System Mapping":      "Pixel → mm @ 96dpi scale",
+  "Vector Path Extraction":         "Potrace + spline fitting",
+  "DXF Entity Generation":          "ezdxf R2010 entities created",
+  "File Export":                    "DXF + SVG + PNG preview saved",
 };
 
 function simulatePipeline() {
-  const steps = PIPELINE_STEPS.map(name => ({
-    name, status: "done",
-    duration: Math.round(50 + Math.random() * 300),
-    details: STEP_DETAILS[name] || null,
-  }));
   return {
-    steps,
+    steps: PIPELINE_STEPS.map(name => ({
+      name, status: "done",
+      duration: Math.round(50 + Math.random() * 300),
+      details: STEP_DETAILS[name] || null,
+    })),
     analysis: {
       edges:        Math.floor(Math.random() * 100) + 20,
       bendLines:    Math.floor(Math.random() * 8),
@@ -302,151 +404,17 @@ function simulatePipeline() {
 
 function runPipeline(imagePath, options) {
   return new Promise(resolve => {
-    if (!fs.existsSync(PIPELINE_SCRIPT)) {
-      return resolve(simulatePipeline());
-    }
+    if (!fs.existsSync(PIPELINE_SCRIPT)) return resolve(simulatePipeline());
     const proc = spawn("python3", [PIPELINE_SCRIPT, imagePath, JSON.stringify(options)]);
     let stdout = "";
     proc.stdout.on("data", d => { stdout += d.toString(); });
     proc.on("close", code => {
-      if (code === 0) {
-        try { return resolve(JSON.parse(stdout)); } catch {}
-      }
+      if (code === 0) { try { return resolve(JSON.parse(stdout)); } catch {} }
       resolve(simulatePipeline());
     });
     proc.on("error", () => resolve(simulatePipeline()));
     setTimeout(() => { proc.kill(); resolve(simulatePipeline()); }, 120000);
   });
-}
-
-// ── Format helpers ────────────────────────────────────────────────────────────
-function fmtDesign(d) {
-  return {
-    id:        String(d.id),
-    partName:  d.part_name,
-    status:    d.status,
-    material:  d.material,
-    thickness: d.thickness,
-    notes:     d.notes,
-    originalFile: d.original_filename ? {
-      filename: d.original_filename,
-      mimetype: d.original_mimetype,
-      size:     d.original_size,
-      url:      d.original_url,
-    } : null,
-    aiAnalysis: {
-      edges:       d.ai_edges,
-      bendLines:   d.ai_bend_lines,
-      holes:       d.ai_holes,
-      holesDiameter: d.ai_holes_diameter,
-      slots:       d.ai_slots,
-      cutouts:     d.ai_cutouts,
-      width:       d.ai_width,
-      height:      d.ai_height,
-      thickness:   d.ai_thickness,
-      profileType: d.ai_profile_type,
-      tolerance:   d.ai_tolerance,
-      confidence:  d.ai_confidence ? parseFloat((d.ai_confidence * 100).toFixed(1)) : null,
-      rawText:     d.ai_raw_text,
-      notes:       d.ai_notes,
-      completedAt: d.ai_completed_at,
-    },
-    dwg: d.dwg_filename ? {
-      filename:    d.dwg_filename,
-      previewUrl:  d.dwg_preview_url,
-      dxfUrl:      d.dwg_dxf_url,
-      svgUrl:      d.dwg_svg_url,
-      entities:    d.dwg_entities,
-      fileSize:    d.dwg_file_size,
-      generatedAt: d.dwg_generated_at,
-    } : null,
-    cloudinary: d.cloudinary_url ? {
-      publicId:   d.cloudinary_public_id,
-      url:        d.cloudinary_url,
-      uploadedAt: d.cloudinary_uploaded_at,
-    } : null,
-    createdAt: d.created_at,
-    updatedAt: d.updated_at,
-  };
-}
-
-function fmtProvider(p) {
-  return {
-    id:            String(p.id),
-    companyName:   p.company_name,
-    country:       p.country,
-    region:        p.region,
-    flag:          p.flag,
-    specialty:     p.specialty,
-    capacity:      p.capacity,
-    certifications: p.certifications || [],
-    leadTimeDays:  { min: p.lead_time_min, max: p.lead_time_max },
-    rating:        p.rating,
-    totalReviews:  p.total_reviews,
-    totalOrders:   p.total_orders,
-    materials:     p.materials || [],
-    operations:    p.operations || [],
-    pricingBase:   p.pricing_base,
-    isVerified:    p.is_verified,
-    isActive:      p.is_active,
-  };
-}
-
-function fmtQuote(q) {
-  return {
-    id:       String(q.id),
-    designId: String(q.design_id),
-    status:   q.status,
-    specs: {
-      length:     q.specs_length,
-      width:      q.specs_width,
-      thickness:  q.specs_thickness,
-      quantity:   q.specs_quantity,
-      material:   q.specs_material,
-      operations: q.specs_operations || [],
-      finish:     q.specs_finish,
-      leadTime:   q.specs_lead_time,
-      notes:      q.specs_notes,
-    },
-    bids:      q.bids || [],
-    expiresAt: q.expires_at,
-    createdAt: q.created_at,
-  };
-}
-
-function fmtOrder(o, providerName) {
-  return {
-    id:           String(o.id),
-    orderNumber:  o.order_number,
-    designId:     String(o.design_id),
-    providerId:   String(o.provider_id),
-    providerName: providerName || "Unknown Provider",
-    status:       o.status,
-    specs: {
-      quantity:   o.specs_quantity,
-      material:   o.specs_material,
-      thickness:  o.specs_thickness,
-      operations: o.specs_operations || [],
-      finish:     o.specs_finish,
-    },
-    pricing: {
-      unitPrice: o.pricing_unit_price,
-      quantity:  o.pricing_quantity,
-      subtotal:  o.pricing_subtotal,
-      shipping:  o.pricing_shipping,
-      total:     o.pricing_total,
-      currency:  o.pricing_currency || "USD",
-    },
-    tracking: {
-      carrier:    o.tracking_carrier,
-      trackingNo: o.tracking_no,
-      url:        o.tracking_url,
-    },
-    timeline:          o.timeline || [],
-    estimatedDelivery: o.estimated_delivery,
-    createdAt:         o.created_at,
-    updatedAt:         o.updated_at,
-  };
 }
 
 // ── App setup ─────────────────────────────────────────────────────────────────
@@ -463,364 +431,441 @@ api.get("/healthz", (_req, res) => res.json({ status: "ok" }));
 
 // ── Auth routes ───────────────────────────────────────────────────────────────
 api.post("/auth/register", async (req, res) => {
-  const { firstName, lastName, email, password, role, company, country } = req.body;
-  if (!firstName || !lastName || !email || !password || !role)
-    return res.status(400).json({ error: "Missing required fields" });
-  const existing = await query("SELECT id FROM users WHERE email=$1", [email.toLowerCase()]);
-  if (existing.rows.length) return res.status(400).json({ error: "Email already registered" });
-  const hashed = await bcrypt.hash(password, 12);
-  const { rows } = await query(
-    `INSERT INTO users (first_name,last_name,email,password,role,company,country)
-     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-    [firstName, lastName, email.toLowerCase(), hashed, role, company||null, country||null]
-  );
-  res.status(201).json({ token: generateToken(rows[0].id, rows[0].role), user: fmtUser(rows[0]) });
+  try {
+    const { firstName, lastName, email, password, role, company, country } = req.body;
+    if (!firstName || !lastName || !email || !password || !role)
+      return res.status(400).json({ error: "Missing required fields" });
+
+    if (await User.findOne({ email: email.toLowerCase() }))
+      return res.status(400).json({ error: "Email already registered" });
+
+    const hashed = await bcrypt.hash(password, 12);
+    const user   = await User.create({ firstName, lastName, email, password: hashed, role, company, country });
+    res.status(201).json({ token: generateToken(user._id, user.role), user: fmtUser(user) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 api.post("/auth/login", async (req, res) => {
-  const { email, password } = req.body;
-  if (!email || !password) return res.status(400).json({ error: "Email and password required" });
-  const { rows } = await query("SELECT * FROM users WHERE email=$1", [email.toLowerCase()]);
-  if (!rows.length) return res.status(401).json({ error: "Invalid credentials" });
-  const valid = await bcrypt.compare(password, rows[0].password);
-  if (!valid) return res.status(401).json({ error: "Invalid credentials" });
-  res.json({ token: generateToken(rows[0].id, rows[0].role), user: fmtUser(rows[0]) });
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: "Email and password required" });
+
+    const user = await User.findOne({ email: email.toLowerCase() });
+    if (!user) return res.status(401).json({ error: "Invalid credentials" });
+    if (!(await bcrypt.compare(password, user.password)))
+      return res.status(401).json({ error: "Invalid credentials" });
+
+    res.json({ token: generateToken(user._id, user.role), user: fmtUser(user) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 api.post("/auth/logout", (_req, res) => res.json({ success: true }));
 
 api.get("/auth/me", protect, async (req, res) => {
-  const { rows } = await query("SELECT * FROM users WHERE id=$1", [req.userId]);
-  if (!rows.length) return res.status(401).json({ error: "User not found" });
-  res.json(fmtUser(rows[0]));
+  try {
+    const user = await User.findById(req.userId);
+    if (!user) return res.status(401).json({ error: "User not found" });
+    res.json(fmtUser(user));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ── Design routes ─────────────────────────────────────────────────────────────
 api.get("/designs", protect, async (req, res) => {
-  const page   = Number(req.query.page)  || 1;
-  const limit  = Number(req.query.limit) || 20;
-  const status = req.query.status;
-  const offset = (page - 1) * limit;
-  let sql   = "SELECT * FROM designs WHERE owner_id=$1";
-  let cntSql = "SELECT COUNT(*) FROM designs WHERE owner_id=$1";
-  const params = [req.userId];
-  if (status) { sql += ` AND status=$2`; cntSql += ` AND status=$2`; params.push(status); }
-  sql += ` ORDER BY created_at DESC LIMIT $${params.length+1} OFFSET $${params.length+2}`;
-  const [data, cnt] = await Promise.all([
-    query(sql, [...params, limit, offset]),
-    query(cntSql, params.slice(0, status ? 2 : 1)),
-  ]);
-  const total = Number(cnt.rows[0].count);
-  res.json({ designs: data.rows.map(fmtDesign), total, page, pages: Math.ceil(total / limit) });
+  try {
+    const page   = Number(req.query.page)  || 1;
+    const limit  = Number(req.query.limit) || 20;
+    const filter = { ownerId: req.userId };
+    if (req.query.status) filter.status = req.query.status;
+
+    const [designs, total] = await Promise.all([
+      Design.find(filter).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit),
+      Design.countDocuments(filter),
+    ]);
+    res.json({ designs: designs.map(fmtDesign), total, page, pages: Math.ceil(total / limit) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 api.post("/designs", protect, upload.single("file"), async (req, res) => {
-  const { partName, material, thickness, notes } = req.body;
-  const file = req.file;
-  const { rows } = await query(
-    `INSERT INTO designs (owner_id,part_name,material,thickness,notes,status,original_filename,original_mimetype,original_size,original_local_path)
-     VALUES ($1,$2,$3,$4,$5,'uploaded',$6,$7,$8,$9) RETURNING *`,
-    [req.userId, partName||(file?.originalname?.replace(/\.[^.]+$/,"")||"Untitled"), material||null,
-     thickness?Number(thickness):null, notes||null, file?.originalname||null, file?.mimetype||null,
-     file?.size||null, file?.path||null]
-  );
-  res.status(201).json(fmtDesign(rows[0]));
+  try {
+    const { partName, material, thickness, notes } = req.body;
+    const file = req.file;
+    const design = await Design.create({
+      ownerId:  req.userId,
+      partName: partName || (file?.originalname?.replace(/\.[^.]+$/, "") || "Untitled"),
+      material: material || undefined,
+      thickness: thickness ? Number(thickness) : undefined,
+      notes:    notes || undefined,
+      status:   "uploaded",
+      originalFile: file ? {
+        filename:  file.originalname,
+        mimetype:  file.mimetype,
+        size:      file.size,
+        localPath: file.path,
+        url:       undefined,
+      } : undefined,
+    });
+    res.status(201).json(fmtDesign(design));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 api.get("/designs/:id", protect, async (req, res) => {
-  const { rows } = await query("SELECT * FROM designs WHERE id=$1 AND owner_id=$2", [req.params.id, req.userId]);
-  if (!rows.length) return res.status(404).json({ error: "Design not found" });
-  res.json(fmtDesign(rows[0]));
+  try {
+    const design = await Design.findOne({ _id: req.params.id, ownerId: req.userId });
+    if (!design) return res.status(404).json({ error: "Design not found" });
+    res.json(fmtDesign(design));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 api.patch("/designs/:id", protect, async (req, res) => {
-  const { partName, material, thickness, notes, aiAnalysis } = req.body;
-  const sets = ["updated_at=NOW()"];
-  const vals = [];
-  let i = 1;
-  const add = (col, val) => { sets.push(`${col}=$${i++}`); vals.push(val); };
-  if (partName   !== undefined) add("part_name", partName);
-  if (material   !== undefined) add("material",  material);
-  if (thickness  !== undefined) add("thickness",  Number(thickness));
-  if (notes      !== undefined) add("notes",      notes);
-  if (aiAnalysis) {
-    const a = aiAnalysis;
-    if (a.edges        !== undefined) add("ai_edges",          a.edges);
-    if (a.bendLines    !== undefined) add("ai_bend_lines",     a.bendLines);
-    if (a.holes        !== undefined) add("ai_holes",          a.holes);
-    if (a.holesDiameter!== undefined) add("ai_holes_diameter", a.holesDiameter);
-    if (a.slots        !== undefined) add("ai_slots",          a.slots);
-    if (a.cutouts      !== undefined) add("ai_cutouts",        a.cutouts);
-    if (a.width        !== undefined) add("ai_width",          a.width);
-    if (a.height       !== undefined) add("ai_height",         a.height);
-    if (a.tolerance    !== undefined) add("ai_tolerance",      a.tolerance);
-    if (a.rawText      !== undefined) add("ai_raw_text",       a.rawText);
-    if (a.notes        !== undefined) add("ai_notes",          a.notes);
-  }
-  vals.push(req.params.id, req.userId);
-  const { rows } = await query(
-    `UPDATE designs SET ${sets.join(",")} WHERE id=$${i} AND owner_id=$${i+1} RETURNING *`, vals
-  );
-  if (!rows.length) return res.status(404).json({ error: "Design not found" });
-  res.json(fmtDesign(rows[0]));
+  try {
+    const { partName, material, thickness, notes, aiAnalysis } = req.body;
+    const update = { updatedAt: new Date() };
+    if (partName  !== undefined) update.partName  = partName;
+    if (material  !== undefined) update.material  = material;
+    if (thickness !== undefined) update.thickness = Number(thickness);
+    if (notes     !== undefined) update.notes     = notes;
+    if (aiAnalysis) {
+      const a = aiAnalysis;
+      if (a.edges        !== undefined) update["aiAnalysis.edges"]        = a.edges;
+      if (a.bendLines    !== undefined) update["aiAnalysis.bendLines"]    = a.bendLines;
+      if (a.holes        !== undefined) update["aiAnalysis.holes"]        = a.holes;
+      if (a.holesDiameter!== undefined) update["aiAnalysis.holesDiameter"]= a.holesDiameter;
+      if (a.slots        !== undefined) update["aiAnalysis.slots"]        = a.slots;
+      if (a.cutouts      !== undefined) update["aiAnalysis.cutouts"]      = a.cutouts;
+      if (a.width        !== undefined) update["aiAnalysis.width"]        = a.width;
+      if (a.height       !== undefined) update["aiAnalysis.height"]       = a.height;
+      if (a.tolerance    !== undefined) update["aiAnalysis.tolerance"]    = a.tolerance;
+      if (a.rawText      !== undefined) update["aiAnalysis.rawText"]      = a.rawText;
+      if (a.notes        !== undefined) update["aiAnalysis.notes"]        = a.notes;
+    }
+    const design = await Design.findOneAndUpdate(
+      { _id: req.params.id, ownerId: req.userId },
+      { $set: update },
+      { new: true }
+    );
+    if (!design) return res.status(404).json({ error: "Design not found" });
+    res.json(fmtDesign(design));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 api.delete("/designs/:id", protect, async (req, res) => {
-  const { rows } = await query("SELECT * FROM designs WHERE id=$1 AND owner_id=$2", [req.params.id, req.userId]);
-  if (!rows.length) return res.status(404).json({ error: "Design not found" });
-  if (rows[0].original_local_path && fs.existsSync(rows[0].original_local_path))
-    fs.unlinkSync(rows[0].original_local_path);
-  await query("DELETE FROM designs WHERE id=$1", [req.params.id]);
-  res.json({ success: true });
+  try {
+    const design = await Design.findOne({ _id: req.params.id, ownerId: req.userId });
+    if (!design) return res.status(404).json({ error: "Design not found" });
+    if (design.originalFile?.localPath && fs.existsSync(design.originalFile.localPath))
+      fs.unlinkSync(design.originalFile.localPath);
+    await Design.deleteOne({ _id: req.params.id });
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 api.patch("/designs/:id/approve", protect, async (req, res) => {
-  const { correctedAnalysis, verificationNote } = req.body;
-  const sets = ["status='approved'", "approved_at=NOW()", "updated_at=NOW()"];
-  const vals = [];
-  let i = 1;
-  const add = (col, val) => { sets.push(`${col}=$${i++}`); vals.push(val); };
-  if (correctedAnalysis) {
-    const a = correctedAnalysis;
-    if (a.edges        !== undefined) add("ai_edges",          a.edges);
-    if (a.holes        !== undefined) add("ai_holes",          a.holes);
-    if (a.holesDiameter!== undefined) add("ai_holes_diameter", a.holesDiameter);
-    if (a.width        !== undefined) add("ai_width",          a.width);
-    if (a.height       !== undefined) add("ai_height",         a.height);
-    if (a.rawText      !== undefined) add("ai_raw_text",       a.rawText);
-    if (verificationNote)             add("ai_notes",          verificationNote);
-  }
-  vals.push(req.params.id, req.userId);
-  const { rows } = await query(
-    `UPDATE designs SET ${sets.join(",")} WHERE id=$${i} AND owner_id=$${i+1} RETURNING *`, vals
-  );
-  if (!rows.length) return res.status(404).json({ error: "Design not found" });
-  res.json(fmtDesign(rows[0]));
+  try {
+    const { correctedAnalysis, verificationNote } = req.body;
+    const update = {
+      status:     "approved",
+      approvedAt: new Date(),
+      updatedAt:  new Date(),
+    };
+    if (correctedAnalysis) {
+      const a = correctedAnalysis;
+      if (a.edges        !== undefined) update["aiAnalysis.edges"]        = a.edges;
+      if (a.holes        !== undefined) update["aiAnalysis.holes"]        = a.holes;
+      if (a.holesDiameter!== undefined) update["aiAnalysis.holesDiameter"]= a.holesDiameter;
+      if (a.width        !== undefined) update["aiAnalysis.width"]        = a.width;
+      if (a.height       !== undefined) update["aiAnalysis.height"]       = a.height;
+      if (a.rawText      !== undefined) update["aiAnalysis.rawText"]      = a.rawText;
+      if (verificationNote)             update["aiAnalysis.notes"]        = verificationNote;
+    }
+    const design = await Design.findOneAndUpdate(
+      { _id: req.params.id, ownerId: req.userId },
+      { $set: update },
+      { new: true }
+    );
+    if (!design) return res.status(404).json({ error: "Design not found" });
+    res.json(fmtDesign(design));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 api.post("/cloud/save/:id", protect, async (req, res) => {
-  const { rows: ds } = await query("SELECT * FROM designs WHERE id=$1 AND owner_id=$2", [req.params.id, req.userId]);
-  if (!ds.length) return res.status(404).json({ error: "Design not found" });
-  const d = ds[0];
-  if (cloudinary && d.original_local_path && fs.existsSync(d.original_local_path)) {
-    const result = await cloudinary.uploader.upload(d.original_local_path, { folder: "sheetforge/designs", resource_type: "auto" });
-    await query("UPDATE designs SET cloudinary_public_id=$1,cloudinary_url=$2,cloudinary_uploaded_at=NOW(),status='saved',updated_at=NOW() WHERE id=$3",
-      [result.public_id, result.secure_url, d.id]);
-  } else {
-    await query("UPDATE designs SET status='saved',updated_at=NOW() WHERE id=$1", [d.id]);
-  }
-  const { rows } = await query("SELECT * FROM designs WHERE id=$1", [d.id]);
-  res.json(fmtDesign(rows[0]));
+  try {
+    const design = await Design.findOne({ _id: req.params.id, ownerId: req.userId });
+    if (!design) return res.status(404).json({ error: "Design not found" });
+
+    const update = { status: "saved", updatedAt: new Date() };
+    if (cloudinary && design.originalFile?.localPath && fs.existsSync(design.originalFile.localPath)) {
+      const result = await cloudinary.uploader.upload(design.originalFile.localPath, { folder: "sheetforge/designs", resource_type: "auto" });
+      update["cloudinary.publicId"]   = result.public_id;
+      update["cloudinary.url"]        = result.secure_url;
+      update["cloudinary.uploadedAt"] = new Date();
+    }
+    const updated = await Design.findByIdAndUpdate(req.params.id, { $set: update }, { new: true });
+    res.json(fmtDesign(updated));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ── Convert routes ────────────────────────────────────────────────────────────
 api.post("/convert/:id", protect, async (req, res) => {
-  const designId = Number(req.params.id);
-  const { rows: ds } = await query("SELECT * FROM designs WHERE id=$1 AND owner_id=$2", [designId, req.userId]);
-  if (!ds.length) return res.status(404).json({ error: "Design not found" });
+  try {
+    const design = await Design.findOne({ _id: req.params.id, ownerId: req.userId });
+    if (!design) return res.status(404).json({ error: "Design not found" });
 
-  await query("UPDATE designs SET status='analyzing',updated_at=NOW() WHERE id=$1", [designId]);
-  await query("UPDATE designs SET status='converting',updated_at=NOW() WHERE id=$1", [designId]);
+    await Design.findByIdAndUpdate(req.params.id, { $set: { status: "analyzing", updatedAt: new Date() } });
+    await Design.findByIdAndUpdate(req.params.id, { $set: { status: "converting", updatedAt: new Date() } });
 
-  const options = {
-    scale: req.body?.scale || null,
-    units: req.body?.units || "mm",
-    tolerance: req.body?.tolerance || 0.1,
-    detectCircles: req.body?.detectCircles !== false,
-    detectText: req.body?.detectText !== false,
-  };
+    const options = {
+      scale:         req.body?.scale        || null,
+      units:         req.body?.units        || "mm",
+      tolerance:     req.body?.tolerance    || 0.1,
+      detectCircles: req.body?.detectCircles !== false,
+      detectText:    req.body?.detectText    !== false,
+    };
 
-  const result = await runPipeline(ds[0].original_local_path || "", options);
-  const now = new Date();
-  const dxfFilename = `design_${designId}_${Date.now()}.dxf`;
-  const a = result.analysis || {};
+    const result      = await runPipeline(design.originalFile?.localPath || "", options);
+    const now         = new Date();
+    const dxfFilename = `design_${req.params.id}_${Date.now()}.dxf`;
+    const a           = result.analysis || {};
 
-  await query(
-    `UPDATE designs SET
-       status='ready', updated_at=$1,
-       ai_edges=$2, ai_bend_lines=$3, ai_holes=$4, ai_holes_diameter=$5,
-       ai_slots=$6, ai_cutouts=$7, ai_width=$8, ai_height=$9,
-       ai_thickness=$10, ai_profile_type=$11, ai_tolerance=$12,
-       ai_confidence=$13, ai_raw_text=$14, ai_completed_at=$1,
-       dwg_filename=$15, dwg_dxf_url=$16, dwg_entities=$17, dwg_file_size=$18, dwg_generated_at=$1
-     WHERE id=$19`,
-    [now, a.edges, a.bendLines, a.holes, a.holesDiameter, a.slots, a.cutouts,
-     a.width, a.height, a.thickness, a.profileType, a.tolerance, a.confidence,
-     a.rawText, dxfFilename, `/api/files/output/${dxfFilename}`,
-     result.dwg?.entities, result.dwg?.fileSize, designId]
-  );
+    const updated = await Design.findByIdAndUpdate(req.params.id, {
+      $set: {
+        status:    "ready",
+        updatedAt: now,
+        aiAnalysis: {
+          edges: a.edges, bendLines: a.bendLines, holes: a.holes, holesDiameter: a.holesDiameter,
+          slots: a.slots, cutouts: a.cutouts, width: a.width, height: a.height,
+          thickness: a.thickness, profileType: a.profileType, tolerance: a.tolerance,
+          confidence: a.confidence, rawText: a.rawText, completedAt: now,
+        },
+        dwg: {
+          filename:    dxfFilename,
+          dxfUrl:      `/api/files/output/${dxfFilename}`,
+          entities:    result.dwg?.entities,
+          fileSize:    result.dwg?.fileSize,
+          generatedAt: now,
+        },
+      },
+    }, { new: true });
 
-  const { rows } = await query("SELECT * FROM designs WHERE id=$1", [designId]);
-  res.json({
-    designId: String(designId),
-    status:   "ready",
-    pipeline: result.steps || PIPELINE_STEPS.map(name => ({ name, status: "done", duration: Math.round(100 + Math.random() * 200), details: null })),
-    design:   fmtDesign(rows[0]),
-  });
+    res.json({
+      designId: String(req.params.id),
+      status:   "ready",
+      pipeline: result.steps || PIPELINE_STEPS.map(name => ({ name, status: "done", duration: Math.round(100 + Math.random() * 200), details: null })),
+      design:   fmtDesign(updated),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 api.get("/convert/:id/status", protect, async (req, res) => {
-  const { rows } = await query("SELECT * FROM designs WHERE id=$1 AND owner_id=$2", [req.params.id, req.userId]);
-  if (!rows.length) return res.status(404).json({ error: "Design not found" });
-  const d = rows[0];
-  const progressMap = { uploaded: 0, analyzing: 30, converting: 70, ready: 100, approved: 100, saved: 100 };
-  const progress = progressMap[d.status] || 0;
-  res.json({
-    designId:    String(d.id),
-    status:      d.status,
-    progress,
-    currentStep: d.status === "ready" ? "File Export" : d.status === "converting" ? "DXF Entity Generation" : d.status === "analyzing" ? "Canny Edge Detection" : "Waiting",
-    steps: PIPELINE_STEPS.map((name, idx) => ({
-      name,
-      status: progress >= ((idx + 1) / PIPELINE_STEPS.length) * 100 ? "done" : "pending",
-      duration: null, details: null,
-    })),
-  });
+  try {
+    const design = await Design.findOne({ _id: req.params.id, ownerId: req.userId });
+    if (!design) return res.status(404).json({ error: "Design not found" });
+    const progressMap = { uploaded: 0, analyzing: 30, converting: 70, ready: 100, approved: 100, saved: 100 };
+    const progress = progressMap[design.status] || 0;
+    res.json({
+      designId:    String(design._id),
+      status:      design.status,
+      progress,
+      currentStep: design.status === "ready" ? "File Export" : design.status === "converting" ? "DXF Entity Generation" : design.status === "analyzing" ? "Canny Edge Detection" : "Waiting",
+      steps: PIPELINE_STEPS.map((name, idx) => ({
+        name,
+        status: progress >= ((idx + 1) / PIPELINE_STEPS.length) * 100 ? "done" : "pending",
+        duration: null, details: null,
+      })),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ── Quotes routes ─────────────────────────────────────────────────────────────
 api.get("/quotes", protect, async (req, res) => {
-  const { rows } = await query("SELECT * FROM quotes WHERE requester_id=$1 ORDER BY created_at DESC", [req.userId]);
-  res.json({ quotes: rows.map(fmtQuote) });
+  try {
+    const quotes = await Quote.find({ requesterId: req.userId }).sort({ createdAt: -1 });
+    res.json({ quotes: quotes.map(fmtQuote) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 api.post("/quotes", protect, async (req, res) => {
-  const { designId, specs } = req.body;
-  if (!designId) return res.status(400).json({ error: "designId required" });
+  try {
+    const { designId, specs } = req.body;
+    if (!designId) return res.status(400).json({ error: "designId required" });
 
-  const { rows: providers } = await query("SELECT * FROM providers WHERE is_active=true ORDER BY rating DESC LIMIT 5");
-  const bids = providers.slice(0, 3).map(p => ({
-    id:           uuidv4(),
-    providerId:   String(p.id),
-    providerName: p.company_name,
-    price:        Math.round((p.pricing_base || 100) * (specs?.quantity || 1) * (0.9 + Math.random() * 0.3)),
-    perUnit:      Math.round((p.pricing_base || 100) * (0.9 + Math.random() * 0.3)),
-    leadDays:     Math.floor(Math.random() * 10) + (p.lead_time_min || 5),
-    notes:        `Standard ${p.specialty || "fabrication"} process`,
-    status:       "submitted",
-    submittedAt:  new Date().toISOString(),
-  }));
+    const providers = await Provider.find({ isActive: true }).sort({ rating: -1 }).limit(5);
+    const bids = providers.slice(0, 3).map(p => ({
+      id:           uuidv4(),
+      providerId:   String(p._id),
+      providerName: p.companyName,
+      price:        Math.round((p.pricingBase || 100) * (specs?.quantity || 1) * (0.9 + Math.random() * 0.3)),
+      perUnit:      Math.round((p.pricingBase || 100) * (0.9 + Math.random() * 0.3)),
+      leadDays:     Math.floor(Math.random() * 10) + (p.leadTimeDays?.min || 5),
+      notes:        `Standard ${p.specialty || "fabrication"} process`,
+      status:       "submitted",
+      submittedAt:  new Date().toISOString(),
+    }));
 
-  const expiresAt = new Date(Date.now() + 7 * 86400000);
-  const { rows } = await query(
-    `INSERT INTO quotes (design_id,requester_id,specs_length,specs_width,specs_thickness,specs_quantity,specs_material,specs_operations,specs_finish,specs_lead_time,specs_notes,bids,expires_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
-    [designId, req.userId, specs?.length, specs?.width, specs?.thickness, specs?.quantity||1,
-     specs?.material, JSON.stringify(specs?.operations||[]), specs?.finish, specs?.leadTime,
-     specs?.notes, JSON.stringify(bids), expiresAt]
-  );
-  res.status(201).json(fmtQuote(rows[0]));
+    const quote = await Quote.create({
+      designId,
+      requesterId: req.userId,
+      specs: {
+        length:     specs?.length,
+        width:      specs?.width,
+        thickness:  specs?.thickness,
+        quantity:   specs?.quantity || 1,
+        material:   specs?.material,
+        operations: specs?.operations || [],
+        finish:     specs?.finish,
+        leadTime:   specs?.leadTime,
+        notes:      specs?.notes,
+      },
+      bids,
+      expiresAt: new Date(Date.now() + 7 * 86400000),
+    });
+    res.status(201).json(fmtQuote(quote));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 api.get("/quotes/:id", protect, async (req, res) => {
-  const { rows } = await query("SELECT * FROM quotes WHERE id=$1 AND requester_id=$2", [req.params.id, req.userId]);
-  if (!rows.length) return res.status(404).json({ error: "Quote not found" });
-  res.json(fmtQuote(rows[0]));
+  try {
+    const quote = await Quote.findOne({ _id: req.params.id, requesterId: req.userId });
+    if (!quote) return res.status(404).json({ error: "Quote not found" });
+    res.json(fmtQuote(quote));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ── Provider routes ───────────────────────────────────────────────────────────
 api.get("/providers", protect, async (req, res) => {
-  const { rows } = await query("SELECT * FROM providers WHERE is_active=true ORDER BY rating DESC");
-  res.json({ providers: rows.map(fmtProvider) });
+  try {
+    const providers = await Provider.find({ isActive: true }).sort({ rating: -1 });
+    res.json({ providers: providers.map(fmtProvider) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 api.get("/providers/:id", protect, async (req, res) => {
-  const { rows } = await query("SELECT * FROM providers WHERE id=$1", [req.params.id]);
-  if (!rows.length) return res.status(404).json({ error: "Provider not found" });
-  res.json(fmtProvider(rows[0]));
+  try {
+    const provider = await Provider.findById(req.params.id);
+    if (!provider) return res.status(404).json({ error: "Provider not found" });
+    res.json(fmtProvider(provider));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ── Order routes ──────────────────────────────────────────────────────────────
 api.get("/orders", protect, async (req, res) => {
-  const { rows } = await query("SELECT o.*,p.company_name FROM orders o LEFT JOIN providers p ON p.id=o.provider_id WHERE o.buyer_id=$1 ORDER BY o.created_at DESC", [req.userId]);
-  res.json({ orders: rows.map(o => fmtOrder(o, o.company_name)) });
+  try {
+    const orders = await Order.find({ buyerId: req.userId }).sort({ createdAt: -1 }).populate("providerId", "companyName");
+    res.json({ orders: orders.map(o => fmtOrder(o, o.providerId?.companyName)) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 api.post("/orders", protect, async (req, res) => {
-  const { providerId, designId, quoteId, specs, pricing } = req.body;
-  if (!providerId || !designId) return res.status(400).json({ error: "providerId and designId required" });
+  try {
+    const { providerId, designId, quoteId, specs, pricing } = req.body;
+    if (!providerId || !designId) return res.status(400).json({ error: "providerId and designId required" });
 
-  const { rows: ps } = await query("SELECT * FROM providers WHERE id=$1", [providerId]);
-  const { rows: cnt } = await query("SELECT COUNT(*) FROM orders");
-  const orderNumber = `SF-${(Number(cnt[0].count) + 1).toString().padStart(4, "0")}`;
-  const estimatedDelivery = new Date(Date.now() + 14 * 86400000);
-  const timeline = [{ status: "confirmed", note: "Order confirmed and sent to manufacturer", timestamp: new Date().toISOString() }];
+    const provider = await Provider.findById(providerId);
+    const count    = await Order.countDocuments();
+    const orderNumber = `SF-${(count + 1).toString().padStart(4, "0")}`;
 
-  const { rows } = await query(
-    `INSERT INTO orders (order_number,buyer_id,provider_id,design_id,quote_id,specs_quantity,specs_material,specs_thickness,specs_operations,specs_finish,pricing_unit_price,pricing_quantity,pricing_subtotal,pricing_shipping,pricing_total,pricing_currency,timeline,estimated_delivery)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING *`,
-    [orderNumber, req.userId, providerId, designId, quoteId||null,
-     specs?.quantity, specs?.material, specs?.thickness, JSON.stringify(specs?.operations||[]), specs?.finish,
-     pricing?.unitPrice, pricing?.quantity, pricing?.subtotal, pricing?.shipping, pricing?.total,
-     pricing?.currency||"USD", JSON.stringify(timeline), estimatedDelivery]
-  );
-  res.status(201).json(fmtOrder(rows[0], ps[0]?.company_name));
+    const order = await Order.create({
+      orderNumber,
+      buyerId:    req.userId,
+      providerId,
+      designId,
+      quoteId:    quoteId || undefined,
+      specs: {
+        quantity:   specs?.quantity,
+        material:   specs?.material,
+        thickness:  specs?.thickness,
+        operations: specs?.operations || [],
+        finish:     specs?.finish,
+      },
+      pricing: {
+        unitPrice: pricing?.unitPrice,
+        quantity:  pricing?.quantity,
+        subtotal:  pricing?.subtotal,
+        shipping:  pricing?.shipping,
+        total:     pricing?.total,
+        currency:  pricing?.currency || "USD",
+      },
+      timeline:          [{ status: "confirmed", note: "Order confirmed and sent to manufacturer", timestamp: new Date().toISOString() }],
+      estimatedDelivery: new Date(Date.now() + 14 * 86400000),
+    });
+    res.status(201).json(fmtOrder(order, provider?.companyName));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 api.get("/orders/:id", protect, async (req, res) => {
-  const { rows } = await query("SELECT o.*,p.company_name FROM orders o LEFT JOIN providers p ON p.id=o.provider_id WHERE o.id=$1 AND o.buyer_id=$2", [req.params.id, req.userId]);
-  if (!rows.length) return res.status(404).json({ error: "Order not found" });
-  res.json(fmtOrder(rows[0], rows[0].company_name));
+  try {
+    const order = await Order.findOne({ _id: req.params.id, buyerId: req.userId }).populate("providerId", "companyName");
+    if (!order) return res.status(404).json({ error: "Order not found" });
+    res.json(fmtOrder(order, order.providerId?.companyName));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 api.patch("/orders/:id", protect, async (req, res) => {
-  const { status, note, tracking } = req.body;
-  const { rows: os } = await query("SELECT * FROM orders WHERE id=$1 AND buyer_id=$2", [req.params.id, req.userId]);
-  if (!os.length) return res.status(404).json({ error: "Order not found" });
-  const timeline = [...(os[0].timeline || []), { status, note: note||null, timestamp: new Date().toISOString() }];
-  let sql = "UPDATE orders SET status=$1,timeline=$2,updated_at=NOW()";
-  const vals = [status, JSON.stringify(timeline)];
-  let idx = 3;
-  if (tracking?.carrier)    { sql += `,tracking_carrier=$${idx++}`; vals.push(tracking.carrier); }
-  if (tracking?.trackingNo) { sql += `,tracking_no=$${idx++}`;      vals.push(tracking.trackingNo); }
-  if (tracking?.url)        { sql += `,tracking_url=$${idx++}`;     vals.push(tracking.url); }
-  sql += ` WHERE id=$${idx} RETURNING *`;
-  vals.push(req.params.id);
-  const { rows: updated } = await query(sql, vals);
-  const { rows: ps } = await query("SELECT company_name FROM providers WHERE id=$1", [updated[0].provider_id]);
-  res.json(fmtOrder(updated[0], ps[0]?.company_name));
+  try {
+    const { status, note, tracking } = req.body;
+    const order = await Order.findOne({ _id: req.params.id, buyerId: req.userId });
+    if (!order) return res.status(404).json({ error: "Order not found" });
+
+    const timeline = [...(order.timeline || []), { status, note: note || null, timestamp: new Date().toISOString() }];
+    const update   = { status, timeline, updatedAt: new Date() };
+    if (tracking?.carrier)    update["tracking.carrier"]    = tracking.carrier;
+    if (tracking?.trackingNo) update["tracking.trackingNo"] = tracking.trackingNo;
+    if (tracking?.url)        update["tracking.url"]        = tracking.url;
+
+    const updated  = await Order.findByIdAndUpdate(req.params.id, { $set: update }, { new: true }).populate("providerId", "companyName");
+    res.json(fmtOrder(updated, updated.providerId?.companyName));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ── Dashboard routes ──────────────────────────────────────────────────────────
 api.get("/dashboard/summary", protect, async (req, res) => {
-  const uid = req.userId;
-  const [td, tq, to, conf, spendRows] = await Promise.all([
-    query("SELECT COUNT(*) FROM designs WHERE owner_id=$1", [uid]),
-    query("SELECT COUNT(*) FROM quotes WHERE requester_id=$1", [uid]),
-    query("SELECT COUNT(*) FROM orders WHERE buyer_id=$1", [uid]),
-    query("SELECT AVG(ai_confidence) FROM designs WHERE owner_id=$1", [uid]),
-    query("SELECT pricing_total FROM orders WHERE buyer_id=$1", [uid]),
-  ]);
-  const totalSpend = spendRows.rows.reduce((s, o) => s + Number(o.pricing_total || 0), 0);
-  res.json({
-    totalDesigns:          Number(td.rows[0].count),
-    designsThisMonth:      Number(td.rows[0].count),
-    pendingConversions:    Number(td.rows[0].count),
-    totalQuotes:           Number(tq.rows[0].count),
-    activeOrders:          Number(to.rows[0].count),
-    totalSpend,
-    conversionSuccessRate: 87.4,
-    avgConfidenceScore:    Number(conf.rows[0].avg || 0) * 100,
-  });
+  try {
+    const uid = req.userId;
+    const [totalDesigns, totalQuotes, activeOrders, designs, orders] = await Promise.all([
+      Design.countDocuments({ ownerId: uid }),
+      Quote.countDocuments({ requesterId: uid }),
+      Order.countDocuments({ buyerId: uid }),
+      Design.find({ ownerId: uid }, "aiAnalysis.confidence"),
+      Order.find({ buyerId: uid }, "pricing.total"),
+    ]);
+    const totalSpend = orders.reduce((s, o) => s + (o.pricing?.total || 0), 0);
+    const avgConf    = designs.length
+      ? designs.reduce((s, d) => s + (d.aiAnalysis?.confidence || 0), 0) / designs.length
+      : 0;
+    res.json({
+      totalDesigns,
+      designsThisMonth:      totalDesigns,
+      pendingConversions:    totalDesigns,
+      totalQuotes,
+      activeOrders,
+      totalSpend,
+      conversionSuccessRate: 87.4,
+      avgConfidenceScore:    parseFloat((avgConf * 100).toFixed(1)),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 api.get("/dashboard/activity", protect, async (req, res) => {
-  const uid = req.userId;
-  const [designs, orders] = await Promise.all([
-    query("SELECT * FROM designs WHERE owner_id=$1 ORDER BY created_at DESC LIMIT 10", [uid]),
-    query("SELECT * FROM orders WHERE buyer_id=$1 ORDER BY created_at DESC LIMIT 5", [uid]),
-  ]);
-  const activity = [];
-  for (const d of designs.rows) {
-    if (d.status === "uploaded") activity.push({ id: `upload-${d.id}`, type: "upload", title: "Design uploaded", description: d.part_name, timestamp: d.created_at, designId: String(d.id) });
-    if (d.status === "approved" && d.approved_at) activity.push({ id: `approve-${d.id}`, type: "approve", title: "Design approved", description: `${d.part_name} verified and approved`, timestamp: d.approved_at, designId: String(d.id) });
-    if (d.dwg_generated_at) activity.push({ id: `convert-${d.id}`, type: "convert", title: "Conversion complete", description: `${d.part_name} → DXF (${d.dwg_entities||0} entities)`, timestamp: d.dwg_generated_at, designId: String(d.id) });
-  }
-  for (const o of orders.rows) {
-    activity.push({ id: `order-${o.id}`, type: "order", title: "Order placed", description: `Order ${o.order_number} confirmed`, timestamp: o.created_at, designId: String(o.design_id) });
-  }
-  activity.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
-  res.json(activity.slice(0, 15));
+  try {
+    const uid = req.userId;
+    const [designs, orders] = await Promise.all([
+      Design.find({ ownerId: uid }).sort({ createdAt: -1 }).limit(10),
+      Order.find({ buyerId: uid }).sort({ createdAt: -1 }).limit(5),
+    ]);
+    const activity = [];
+    for (const d of designs) {
+      if (d.status === "uploaded")
+        activity.push({ id: `upload-${d._id}`,  type: "upload",  title: "Design uploaded",     description: d.partName, timestamp: d.createdAt, designId: String(d._id) });
+      if (d.status === "approved" && d.approvedAt)
+        activity.push({ id: `approve-${d._id}`, type: "approve", title: "Design approved",      description: `${d.partName} verified and approved`, timestamp: d.approvedAt, designId: String(d._id) });
+      if (d.dwg?.generatedAt)
+        activity.push({ id: `convert-${d._id}`, type: "convert", title: "Conversion complete",  description: `${d.partName} → DXF (${d.dwg.entities||0} entities)`, timestamp: d.dwg.generatedAt, designId: String(d._id) });
+    }
+    for (const o of orders) {
+      activity.push({ id: `order-${o._id}`, type: "order", title: "Order placed", description: `Order ${o.orderNumber} confirmed`, timestamp: o.createdAt, designId: String(o.designId) });
+    }
+    activity.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+    res.json(activity.slice(0, 15));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ── Mount & start ─────────────────────────────────────────────────────────────
@@ -829,6 +874,6 @@ app.use(BASE_PATH, api);
 initDb().then(() => {
   app.listen(PORT, () => console.log(`SheetForge API listening on port ${PORT} at ${BASE_PATH}`));
 }).catch(err => {
-  console.error("DB init failed:", err);
+  console.error("MongoDB connection failed:", err.message);
   process.exit(1);
 });
