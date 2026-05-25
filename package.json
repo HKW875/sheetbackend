@@ -10,7 +10,6 @@
   },
 
   "dependencies": {
-
     "express":            "^4.19.2",
     "mongoose":           "^8.4.0",
     "cors":               "^2.8.5",
@@ -21,32 +20,22 @@
     "jsonwebtoken":       "^9.0.2",
     "bcryptjs":           "^2.4.3",
     "dotenv":             "^16.4.5",
-
     "@anthropic-ai/sdk":  "^0.24.3",
-
     "sharp":              "^0.34.5",
-
     "@tarikjabiri/dxf":   "^2.8.9",
-
     "pdf2pic":            "^3.2.0",
     "pdf-parse":          "^2.4.5",
-
     "jimp":               "^1.6.1",
     "canvas":             "^3.2.3",
     "image-js":           "^1.6.1",
-
     "potrace":            "^2.1.8",
     "opentype.js":        "^2.0.0",
     "svg-parser":         "^2.0.4",
-
     "dxf-parser":         "^1.1.2",
-
     "axios":              "^1.7.2",
     "form-data":          "^4.0.0",
-
     "archiver":           "^7.0.1",
     "tmp":                "^0.2.5",
-
     "winston":            "^3.19.0",
     "express-rate-limit": "^8.5.2",
     "compression":        "^1.8.1",
