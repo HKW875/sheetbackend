@@ -19,7 +19,7 @@ const path       = require("path");
 const fs         = require("fs");
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const PORT       = process.env.PORT || 8080;
+const PORT       = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || "sheetforge_jwt_secret_2026";
 const BASE_PATH  = process.env.BASE_PATH || "/api";
 
