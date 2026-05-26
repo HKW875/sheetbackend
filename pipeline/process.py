@@ -321,7 +321,13 @@ def map_coordinates(hull_data, dpi):
     }
 
 # ─── STAGE 19 — Google AI Vision deep analysis ────────────────────────────────────
-import google.generativeai as genai
+# New (google-genai)
+from google import genai
+client = genai.Client(api_key=api_key)
+response = client.models.generate_content(
+    model="gemini-2.0-flash",
+    contents=[image, prompt]
+)
 
 def gemini_vision_analysis(image_path, cv_data):
     api_key = os.environ.get("GEMINI_API_KEY")
