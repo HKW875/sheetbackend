@@ -1,0 +1,7 @@
+# Python dependencies for pipeline/process.py
+opencv-python==4.11.0.86
+numpy>=1.24.0
+ezdxf==1.4.4
+pytesseract==0.3.13
+Pillow==12.2.0
+anthropic==0.104.1
