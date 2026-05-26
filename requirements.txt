@@ -1,8 +1,22 @@
-# Python dependencies for pipeline/process.py
+# Python dependencies for SheetForge pipeline/process.py  v3.0
+# Core CV
 opencv-python==4.11.0.86
+opencv-contrib-python==4.11.0.86
 numpy>=1.24.0
+
+# DXF generation
 ezdxf==1.4.4
+
+# OCR
 pytesseract==0.3.13
+
+# Image processing
 Pillow==12.2.0
-anthropic==0.104.1
+scikit-image>=0.21.0
+
+# AI clients
 google-genai>=1.0.0
+
+# Scientific / clustering
+scipy>=1.11.0
+scikit-learn>=1.3.0
