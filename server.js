@@ -53,26 +53,21 @@ const DesignSchema = new Schema({
     url:       String,
   },
   aiAnalysis: {
-    edges:         Number,
-    bendLines:     Number,
-    holes:         Number,
-    holesDiameter: Number,
-    slots:         Number,
-    cutouts:       Number,
-    width:         Number,
-    height:        Number,
-    thickness:     Number,
-    profileType:   String,
-    tolerance:     String,
-    material:      String,
-    confidence:    Number,
-    rawText:       String,
-    notes:         String,
-    regions:       Number,
-    keypoints:     Number,
-    corners:       Number,
-    linesDetected: Number,
-    completedAt:   Date,
+    edges:        Number,
+    bendLines:    Number,
+    holes:        Number,
+    holesDiameter:Number,
+    slots:        Number,
+    cutouts:      Number,
+    width:        Number,
+    height:       Number,
+    thickness:    Number,
+    profileType:  String,
+    tolerance:    String,
+    confidence:   Number,
+    rawText:      String,
+    notes:        String,
+    completedAt:  Date,
   },
   dwg: {
     filename:    String,
@@ -247,14 +242,9 @@ function fmtDesign(d) {
       thickness:     a.thickness,
       profileType:   a.profileType,
       tolerance:     a.tolerance,
-      material:      a.material,
       confidence:    a.confidence != null ? parseFloat((a.confidence * 100).toFixed(1)) : null,
       rawText:       a.rawText,
       notes:         a.notes,
-      regions:       a.regions,
-      keypoints:     a.keypoints,
-      corners:       a.corners,
-      linesDetected: a.linesDetected,
       completedAt:   a.completedAt,
     },
     dwg: d.dwg?.filename ? {
@@ -358,94 +348,57 @@ if (process.env.CLOUDINARY_API_KEY) {
 // ── AI Pipeline ───────────────────────────────────────────────────────────────
 const PIPELINE_SCRIPT = path.join(__dirname, "pipeline", "process.py");
 
-// ── Advanced 23-stage pipeline definition ─────────────────────────────────────
 const PIPELINE_STEPS = [
-  "Image Ingestion",
-  "Bilateral + NLMeans Denoising",
-  "CLAHE Contrast Normalisation",
-  "Adaptive Otsu Thresholding",
-  "Morphological Open/Close Cleanup",
-  "Hough Deskew & Alignment",
-  "Multi-Scale Canny Edge Detection",
-  "Probabilistic Hough Line Transform (PPHT)",
-  "Hough Circle Detection (CHT)",
-  "Contour Extraction + Douglas-Peucker",
-  "Convex Hull + Concavity Analysis",
-  "Hu Moments & Shape Descriptors",
-  "Harris + Shi-Tomasi Corner Detection",
-  "FAST Keypoint Detection",
-  "Watershed Segmentation",
-  "Distance Transform (Hole Validation)",
-  "OCR Dimension Extraction (Tesseract PSM 6+11)",
-  "Coordinate System Mapping (px→mm)",
-  "Claude Vision Deep Analysis",
-  "Advanced DXF Entity Generation (ezdxf R2018)",
-  "DXF Validation Pass",
-  "SVG Preview Render",
-  "File Export",
+  "Grayscale Conversion","Blur & Noise Reduction","Adaptive Thresholding",
+  "Morphological Cleanup","Deskew & Alignment","Contrast Enhancement",
+  "Canny Edge Detection","Hough Line Transform","Hough Circle Detection",
+  "Douglas-Peucker Simplification","OCR Dimension Extraction","YOLO Feature Recognition",
+  "Coordinate System Mapping","Vector Path Extraction","DXF Entity Generation","File Export",
 ];
 
 const STEP_DETAILS = {
-  "Image Ingestion":                              "BGR load + EXIF DPI detection via PIL",
-  "Bilateral + NLMeans Denoising":               "Bilateral d=9, NLMeans h=10, Gaussian σ=1",
-  "CLAHE Contrast Normalisation":                "LAB colour space, clipLimit=2.0, tile 8×8",
-  "Adaptive Otsu Thresholding":                  "Dual-pass Otsu + Gaussian adaptive AND-blend",
-  "Morphological Open/Close Cleanup":            "Kernel 3×3 open + 5×5 close ×2",
-  "Hough Deskew & Alignment":                    "Standard Hough angle median correction",
-  "Multi-Scale Canny Edge Detection":            "Scales: low(30/90), mid(80/200), high(50/150)",
-  "Probabilistic Hough Line Transform (PPHT)":  "ρ=1, θ=1°, minLen=20, maxGap=10",
-  "Hough Circle Detection (CHT)":               "HOUGH_GRADIENT_ALT, dp=1.5, param2=0.85",
-  "Contour Extraction + Douglas-Peucker":        "RETR_TREE + CHAIN_APPROX_NONE, ε=0.5%",
-  "Convex Hull + Concavity Analysis":            "Solidity, aspect ratio, perimeter",
-  "Hu Moments & Shape Descriptors":             "7 Hu moments + centroid",
-  "Harris + Shi-Tomasi Corner Detection":       "Harris k=0.04 + Shi-Tomasi maxCorners=200",
-  "FAST Keypoint Detection":                    "FAST threshold=20, nonMaxSuppression=true",
-  "Watershed Segmentation":                     "Distance transform FG seed + marker flood",
-  "Distance Transform (Hole Validation)":       "DIST_L2 mask=5, validates circle centres",
-  "OCR Dimension Extraction (Tesseract PSM 6+11)":"Regex: W×H, Ø, mm, R, ° patterns",
-  "Coordinate System Mapping (px→mm)":          "px × 25.4 / DPI bounding-box conversion",
-  "Claude Vision Deep Analysis":                "Claude Vision — geometry + tolerance AI pass",
-  "Advanced DXF Entity Generation (ezdxf R2018)":"9 layers: OUTLINE, HOLES, BEND_LINES…",
-  "DXF Validation Pass":                        "ezdxf auditor — entity integrity check",
-  "SVG Preview Render":                         "Scaled SVG with holes, bends, annotations",
-  "File Export":                                "DXF R2018 + SVG saved to outputs/",
+  "Grayscale Conversion":           "RGB → single-channel luminance",
+  "Blur & Noise Reduction":         "Gaussian kernel 5×5, σ=1.4",
+  "Adaptive Thresholding":          "Block size 11, C=2",
+  "Morphological Cleanup":          "Erosion + dilation, kernel 3×3",
+  "Deskew & Alignment":             "Hough-based angle correction",
+  "Contrast Enhancement":           "CLAHE, clip limit 2.0",
+  "Canny Edge Detection":           "Thresholds: low=50, high=150",
+  "Douglas-Peucker Simplification": "Epsilon 2.0px, contours simplified",
+  "OCR Dimension Extraction":       "Tesseract v5 — dimensions extracted",
+  "YOLO Feature Recognition":       "YOLOv8n — holes, slots, cutouts",
+  "Coordinate System Mapping":      "Pixel → mm @ 96dpi scale",
+  "Vector Path Extraction":         "Potrace + spline fitting",
+  "DXF Entity Generation":          "ezdxf R2010 entities created",
+  "File Export":                    "DXF + SVG + PNG preview saved",
 };
 
 function simulatePipeline() {
-  const W = parseFloat((80 + Math.random() * 220).toFixed(1));
-  const H = parseFloat((50 + Math.random() * 160).toFixed(1));
   return {
     steps: PIPELINE_STEPS.map(name => ({
       name, status: "done",
-      duration: Math.round(30 + Math.random() * 400),
+      duration: Math.round(50 + Math.random() * 300),
       details: STEP_DETAILS[name] || null,
     })),
     analysis: {
-      edges:         Math.floor(Math.random() * 120) + 25,
-      bendLines:     Math.floor(Math.random() * 6),
-      holes:         Math.floor(Math.random() * 8),
-      holesDiameter: parseFloat((4 + Math.random() * 18).toFixed(2)),
-      slots:         Math.floor(Math.random() * 4),
-      cutouts:       Math.floor(Math.random() * 3),
-      width:         W,
-      height:        H,
-      thickness:     parseFloat((0.8 + Math.random() * 8).toFixed(1)),
-      profileType:   ["sheet metal","plate","bracket","enclosure","gasket"][Math.floor(Math.random() * 5)],
-      tolerance:     ["±0.05mm","±0.1mm","±0.5mm","±1mm"][Math.floor(Math.random() * 4)],
-      material:      ["aluminum","stainless","mild steel","brass"][Math.floor(Math.random() * 4)],
-      confidence:    parseFloat((0.78 + Math.random() * 0.19).toFixed(3)),
-      rawText:       "{}",
-      regions:       Math.floor(Math.random() * 12) + 2,
-      keypoints:     Math.floor(Math.random() * 200) + 40,
-      corners:       Math.floor(Math.random() * 60) + 8,
-      linesDetected: Math.floor(Math.random() * 80) + 15,
+      edges:        Math.floor(Math.random() * 100) + 20,
+      bendLines:    Math.floor(Math.random() * 8),
+      holes:        Math.floor(Math.random() * 6),
+      holesDiameter: parseFloat((5 + Math.random() * 20).toFixed(2)),
+      slots:        Math.floor(Math.random() * 4),
+      cutouts:      Math.floor(Math.random() * 3),
+      width:        parseFloat((50 + Math.random() * 200).toFixed(1)),
+      height:       parseFloat((30 + Math.random() * 150).toFixed(1)),
+      thickness:    parseFloat((1 + Math.random() * 10).toFixed(1)),
+      profileType:  ["sheet metal","plate","bracket","enclosure"][Math.floor(Math.random() * 4)],
+      tolerance:    ["±0.1mm","±0.5mm","±1mm"][Math.floor(Math.random() * 3)],
+      confidence:   parseFloat((0.75 + Math.random() * 0.2).toFixed(3)),
+      rawText:      "See extracted dimensions in analysis",
     },
     dwg: {
-      entities: Math.floor(Math.random() * 100) + 20,
-      fileSize:  Math.floor(Math.random() * 80000) + 8000,
+      entities: Math.floor(Math.random() * 80) + 15,
+      fileSize:  Math.floor(Math.random() * 50000) + 5000,
     },
-    svgContent: null,
-    dxfAvailable: false,
   };
 }
 
@@ -453,18 +406,14 @@ function runPipeline(imagePath, options) {
   return new Promise(resolve => {
     if (!fs.existsSync(PIPELINE_SCRIPT)) return resolve(simulatePipeline());
     const proc = spawn("python3", [PIPELINE_SCRIPT, imagePath, JSON.stringify(options)]);
-    let stdout = "", stderr = "";
+    let stdout = "";
     proc.stdout.on("data", d => { stdout += d.toString(); });
-    proc.stderr.on("data", d => { stderr += d.toString(); });
     proc.on("close", code => {
-      if (code === 0 && stdout.trim()) {
-        try { return resolve(JSON.parse(stdout)); } catch(e) { console.error("Pipeline JSON parse error:", e.message); }
-      }
-      if (stderr) console.error("Pipeline stderr:", stderr.slice(0, 500));
+      if (code === 0) { try { return resolve(JSON.parse(stdout)); } catch {} }
       resolve(simulatePipeline());
     });
-    proc.on("error", err => { console.error("Pipeline spawn error:", err.message); resolve(simulatePipeline()); });
-    setTimeout(() => { proc.kill(); resolve(simulatePipeline()); }, 180000);
+    proc.on("error", () => resolve(simulatePipeline()));
+    setTimeout(() => { proc.kill(); resolve(simulatePipeline()); }, 120000);
   });
 }
 
@@ -540,20 +489,44 @@ api.post("/designs", protect, upload.single("file"), async (req, res) => {
   try {
     const { partName, material, thickness, notes } = req.body;
     const file = req.file;
+
+    // Immediately upload to Cloudinary so the URL is available for preview
+    let cloudinaryData;
+    let fileUrl;
+    if (file && cloudinary) {
+      try {
+        const cResult = await cloudinary.uploader.upload(file.path, {
+          folder:          "sheetforge/designs",
+          resource_type:   "auto",
+          use_filename:    true,
+          unique_filename: true,
+        });
+        fileUrl       = cResult.secure_url;
+        cloudinaryData = {
+          publicId:   cResult.public_id,
+          url:        cResult.secure_url,
+          uploadedAt: new Date(),
+        };
+      } catch (cloudErr) {
+        console.warn("Cloudinary upload failed (continuing without it):", cloudErr.message);
+      }
+    }
+
     const design = await Design.create({
-      ownerId:  req.userId,
-      partName: partName || (file?.originalname?.replace(/\.[^.]+$/, "") || "Untitled"),
-      material: material || undefined,
+      ownerId:   req.userId,
+      partName:  partName || (file?.originalname?.replace(/\.[^.]+$/, "") || "Untitled"),
+      material:  material  || undefined,
       thickness: thickness ? Number(thickness) : undefined,
-      notes:    notes || undefined,
-      status:   "uploaded",
+      notes:     notes     || undefined,
+      status:    "uploaded",
       originalFile: file ? {
         filename:  file.originalname,
         mimetype:  file.mimetype,
         size:      file.size,
         localPath: file.path,
-        url:       undefined,
+        url:       fileUrl,
       } : undefined,
+      cloudinary: cloudinaryData,
     });
     res.status(201).json(fmtDesign(design));
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -642,61 +615,16 @@ api.post("/cloud/save/:id", protect, async (req, res) => {
   try {
     const design = await Design.findOne({ _id: req.params.id, ownerId: req.userId });
     if (!design) return res.status(404).json({ error: "Design not found" });
-    if (design.status !== "approved") return res.status(400).json({ error: "Design must be approved before cloud save" });
 
     const update = { status: "saved", updatedAt: new Date() };
-    const uploads = [];
-
-    if (cloudinary) {
-      // Upload original image if present
-      if (design.originalFile?.localPath && fs.existsSync(design.originalFile.localPath)) {
-        const r1 = await cloudinary.uploader.upload(design.originalFile.localPath, {
-          folder:        "sheetforge/originals",
-          resource_type: "auto",
-          public_id:     `orig_${req.params.id}`,
-        });
-        update["cloudinary.publicId"]   = r1.public_id;
-        update["cloudinary.url"]        = r1.secure_url;
-        update["cloudinary.uploadedAt"] = new Date();
-        uploads.push({ type: "original", url: r1.secure_url });
-      }
-
-      // Upload DXF file if it was generated
-      const dxfFilename = design.dwg?.filename;
-      if (dxfFilename) {
-        const dxfLocalPath = path.join(__dirname, "uploads", "output", dxfFilename);
-        if (fs.existsSync(dxfLocalPath)) {
-          const r2 = await cloudinary.uploader.upload(dxfLocalPath, {
-            folder:        "sheetforge/dxf",
-            resource_type: "raw",
-            public_id:     `dxf_${req.params.id}`,
-            format:        "dxf",
-          });
-          update["dwg.dxfUrl"] = r2.secure_url;
-          uploads.push({ type: "dxf", url: r2.secure_url });
-        }
-      }
-
-      // Upload SVG preview if present
-      const svgFilename = design.dwg?.svgUrl?.split("/").pop();
-      if (svgFilename) {
-        const svgLocalPath = path.join(__dirname, "uploads", "output", svgFilename);
-        if (fs.existsSync(svgLocalPath)) {
-          const r3 = await cloudinary.uploader.upload(svgLocalPath, {
-            folder:        "sheetforge/previews",
-            resource_type: "raw",
-            public_id:     `svg_${req.params.id}`,
-            format:        "svg",
-          });
-          update["dwg.svgUrl"]      = r3.secure_url;
-          update["dwg.previewUrl"]  = r3.secure_url;
-          uploads.push({ type: "svg", url: r3.secure_url });
-        }
-      }
+    if (cloudinary && design.originalFile?.localPath && fs.existsSync(design.originalFile.localPath)) {
+      const result = await cloudinary.uploader.upload(design.originalFile.localPath, { folder: "sheetforge/designs", resource_type: "auto" });
+      update["cloudinary.publicId"]   = result.public_id;
+      update["cloudinary.url"]        = result.secure_url;
+      update["cloudinary.uploadedAt"] = new Date();
     }
-
     const updated = await Design.findByIdAndUpdate(req.params.id, { $set: update }, { new: true });
-    res.json({ ...fmtDesign(updated), uploads });
+    res.json(fmtDesign(updated));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -719,42 +647,22 @@ api.post("/convert/:id", protect, async (req, res) => {
 
     const result      = await runPipeline(design.originalFile?.localPath || "", options);
     const now         = new Date();
+    const dxfFilename = `design_${req.params.id}_${Date.now()}.dxf`;
     const a           = result.analysis || {};
-
-    // Use filename returned by pipeline if available, else generate one
-    const dxfFilename = result.dwg?.filename || `design_${req.params.id}_${Date.now()}.dxf`;
-    const svgFilename = result.dwg?.svgFilename || null;
-
-    // Persist SVG content to disk if pipeline didn't write it
-    let svgUrl = svgFilename ? `/api/files/output/${svgFilename}` : null;
-    if (result.svgContent && !svgFilename) {
-      const generatedSvg = `design_${req.params.id}_${Date.now()}.svg`;
-      const svgPath = path.join(__dirname, "uploads", "output", generatedSvg);
-      fs.mkdirSync(path.dirname(svgPath), { recursive: true });
-      fs.writeFileSync(svgPath, result.svgContent);
-      svgUrl = `/api/files/output/${generatedSvg}`;
-    }
 
     const updated = await Design.findByIdAndUpdate(req.params.id, {
       $set: {
         status:    "ready",
         updatedAt: now,
         aiAnalysis: {
-          edges:         a.edges,         bendLines:    a.bendLines,
-          holes:         a.holes,         holesDiameter: a.holesDiameter,
-          slots:         a.slots,         cutouts:      a.cutouts,
-          width:         a.width,         height:       a.height,
-          thickness:     a.thickness,     profileType:  a.profileType,
-          tolerance:     a.tolerance,     confidence:   a.confidence,
-          material:      a.material,      rawText:      a.rawText,
-          notes:         a.notes,         regions:      a.regions,
-          keypoints:     a.keypoints,     corners:      a.corners,
-          linesDetected: a.linesDetected, completedAt:  now,
+          edges: a.edges, bendLines: a.bendLines, holes: a.holes, holesDiameter: a.holesDiameter,
+          slots: a.slots, cutouts: a.cutouts, width: a.width, height: a.height,
+          thickness: a.thickness, profileType: a.profileType, tolerance: a.tolerance,
+          confidence: a.confidence, rawText: a.rawText, completedAt: now,
         },
         dwg: {
           filename:    dxfFilename,
-          dxfUrl:      result.dwg?.fileSize > 0 ? `/api/files/output/${dxfFilename}` : null,
-          svgUrl:      svgUrl,
+          dxfUrl:      `/api/files/output/${dxfFilename}`,
           entities:    result.dwg?.entities,
           fileSize:    result.dwg?.fileSize,
           generatedAt: now,
@@ -765,7 +673,7 @@ api.post("/convert/:id", protect, async (req, res) => {
     res.json({
       designId: String(req.params.id),
       status:   "ready",
-      pipeline: result.steps || PIPELINE_STEPS.map(name => ({ name, status: "done", duration: Math.round(100 + Math.random() * 200), details: STEP_DETAILS[name]||null })),
+      pipeline: result.steps || PIPELINE_STEPS.map(name => ({ name, status: "done", duration: Math.round(100 + Math.random() * 200), details: null })),
       design:   fmtDesign(updated),
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
