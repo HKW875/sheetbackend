@@ -320,65 +320,21 @@ def map_coordinates(hull_data, dpi):
         "scale_px_mm": round(dpi / 25.4, 6),
     }
 
-# ─── STAGE 19 — Claude Vision deep analysis ────────────────────────────────────
-def claude_vision_analysis(image_path, cv_data):
-    """Call Claude Vision for semantic understanding + engineering metadata."""
-    if not HAS_AI: return {}
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+# ─── STAGE 19 — Google AI Vision deep analysis ────────────────────────────────────
+import google.generativeai as genai
+
+def gemini_vision_analysis(image_path, cv_data):
+    api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key: return {}
     try:
-        client = anthropic_mod.Anthropic(api_key=api_key)
-        # Encode image
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel("gemini-1.5-flash")
         with open(image_path, "rb") as f:
-            img_b64 = base64.standard_b64encode(f.read()).decode()
-        ext = Path(image_path).suffix.lower().lstrip(".")
-        media_type = {"jpg":"image/jpeg","jpeg":"image/jpeg","png":"image/png","bmp":"image/bmp","tiff":"image/tiff"}.get(ext, "image/jpeg")
-
-        prompt = f"""You are an expert mechanical/sheet-metal CAD engineer.
-Analyse this engineering drawing image and return ONLY a valid JSON object with these keys:
-{{
-  "profileType": "sheet metal | plate | bracket | enclosure | gasket | stamping | other",
-  "widthMM": <number or null>,
-  "heightMM": <number or null>,
-  "thicknessMM": <number or null>,
-  "holeCount": <integer>,
-  "holeDiameterMM": <number or null>,
-  "slotCount": <integer>,
-  "bendLineCount": <integer>,
-  "cutoutCount": <integer>,
-  "totalEdges": <integer>,
-  "toleranceClass": "fine (±0.05mm) | medium (±0.1mm) | coarse (±0.5mm) | general (±1mm)",
-  "surfaceFinish": "as machined | anodized | powder coat | galvanized | raw | unknown",
-  "threadedHoles": <integer>,
-  "symmetryAxes": <0|1|2>,
-  "estimatedMaterial": "aluminum | steel | stainless | brass | copper | titanium | unknown",
-  "confidence": <0.0-1.0>,
-  "engineeringNotes": "<brief note>"
-}}
-
-CV pre-processing detected:
-- Circles (holes): {len(cv_data.get('circles',[]))}
-- Lines detected:  {len(cv_data.get('lines',[]))}
-- Corners:         {len(cv_data.get('corners',[]))}
-- Image W×H px:    {cv_data.get('img_w',0)} × {cv_data.get('img_h',0)}
-- Estimated W×H mm: {cv_data.get('width_mm',0)} × {cv_data.get('height_mm',0)}
-
-Return ONLY the JSON object. No preamble. No markdown."""
-
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=600,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_b64}},
-                    {"type": "text",  "text":  prompt},
-                ]
-            }]
-        )
-        text = "".join(b.text for b in response.content if hasattr(b,"text"))
-        text = re.sub(r"```[a-z]*", "", text).strip().strip("`")
-        return json.loads(text)
+            img_data = f.read()
+        import PIL.Image, io
+        img = PIL.Image.open(io.BytesIO(img_data))
+        response = model.generate_content([img, prompt])  # same prompt as Claude
+        return json.loads(re.sub(r"```[a-z]*", "", response.text).strip().strip("`"))
     except Exception as e:
         return {"error": str(e)}
 
