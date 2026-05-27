@@ -21,7 +21,7 @@ v4.0 New Features:
   - AI-powered DXF interaction/correction endpoint
 """
 
-import sys, os, json, math, time, base64, re, traceback, cv2
+import sys, os, json, math, time, base64, re, traceback
 from pathlib import Path
 
 # ─── Graceful optional imports ────────────────────────────────────────────────
