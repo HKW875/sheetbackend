@@ -63,7 +63,7 @@ const User = mongoose.model('User', userSchema);
 const designSchema = new mongoose.Schema({
   userId: mongoose.Types.ObjectId, partName: String, material: String, thickness: Number,
   status: { type: String, default: 'uploaded' },
-  originalFile: { filename: String, url: String, cloudinaryId: String, mimetype: String, size: Number },
+  originalFile: { filename: String, url: String, cloudinaryId: String, mimetype: String, size: Number, localPath: String },
   aiAnalysis: mongoose.Schema.Types.Mixed,
   dwg: {
     entities: Number, fileSize: Number, filename: String, svgFilename: String,
@@ -277,7 +277,7 @@ app.post('/api/designs', authMiddleware, upload.single('file'), async (req, res)
     const design = await Design.create({
       userId: req.user.id, partName: partName || req.file.originalname.replace(/\.[^.]+$/, ''),
       material, thickness: thickness ? parseFloat(thickness) : null,
-      originalFile: { filename: req.file.originalname, url: fileUrl, cloudinaryId, mimetype: req.file.mimetype, size: req.file.size },
+      originalFile: { filename: req.file.originalname, url: fileUrl, cloudinaryId, mimetype: req.file.mimetype, size: req.file.size, localPath: newPath },
     });
 
     logActivity(req.user.id, 'upload', `Uploaded: ${design.partName}`, `${req.file.originalname} • ${(req.file.size / 1024).toFixed(0)}KB`);
@@ -315,14 +315,24 @@ app.post('/api/convert/:id', authMiddleware, async (req, res) => {
     d.status = 'analyzing'; d.conversionLog = []; await d.save();
 
     const opts = { ...req.body, anthropicApiKey: process.env.ANTHROPIC_API_KEY, thickness: d.thickness || 2.0 };
-    const imageFile = d.originalFile?.url?.startsWith('/uploads/') ? path.join(__dirname, d.originalFile.url) : null;
-
-    // Determine local path
-    let localImagePath = imageFile;
+    // Determine local path: prefer saved localPath, then /uploads/ URL, then scan by original filename
+    let localImagePath = d.originalFile?.localPath || null;
     if (!localImagePath || !fs.existsSync(localImagePath)) {
-      const files = fs.readdirSync(UPLOAD_DIR).filter(f => !fs.statSync(path.join(UPLOAD_DIR, f)).isDirectory());
-      const match = files.find(f => f.includes(d._id.toString().slice(-6)));
-      if (match) localImagePath = path.join(UPLOAD_DIR, match);
+      const urlBased = d.originalFile?.url?.startsWith('/uploads/')
+        ? path.join(__dirname, d.originalFile.url) : null;
+      if (urlBased && fs.existsSync(urlBased)) localImagePath = urlBased;
+    }
+    if (!localImagePath || !fs.existsSync(localImagePath)) {
+      // Fallback: scan uploads dir — match by original filename stem (multer generates random hex names)
+      const origName = require('path').parse(d.originalFile?.filename || '').name;
+      try {
+        const allFiles = fs.readdirSync(UPLOAD_DIR)
+          .filter(f => !fs.statSync(path.join(UPLOAD_DIR, f)).isDirectory());
+        const match = origName
+          ? allFiles.find(f => f.startsWith(origName) || f.includes(origName))
+          : allFiles.find(f => f.includes(d._id.toString().slice(-6)));
+        if (match) localImagePath = path.join(UPLOAD_DIR, match);
+      } catch (_) {}
     }
 
     // Run process.py asynchronously
