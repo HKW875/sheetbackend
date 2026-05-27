@@ -396,11 +396,11 @@ function runProcessPy(imagePath, opts = {}, onStep = null) {
     }
 
     const args    = [scriptPath, imagePath, JSON.stringify(opts)];
-    const py      = spawn('python3', args, {
+    const py      = spawn('python', args, {
       env: {
         ...process.env,
         GEMINI_API_KEY: process.env.GEMINI_API_KEY || '',
-        // Keep PATH so python3 can find system libs
+        // Keep PATH so python can find system libs
         PATH: process.env.PATH,
       },
     });
@@ -455,7 +455,7 @@ function execProcessPy(imagePath, opts = {}) {
   return new Promise((resolve, reject) => {
     const scriptPath = path.join(__dirname, 'process.py');
     const optsJson   = JSON.stringify(opts).replace(/'/g, "'\\''");
-    const cmd        = `python3 "${scriptPath}" "${imagePath}" '${optsJson}'`;
+    const cmd        = `python "${scriptPath}" "${imagePath}" '${optsJson}'`;
 
     exec(cmd, {
       maxBuffer: 50 * 1024 * 1024,  // 50 MB stdout buffer
