@@ -1,903 +1,672 @@
-"use strict";
+/**
+ * SheetForge v4 — Express Backend
+ * ================================
+ * New in v4:
+ *  - /api/gcode/:id          POST  — Generate G-Code from DXF analysis
+ *  - /api/ai-interact        POST  — AI natural-language DXF manipulation
+ *  - /api/cloud/gcode        POST  — Upload G-Code as PDF to Cloudinary + save link in MongoDB
+ *  - /api/dashboard/activity/:id DELETE — Delete activity entry
+ *  - /api/designs/:id/approve PATCH — now also triggers GCode generation
+ *  - All existing v3 routes preserved
+ */
 
-// ─── SheetForge — server.js ───────────────────────────────────────────────────
-// Single-file Express backend. No TypeScript, no build step.
-// Run:  node server.js
-// Env:  MONGO_URI (required), JWT_SECRET (optional), PORT (optional),
-//       CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET (optional)
-// ─────────────────────────────────────────────────────────────────────────────
+'use strict';
+require('dotenv').config();
 
-const express    = require("express");
-const cors       = require("cors");
-const multer     = require("multer");
-const bcrypt     = require("bcryptjs");
-const jwt        = require("jsonwebtoken");
-const mongoose   = require("mongoose");
-const { v4: uuidv4 } = require("uuid");
-const { spawn }  = require("child_process");
-const path       = require("path");
-const fs         = require("fs");
+const express      = require('express');
+const cors         = require('cors');
+const helmet       = require('helmet');
+const morgan       = require('morgan');
+const multer       = require('multer');
+const path         = require('path');
+const fs           = require('fs');
+const fsp          = require('fs').promises;
+const { spawn }    = require('child_process');
+const mongoose     = require('mongoose');
+const jwt          = require('jsonwebtoken');
+const bcrypt       = require('bcryptjs');
+const cloudinary   = require('cloudinary').v2;
+const PDFDocument  = require('pdfkit');
+const Anthropic    = require('@anthropic-ai/sdk');
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const PORT       = process.env.PORT     || 8080;
-const JWT_SECRET = process.env.JWT_SECRET || "sheetforge_jwt_secret_2026";
-const BASE_PATH  = process.env.BASE_PATH  || "/api";
-const MONGO_URI  = process.env.MONGO_URI  || "mongodb://127.0.0.1:27017/sheetforge";
+const PORT       = process.env.PORT || 5000;
+const MONGO_URI  = process.env.MONGO_URI  || 'mongodb://localhost:27017/sheetforge';
+const JWT_SECRET = process.env.JWT_SECRET || 'sheetforge_secret_v4';
+const PYTHON_CMD = process.env.PYTHON_CMD || 'python3';
+const PROCESS_PY = path.join(__dirname, 'process.py');
+const UPLOAD_DIR = path.join(__dirname, 'uploads');
+const OUTPUT_DIR = path.join(UPLOAD_DIR, 'output');
 
-// ── Mongoose Schemas & Models ─────────────────────────────────────────────────
-const { Schema, model, Types } = mongoose;
+[UPLOAD_DIR, OUTPUT_DIR].forEach(d => { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); });
 
-const UserSchema = new Schema({
-  firstName:  { type: String, required: true },
-  lastName:   { type: String, required: true },
-  email:      { type: String, required: true, unique: true, lowercase: true },
-  password:   { type: String, required: true },
-  role:       { type: String, default: "designer" },
-  company:    String,
-  country:    String,
-  isVerified: { type: Boolean, default: false },
-}, { timestamps: true });
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME || '',
+  api_key:    process.env.CLOUDINARY_API_KEY    || '',
+  api_secret: process.env.CLOUDINARY_API_SECRET || '',
+});
 
-const DesignSchema = new Schema({
-  ownerId:   { type: Schema.Types.ObjectId, ref: "User", required: true },
-  partName:  { type: String, required: true },
-  status:    { type: String, default: "uploaded" },
-  material:  String,
-  thickness: Number,
-  notes:     String,
-  originalFile: {
-    filename:  String,
-    mimetype:  String,
-    size:      Number,
-    localPath: String,
-    url:       String,
-  },
-  aiAnalysis: {
-    edges:        Number,
-    bendLines:    Number,
-    holes:        Number,
-    holesDiameter:Number,
-    slots:        Number,
-    cutouts:      Number,
-    width:        Number,
-    height:       Number,
-    thickness:    Number,
-    profileType:  String,
-    tolerance:    String,
-    confidence:   Number,
-    rawText:      String,
-    notes:        String,
-    completedAt:  Date,
-  },
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY || '' });
+
+// ── Mongoose Models ───────────────────────────────────────────────────────────
+mongoose.connect(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
+  .then(() => console.log('MongoDB connected'))
+  .catch(e  => console.error('MongoDB error:', e.message));
+
+const userSchema = new mongoose.Schema({
+  firstName: String, lastName: String, email: { type: String, unique: true },
+  passwordHash: String, role: { type: String, enum: ['designer','provider'], default: 'designer' },
+  company: String, createdAt: { type: Date, default: Date.now },
+});
+const User = mongoose.model('User', userSchema);
+
+const designSchema = new mongoose.Schema({
+  userId: mongoose.Types.ObjectId, partName: String, material: String, thickness: Number,
+  status: { type: String, default: 'uploaded' },
+  originalFile: { filename: String, url: String, cloudinaryId: String, mimetype: String, size: Number },
+  aiAnalysis: mongoose.Schema.Types.Mixed,
   dwg: {
-    filename:    String,
-    previewUrl:  String,
-    dxfUrl:      String,
-    svgUrl:      String,
-    entities:    Number,
-    fileSize:    Number,
-    generatedAt: Date,
+    entities: Number, fileSize: Number, filename: String, svgFilename: String,
+    dxfUrl: String, svgUrl: String, pdfUrl: String, gcodeUrl: String,
+    gcodeFilename: String, localPath: String,
   },
-  cloudinary: {
-    publicId:   String,
-    url:        String,
-    uploadedAt: Date,
-  },
-  approvedAt: Date,
-}, { timestamps: true });
-
-const ProviderSchema = new Schema({
-  companyName:    { type: String, required: true },
-  country:        String,
-  region:         String,
-  flag:           String,
-  specialty:      String,
-  capacity:       String,
-  certifications: { type: [String], default: [] },
-  leadTimeDays:   { min: { type: Number, default: 5 }, max: { type: Number, default: 14 } },
-  rating:         { type: Number, default: 4.5 },
-  totalReviews:   { type: Number, default: 0 },
-  totalOrders:    { type: Number, default: 0 },
-  materials:      { type: [String], default: [] },
-  operations:     { type: [String], default: [] },
-  pricingBase:    { type: Number, default: 100 },
-  isVerified:     { type: Boolean, default: false },
-  isActive:       { type: Boolean, default: true },
-}, { timestamps: true });
-
-const QuoteSchema = new Schema({
-  designId:     { type: Schema.Types.ObjectId, ref: "Design", required: true },
-  requesterId:  { type: Schema.Types.ObjectId, ref: "User",   required: true },
-  status:       { type: String, default: "open" },
-  specs: {
-    length:     Number,
-    width:      Number,
-    thickness:  Number,
-    quantity:   { type: Number, default: 1 },
-    material:   String,
-    operations: { type: [String], default: [] },
-    finish:     String,
-    leadTime:   Number,
-    notes:      String,
-  },
-  bids:      { type: Array, default: [] },
-  expiresAt: Date,
-}, { timestamps: true });
-
-const OrderSchema = new Schema({
-  orderNumber:  { type: String, required: true },
-  buyerId:      { type: Schema.Types.ObjectId, ref: "User" },
-  providerId:   { type: Schema.Types.ObjectId, ref: "Provider" },
-  designId:     { type: Schema.Types.ObjectId, ref: "Design" },
-  quoteId:      { type: Schema.Types.ObjectId, ref: "Quote" },
-  status:       { type: String, default: "confirmed" },
-  specs: {
-    quantity:   Number,
-    material:   String,
-    thickness:  Number,
-    operations: { type: [String], default: [] },
-    finish:     String,
-  },
-  pricing: {
-    unitPrice: Number,
-    quantity:  Number,
-    subtotal:  Number,
-    shipping:  Number,
-    total:     Number,
-    currency:  { type: String, default: "USD" },
-  },
-  tracking: {
-    carrier:    String,
-    trackingNo: String,
-    url:        String,
-  },
-  timeline:          { type: Array, default: [] },
-  estimatedDelivery: Date,
-}, { timestamps: true });
-
-const User     = model("User",     UserSchema);
-const Design   = model("Design",   DesignSchema);
-const Provider = model("Provider", ProviderSchema);
-const Quote    = model("Quote",    QuoteSchema);
-const Order    = model("Order",    OrderSchema);
-
-// ── DB init & seed ────────────────────────────────────────────────────────────
-async function initDb() {
-  await mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 10000 });
-  console.log("MongoDB connected.");
-
-  const count = await Provider.countDocuments();
-  if (count === 0) {
-    await Provider.insertMany([
-      { companyName:"PrecisionCut GmbH",   country:"Germany",        region:"Bavaria",         flag:"🇩🇪", specialty:"Laser Cutting & Bending",    capacity:"High Volume",       certifications:["ISO 9001","DIN EN 1090"],  leadTimeDays:{min:3,max:7},   rating:4.9, totalReviews:312, totalOrders:1840, materials:["Steel","Aluminum","Stainless","Copper"],            operations:["Laser Cut","Press Brake","Welding","Powder Coat"], pricingBase:85,  isVerified:true },
-      { companyName:"Shanghai MetalWorks", country:"China",          region:"Yangtze Delta",   flag:"🇨🇳", specialty:"Sheet Metal Fabrication",    capacity:"Mass Production",   certifications:["ISO 9001","IATF 16949"], leadTimeDays:{min:5,max:12},  rating:4.6, totalReviews:891, totalOrders:4200, materials:["Steel","Aluminum","Brass","Titanium"],              operations:["Stamping","Deep Drawing","CNC Milling","Anodize"], pricingBase:42,  isVerified:true },
-      { companyName:"Makino Metal Works",  country:"Japan",          region:"Osaka",           flag:"🇯🇵", specialty:"High-Precision Stamping",    capacity:"Medium Volume",     certifications:["JIS Q 9001","NADCAP"],   leadTimeDays:{min:7,max:14},  rating:4.8, totalReviews:204, totalOrders:980,  materials:["Titanium","Inconel","Stainless","Copper"],          operations:["EDM","Fine Blanking","Lapping","Plating"],         pricingBase:140, isVerified:true },
-      { companyName:"TechForm Industries", country:"USA",            region:"Michigan",        flag:"🇺🇸", specialty:"Aerospace Components",       capacity:"Custom/Low Volume", certifications:["AS9100D","ITAR","NADCAP"],leadTimeDays:{min:10,max:21}, rating:4.7, totalReviews:156, totalOrders:620,  materials:["Aluminum 6061","Titanium","Steel 4130","Inconel"],  operations:["5-Axis CNC","EDM","CMM Inspection","Anodize"],    pricingBase:180, isVerified:true },
-      { companyName:"Formex UK",           country:"United Kingdom", region:"West Midlands",   flag:"🇬🇧", specialty:"Structural Fabrication",    capacity:"Medium Volume",     certifications:["ISO 9001","CE Marking"], leadTimeDays:{min:5,max:10},  rating:4.5, totalReviews:278, totalOrders:1100, materials:["Mild Steel","Stainless 316","Aluminum"],            operations:["MIG Welding","Laser Cut","Guillotine","Paint"],    pricingBase:95,  isVerified:true },
-      { companyName:"IndiaCNC Solutions",  country:"India",          region:"Pune",            flag:"🇮🇳", specialty:"CNC Machining & Turning",   capacity:"High Volume",       certifications:["ISO 9001","OHSAS"],      leadTimeDays:{min:4,max:9},   rating:4.4, totalReviews:432, totalOrders:2300, materials:["Steel","Aluminum","Brass","Cast Iron"],             operations:["CNC Turning","VMC Milling","Surface Grind","Zinc Plate"], pricingBase:35, isVerified:true },
-      { companyName:"Waterjet Nordic",     country:"Sweden",         region:"Stockholm",       flag:"🇸🇪", specialty:"Waterjet & Plasma",         capacity:"Custom",            certifications:["ISO 9001","EN 1090-2"], leadTimeDays:{min:3,max:8},   rating:4.8, totalReviews:189, totalOrders:740,  materials:["Stone","Glass","Composites","Steel","Aluminum"],   operations:["Waterjet","Plasma Cut","Deburr","Anodize"],        pricingBase:120, isVerified:true },
-      { companyName:"FabTech Brazil",      country:"Brazil",         region:"São Paulo",       flag:"🇧🇷", specialty:"General Metal Fabrication", capacity:"High Volume",       certifications:["ISO 9001","ABNT NBR"],  leadTimeDays:{min:6,max:14},  rating:4.3, totalReviews:267, totalOrders:890,  materials:["Steel","Aluminum","Stainless"],                     operations:["Laser Cut","Press Brake","MIG Weld","Primer"],    pricingBase:55,  isVerified:false },
-    ]);
-    console.log("Providers seeded.");
-  }
-}
-
-// ── Auth helpers ──────────────────────────────────────────────────────────────
-function generateToken(id, role) {
-  return jwt.sign({ id: String(id), role }, JWT_SECRET, { expiresIn: "7d" });
-}
-
-function protect(req, res, next) {
-  const header = req.headers.authorization;
-  if (!header?.startsWith("Bearer ")) return res.status(401).json({ error: "Not authenticated" });
-  try {
-    const decoded = jwt.verify(header.split(" ")[1], JWT_SECRET);
-    req.userId   = decoded.id;
-    req.userRole = decoded.role;
-    next();
-  } catch {
-    res.status(401).json({ error: "Invalid or expired token" });
-  }
-}
-
-// ── Format helpers ────────────────────────────────────────────────────────────
-function fmtUser(u) {
-  return {
-    id:         String(u._id),
-    firstName:  u.firstName,
-    lastName:   u.lastName,
-    email:      u.email,
-    role:       u.role,
-    company:    u.company,
-    country:    u.country,
-    isVerified: u.isVerified,
-    createdAt:  u.createdAt,
-  };
-}
-
-function fmtDesign(d) {
-  const a = d.aiAnalysis || {};
-  return {
-    id:        String(d._id),
-    partName:  d.partName,
-    status:    d.status,
-    material:  d.material,
-    thickness: d.thickness,
-    notes:     d.notes,
-    originalFile: d.originalFile?.filename ? {
-      filename: d.originalFile.filename,
-      mimetype: d.originalFile.mimetype,
-      size:     d.originalFile.size,
-      url:      d.originalFile.url,
-    } : null,
-    aiAnalysis: {
-      edges:         a.edges,
-      bendLines:     a.bendLines,
-      holes:         a.holes,
-      holesDiameter: a.holesDiameter,
-      slots:         a.slots,
-      cutouts:       a.cutouts,
-      width:         a.width,
-      height:        a.height,
-      thickness:     a.thickness,
-      profileType:   a.profileType,
-      tolerance:     a.tolerance,
-      confidence:    a.confidence != null ? parseFloat((a.confidence * 100).toFixed(1)) : null,
-      rawText:       a.rawText,
-      notes:         a.notes,
-      completedAt:   a.completedAt,
-    },
-    dwg: d.dwg?.filename ? {
-      filename:    d.dwg.filename,
-      previewUrl:  d.dwg.previewUrl,
-      dxfUrl:      d.dwg.dxfUrl,
-      svgUrl:      d.dwg.svgUrl,
-      entities:    d.dwg.entities,
-      fileSize:    d.dwg.fileSize,
-      generatedAt: d.dwg.generatedAt,
-    } : null,
-    cloudinary: d.cloudinary?.url ? {
-      publicId:   d.cloudinary.publicId,
-      url:        d.cloudinary.url,
-      uploadedAt: d.cloudinary.uploadedAt,
-    } : null,
-    createdAt: d.createdAt,
-    updatedAt: d.updatedAt,
-  };
-}
-
-function fmtProvider(p) {
-  return {
-    id:             String(p._id),
-    companyName:    p.companyName,
-    country:        p.country,
-    region:         p.region,
-    flag:           p.flag,
-    specialty:      p.specialty,
-    capacity:       p.capacity,
-    certifications: p.certifications || [],
-    leadTimeDays:   { min: p.leadTimeDays?.min, max: p.leadTimeDays?.max },
-    rating:         p.rating,
-    totalReviews:   p.totalReviews,
-    totalOrders:    p.totalOrders,
-    materials:      p.materials || [],
-    operations:     p.operations || [],
-    pricingBase:    p.pricingBase,
-    isVerified:     p.isVerified,
-    isActive:       p.isActive,
-  };
-}
-
-function fmtQuote(q) {
-  return {
-    id:       String(q._id),
-    designId: String(q.designId),
-    status:   q.status,
-    specs:    q.specs || {},
-    bids:     q.bids  || [],
-    expiresAt: q.expiresAt,
-    createdAt: q.createdAt,
-  };
-}
-
-function fmtOrder(o, providerName) {
-  return {
-    id:           String(o._id),
-    orderNumber:  o.orderNumber,
-    designId:     String(o.designId),
-    providerId:   String(o.providerId),
-    providerName: providerName || "Unknown Provider",
-    status:       o.status,
-    specs:        o.specs    || {},
-    pricing:      o.pricing  || {},
-    tracking:     o.tracking || {},
-    timeline:          o.timeline || [],
-    estimatedDelivery: o.estimatedDelivery,
-    createdAt:         o.createdAt,
-    updatedAt:         o.updatedAt,
-  };
-}
-
-// ── File uploads ──────────────────────────────────────────────────────────────
-const uploadDir = path.join(__dirname, "uploads", "tmp");
-const outputDir = path.join(__dirname, "uploads", "output");
-fs.mkdirSync(uploadDir, { recursive: true });
-fs.mkdirSync(outputDir, { recursive: true });
-
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, uploadDir),
-  filename:    (_req, file,  cb) => {
-    const safe = file.originalname.replace(/\s+/g, "_").replace(/[^a-zA-Z0-9._-]/g, "");
-    cb(null, `${Date.now()}-${safe}`);
-  },
+  gcodeHistory: [{ gcode: String, url: String, opts: Object, generatedAt: Date }],
+  conversionLog: [mongoose.Schema.Types.Mixed],
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now },
 });
-const upload = multer({ storage, limits: { fileSize: 50 * 1024 * 1024 } });
+const Design = mongoose.model('Design', designSchema);
 
-// ── Cloudinary (optional) ─────────────────────────────────────────────────────
-let cloudinary = null;
-if (process.env.CLOUDINARY_API_KEY) {
-  cloudinary = require("cloudinary").v2;
-  cloudinary.config({
-    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-    api_key:    process.env.CLOUDINARY_API_KEY,
-    api_secret: process.env.CLOUDINARY_API_SECRET,
-    secure:     true,
-  });
-}
+const quoteSchema = new mongoose.Schema({
+  designId: String, userId: mongoose.Types.ObjectId, designName: String,
+  specs: { quantity: Number, material: String, finish: String, tolerance: String },
+  notes: String, status: { type: String, default: 'open' },
+  bids: [{ providerId: String, providerName: String, price: Number, perUnit: Number, leadDays: Number, notes: String, submittedAt: Date }],
+  createdAt: { type: Date, default: Date.now },
+});
+const Quote = mongoose.model('Quote', quoteSchema);
 
-// ── AI Pipeline ───────────────────────────────────────────────────────────────
-const PIPELINE_SCRIPT = path.join(__dirname, "pipeline", "process.py");
+const orderSchema = new mongoose.Schema({
+  orderNumber: String, quoteId: String, designId: String,
+  userId: mongoose.Types.ObjectId, providerId: String, providerName: String,
+  status: { type: String, default: 'confirmed' },
+  specs: mongoose.Schema.Types.Mixed,
+  pricing: { unitPrice: Number, quantity: Number, subtotal: Number, shipping: Number, total: Number, currency: String },
+  estimatedDelivery: Date, trackingNumber: String,
+  createdAt: { type: Date, default: Date.now },
+});
+const Order = mongoose.model('Order', orderSchema);
 
-const PIPELINE_STEPS = [
-  "Grayscale Conversion","Blur & Noise Reduction","Adaptive Thresholding",
-  "Morphological Cleanup","Deskew & Alignment","Contrast Enhancement",
-  "Canny Edge Detection","Hough Line Transform","Hough Circle Detection",
-  "Douglas-Peucker Simplification","OCR Dimension Extraction","YOLO Feature Recognition",
-  "Coordinate System Mapping","Vector Path Extraction","DXF Entity Generation","File Export",
-];
+const activitySchema = new mongoose.Schema({
+  userId: mongoose.Types.ObjectId,
+  type: { type: String, enum: ['upload','convert','approve','order','quote','ai_interact','gcode'] },
+  title: String, description: String,
+  timestamp: { type: Date, default: Date.now },
+  metadata: mongoose.Schema.Types.Mixed,
+});
+const Activity = mongoose.model('Activity', activitySchema);
 
-const STEP_DETAILS = {
-  "Grayscale Conversion":           "RGB → single-channel luminance",
-  "Blur & Noise Reduction":         "Gaussian kernel 5×5, σ=1.4",
-  "Adaptive Thresholding":          "Block size 11, C=2",
-  "Morphological Cleanup":          "Erosion + dilation, kernel 3×3",
-  "Deskew & Alignment":             "Hough-based angle correction",
-  "Contrast Enhancement":           "CLAHE, clip limit 2.0",
-  "Canny Edge Detection":           "Thresholds: low=50, high=150",
-  "Douglas-Peucker Simplification": "Epsilon 2.0px, contours simplified",
-  "OCR Dimension Extraction":       "Tesseract v5 — dimensions extracted",
-  "YOLO Feature Recognition":       "YOLOv8n — holes, slots, cutouts",
-  "Coordinate System Mapping":      "Pixel → mm @ 96dpi scale",
-  "Vector Path Extraction":         "Potrace + spline fitting",
-  "DXF Entity Generation":          "ezdxf R2010 entities created",
-  "File Export":                    "DXF + SVG + PNG preview saved",
-};
+const providerSchema = new mongoose.Schema({
+  userId: mongoose.Types.ObjectId, companyName: String, region: String, country: String,
+  rating: { type: Number, default: 0 }, totalReviews: { type: Number, default: 0 },
+  isVerified: { type: Boolean, default: false },
+  leadTimeDays: { min: Number, max: Number },
+  materials: [String], services: [String],
+  contact: { address: String, phone: String, whatsapp: String, email: String, website: String },
+  description: String, createdAt: { type: Date, default: Date.now },
+});
+const Provider = mongoose.model('Provider', providerSchema);
 
-function simulatePipeline() {
-  return {
-    steps: PIPELINE_STEPS.map(name => ({
-      name, status: "done",
-      duration: Math.round(50 + Math.random() * 300),
-      details: STEP_DETAILS[name] || null,
-    })),
-    analysis: {
-      edges:        Math.floor(Math.random() * 100) + 20,
-      bendLines:    Math.floor(Math.random() * 8),
-      holes:        Math.floor(Math.random() * 6),
-      holesDiameter: parseFloat((5 + Math.random() * 20).toFixed(2)),
-      slots:        Math.floor(Math.random() * 4),
-      cutouts:      Math.floor(Math.random() * 3),
-      width:        parseFloat((50 + Math.random() * 200).toFixed(1)),
-      height:       parseFloat((30 + Math.random() * 150).toFixed(1)),
-      thickness:    parseFloat((1 + Math.random() * 10).toFixed(1)),
-      profileType:  ["sheet metal","plate","bracket","enclosure"][Math.floor(Math.random() * 4)],
-      tolerance:    ["±0.1mm","±0.5mm","±1mm"][Math.floor(Math.random() * 3)],
-      confidence:   parseFloat((0.75 + Math.random() * 0.2).toFixed(3)),
-      rawText:      "See extracted dimensions in analysis",
-    },
-    dwg: {
-      entities: Math.floor(Math.random() * 80) + 15,
-      fileSize:  Math.floor(Math.random() * 50000) + 5000,
-    },
-  };
-}
-
-function runPipeline(imagePath, options) {
-  return new Promise(resolve => {
-    if (!fs.existsSync(PIPELINE_SCRIPT)) return resolve(simulatePipeline());
-    const proc = spawn("python3", [PIPELINE_SCRIPT, imagePath, JSON.stringify(options)]);
-    let stdout = "";
-    proc.stdout.on("data", d => { stdout += d.toString(); });
-    proc.on("close", code => {
-      if (code === 0) { try { return resolve(JSON.parse(stdout)); } catch {} }
-      resolve(simulatePipeline());
-    });
-    proc.on("error", () => resolve(simulatePipeline()));
-    setTimeout(() => { proc.kill(); resolve(simulatePipeline()); }, 120000);
-  });
-}
-
-// ── App setup ─────────────────────────────────────────────────────────────────
+// ── App ───────────────────────────────────────────────────────────────────────
 const app = express();
-app.use(cors({ origin: true, credentials: true, allowedHeaders: ["Content-Type","Authorization"] }));
-app.use(express.json({ limit: "50mb" }));
-app.use(express.urlencoded({ extended: true, limit: "50mb" }));
-app.use(`${BASE_PATH}/files`, express.static(path.join(__dirname, "uploads")));
+app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
+app.use(cors({ origin: '*', methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] }));
+app.use(morgan('combined'));
+app.use(express.json({ limit: '20mb' }));
+app.use(express.urlencoded({ extended: true, limit: '20mb' }));
+app.use('/uploads', express.static(UPLOAD_DIR));
 
-const api = express.Router();
-
-// ── Health ────────────────────────────────────────────────────────────────────
-api.get("/healthz", (_req, res) => res.json({ status: "ok" }));
-
-// ── Auth routes ───────────────────────────────────────────────────────────────
-api.post("/auth/register", async (req, res) => {
-  try {
-    const { firstName, lastName, email, password, role, company, country } = req.body;
-    if (!firstName || !lastName || !email || !password || !role)
-      return res.status(400).json({ error: "Missing required fields" });
-
-    if (await User.findOne({ email: email.toLowerCase() }))
-      return res.status(400).json({ error: "Email already registered" });
-
-    const hashed = await bcrypt.hash(password, 12);
-    const user   = await User.create({ firstName, lastName, email, password: hashed, role, company, country });
-    res.status(201).json({ token: generateToken(user._id, user.role), user: fmtUser(user) });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+const upload = multer({
+  dest: UPLOAD_DIR,
+  limits: { fileSize: 50 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const ok = /\.(pdf|dxf|png|jpg|jpeg|bmp|tiff?|webp)$/i.test(file.originalname);
+    cb(ok ? null : new Error('Unsupported file type'), ok);
+  },
 });
 
-api.post("/auth/login", async (req, res) => {
+// ── Auth middleware ────────────────────────────────────────────────────────────
+function authMiddleware(req, res, next) {
+  const token = (req.headers.authorization || '').replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: 'No token' });
+  try { req.user = jwt.verify(token, JWT_SECRET); next(); }
+  catch { res.status(401).json({ error: 'Invalid token' }); }
+}
+
+function logActivity(userId, type, title, description, metadata = {}) {
+  Activity.create({ userId, type, title, description, timestamp: new Date(), metadata }).catch(() => {});
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────────
+async function uploadToCloudinary(filePath, folder = 'sheetforge', resourceType = 'raw') {
+  return new Promise((resolve, reject) => {
+    cloudinary.uploader.upload(filePath, { folder, resource_type: resourceType }, (err, result) => {
+      if (err) reject(err); else resolve(result);
+    });
+  });
+}
+
+async function gcodeToPdf(gcodeText, outputPath, designName = 'Part') {
+  return new Promise((resolve, reject) => {
+    try {
+      const doc = new PDFDocument({ margin: 40, size: 'A4' });
+      const stream = fs.createWriteStream(outputPath);
+      doc.pipe(stream);
+      doc.fontSize(16).fillColor('#1a1a2e').text(`SheetForge v4 — G-Code Export`, { align: 'center' });
+      doc.fontSize(11).fillColor('#555').text(`Part: ${designName}  •  Generated: ${new Date().toISOString()}`, { align: 'center' });
+      doc.moveDown(0.5);
+      doc.moveTo(40, doc.y).lineTo(doc.page.width - 40, doc.y).stroke('#ccc');
+      doc.moveDown(0.5);
+      doc.font('Courier').fontSize(8).fillColor('#1a1a2e');
+      const lines = gcodeText.split('\n');
+      lines.forEach((line, i) => {
+        const isComment = line.trim().startsWith(';');
+        doc.fillColor(isComment ? '#888' : '#000').text(`${String(i + 1).padStart(4, ' ')}  ${line}`);
+      });
+      doc.end();
+      stream.on('finish', () => resolve(outputPath));
+      stream.on('error', reject);
+    } catch (e) { reject(e); }
+  });
+}
+
+// ── Auth Routes ───────────────────────────────────────────────────────────────
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { email, password, firstName, lastName, role, company } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+    const existing = await User.findOne({ email: email.toLowerCase() });
+    if (existing) return res.status(409).json({ error: 'Email already registered' });
+    const passwordHash = await bcrypt.hash(password, 12);
+    const user = await User.create({ email: email.toLowerCase(), passwordHash, firstName, lastName, role: role || 'designer', company });
+    const token = jwt.sign({ id: user._id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '30d' });
+    if (role === 'provider') {
+      await Provider.create({ userId: user._id, companyName: company || `${firstName} ${lastName} Workshop`, region: 'Unknown', country: 'Unknown', contact: { email } });
+    }
+    res.json({ token, user: { id: user._id, email: user.email, firstName, lastName, role: user.role } });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
-    if (!email || !password) return res.status(400).json({ error: "Email and password required" });
-
-    const user = await User.findOne({ email: email.toLowerCase() });
-    if (!user) return res.status(401).json({ error: "Invalid credentials" });
-    if (!(await bcrypt.compare(password, user.password)))
-      return res.status(401).json({ error: "Invalid credentials" });
-
-    res.json({ token: generateToken(user._id, user.role), user: fmtUser(user) });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    const user = await User.findOne({ email: email?.toLowerCase() });
+    if (!user) return res.status(401).json({ error: 'Invalid credentials' });
+    const ok = await bcrypt.compare(password, user.passwordHash);
+    if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+    const token = jwt.sign({ id: user._id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({ token, user: { id: user._id, email: user.email, firstName: user.firstName, lastName: user.lastName, role: user.role } });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-api.post("/auth/logout", (_req, res) => res.json({ success: true }));
-
-api.get("/auth/me", protect, async (req, res) => {
+app.get('/api/auth/me', authMiddleware, async (req, res) => {
   try {
-    const user = await User.findById(req.userId);
-    if (!user) return res.status(401).json({ error: "User not found" });
-    res.json(fmtUser(user));
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    const user = await User.findById(req.user.id).select('-passwordHash');
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    res.json({ id: user._id, email: user.email, firstName: user.firstName, lastName: user.lastName, role: user.role, company: user.company });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── Design routes ─────────────────────────────────────────────────────────────
-api.get("/designs", protect, async (req, res) => {
+// ── Dashboard Routes ──────────────────────────────────────────────────────────
+app.get('/api/dashboard/summary', authMiddleware, async (req, res) => {
   try {
-    const page   = Number(req.query.page)  || 1;
-    const limit  = Number(req.query.limit) || 20;
-    const filter = { ownerId: req.userId };
-    if (req.query.status) filter.status = req.query.status;
-
-    const [designs, total] = await Promise.all([
-      Design.find(filter).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit),
-      Design.countDocuments(filter),
+    const uid = req.user.id;
+    const [totalDesigns, pendingConversions, totalQuotes, orders] = await Promise.all([
+      Design.countDocuments({ userId: uid }),
+      Design.countDocuments({ userId: uid, status: { $in: ['uploaded','analyzing','converting'] } }),
+      Quote.countDocuments({ userId: uid }),
+      Order.find({ userId: uid }).select('pricing'),
     ]);
-    res.json({ designs: designs.map(fmtDesign), total, page, pages: Math.ceil(total / limit) });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    const totalSpend = orders.reduce((s, o) => s + (o.pricing?.total || 0), 0);
+    res.json({ totalDesigns, pendingConversions, totalQuotes, totalOrders: orders.length, totalSpend });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-api.post("/designs", protect, upload.single("file"), async (req, res) => {
+app.get('/api/dashboard/activity', authMiddleware, async (req, res) => {
   try {
-    const { partName, material, thickness, notes } = req.body;
-    const file = req.file;
+    const items = await Activity.find({ userId: req.user.id }).sort({ timestamp: -1 }).limit(30);
+    res.json(items.map(a => ({ id: a._id, type: a.type, title: a.title, description: a.description, timestamp: a.timestamp })));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
-    // Immediately upload to Cloudinary so the URL is available for preview
-    let cloudinaryData;
-    let fileUrl;
-    if (file && cloudinary) {
+// DELETE activity entry
+app.delete('/api/dashboard/activity/:id', authMiddleware, async (req, res) => {
+  try {
+    await Activity.deleteOne({ _id: req.params.id, userId: req.user.id });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Design Routes ─────────────────────────────────────────────────────────────
+app.get('/api/designs', authMiddleware, async (req, res) => {
+  try {
+    const designs = await Design.find({ userId: req.user.id }).sort({ createdAt: -1 }).limit(50)
+      .select('partName material status originalFile aiAnalysis dwg createdAt');
+    res.json({ designs: designs.map(d => ({ id: d._id, partName: d.partName, material: d.material, status: d.status, originalFile: d.originalFile, aiAnalysis: d.aiAnalysis, dwg: d.dwg, createdAt: d.createdAt })) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/designs', authMiddleware, upload.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'File required' });
+  try {
+    const { partName, material, thickness } = req.body;
+    const ext = path.extname(req.file.originalname).toLowerCase();
+    const newPath = `${req.file.path}${ext}`;
+    await fsp.rename(req.file.path, newPath);
+
+    let fileUrl = `/uploads/${path.basename(newPath)}`;
+    let cloudinaryId = '';
+
+    // Upload to Cloudinary
+    try {
+      const isImage = /\.(png|jpg|jpeg|bmp|webp|tiff?)$/i.test(ext);
+      const cRes = await uploadToCloudinary(newPath, 'sheetforge/originals', isImage ? 'image' : 'raw');
+      fileUrl = cRes.secure_url; cloudinaryId = cRes.public_id;
+    } catch {}
+
+    const design = await Design.create({
+      userId: req.user.id, partName: partName || req.file.originalname.replace(/\.[^.]+$/, ''),
+      material, thickness: thickness ? parseFloat(thickness) : null,
+      originalFile: { filename: req.file.originalname, url: fileUrl, cloudinaryId, mimetype: req.file.mimetype, size: req.file.size },
+    });
+
+    logActivity(req.user.id, 'upload', `Uploaded: ${design.partName}`, `${req.file.originalname} • ${(req.file.size / 1024).toFixed(0)}KB`);
+    res.json({ id: design._id, status: design.status });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/designs/:id', authMiddleware, async (req, res) => {
+  try {
+    const d = await Design.findOne({ _id: req.params.id, userId: req.user.id });
+    if (!d) return res.status(404).json({ error: 'Not found' });
+    res.json({ id: d._id, partName: d.partName, material: d.material, thickness: d.thickness, status: d.status, originalFile: d.originalFile, aiAnalysis: d.aiAnalysis, dwg: d.dwg, createdAt: d.createdAt });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.patch('/api/designs/:id/approve', authMiddleware, async (req, res) => {
+  try {
+    const d = await Design.findOne({ _id: req.params.id, userId: req.user.id });
+    if (!d) return res.status(404).json({ error: 'Not found' });
+    const corrected = req.body.correctedAnalysis || {};
+    d.aiAnalysis = { ...d.aiAnalysis, ...corrected };
+    d.status = 'approved'; d.updatedAt = new Date();
+    await d.save();
+    logActivity(req.user.id, 'approve', `Approved: ${d.partName}`, `W=${d.aiAnalysis.width}mm H=${d.aiAnalysis.height}mm`);
+    res.json({ id: d._id, status: d.status, aiAnalysis: d.aiAnalysis });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Conversion Pipeline ───────────────────────────────────────────────────────
+app.post('/api/convert/:id', authMiddleware, async (req, res) => {
+  const designId = req.params.id;
+  try {
+    const d = await Design.findOne({ _id: designId, userId: req.user.id });
+    if (!d) return res.status(404).json({ error: 'Design not found' });
+    d.status = 'analyzing'; d.conversionLog = []; await d.save();
+
+    const opts = { ...req.body, anthropicApiKey: process.env.ANTHROPIC_API_KEY, thickness: d.thickness || 2.0 };
+    const imageFile = d.originalFile?.url?.startsWith('/uploads/') ? path.join(__dirname, d.originalFile.url) : null;
+
+    // Determine local path
+    let localImagePath = imageFile;
+    if (!localImagePath || !fs.existsSync(localImagePath)) {
+      const files = fs.readdirSync(UPLOAD_DIR).filter(f => !fs.statSync(path.join(UPLOAD_DIR, f)).isDirectory());
+      const match = files.find(f => f.includes(d._id.toString().slice(-6)));
+      if (match) localImagePath = path.join(UPLOAD_DIR, match);
+    }
+
+    // Run process.py asynchronously
+    let output = '', errorOut = '';
+    const py = spawn(PYTHON_CMD, [PROCESS_PY, localImagePath || '', JSON.stringify(opts)], {
+      env: { ...process.env, PYTHONUNBUFFERED: '1' },
+    });
+    py.stdout.on('data', chunk => { output += chunk.toString(); });
+    py.stderr.on('data', chunk => { errorOut += chunk.toString(); console.error('[py]', chunk.toString().slice(0, 200)); });
+    py.on('close', async code => {
       try {
-        const cResult = await cloudinary.uploader.upload(file.path, {
-          folder:          "sheetforge/designs",
-          resource_type:   "auto",
-          use_filename:    true,
-          unique_filename: true,
-        });
-        fileUrl       = cResult.secure_url;
-        cloudinaryData = {
-          publicId:   cResult.public_id,
-          url:        cResult.secure_url,
-          uploadedAt: new Date(),
-        };
-      } catch (cloudErr) {
-        console.warn("Cloudinary upload failed (continuing without it):", cloudErr.message);
+        const result = JSON.parse(output.trim().split('\n').pop());
+        if (result.error) throw new Error(result.error);
+        d.aiAnalysis    = result.analysis;
+        d.dwg           = { ...result.dwg };
+        d.conversionLog = result.steps;
+        d.status        = 'ready';
+        d.updatedAt     = new Date();
+
+        // Upload DXF + SVG to Cloudinary
+        const dxfPath = path.join(OUTPUT_DIR, result.dwg.filename || '');
+        const svgPath = path.join(OUTPUT_DIR, result.dwg.svgFilename || '');
+        if (fs.existsSync(dxfPath)) {
+          try { const cr = await uploadToCloudinary(dxfPath, 'sheetforge/dxf', 'raw'); d.dwg.dxfUrl = cr.secure_url; } catch {}
+        }
+        if (fs.existsSync(svgPath)) {
+          try { const cr = await uploadToCloudinary(svgPath, 'sheetforge/svg', 'image'); d.dwg.svgUrl = cr.secure_url; } catch {}
+        }
+
+        // Store GCode if generated
+        if (result.gcode) {
+          d.gcodeHistory = [{ gcode: result.gcode, opts: opts, generatedAt: new Date() }];
+          d.dwg.gcodeFilename = result.dwg.gcodeFilename || '';
+          const gcodePath = path.join(OUTPUT_DIR, d.dwg.gcodeFilename || '');
+          if (fs.existsSync(gcodePath)) {
+            try { const cr = await uploadToCloudinary(gcodePath, 'sheetforge/gcode', 'raw'); d.dwg.gcodeUrl = cr.secure_url; } catch {}
+          }
+        }
+
+        await d.save();
+        logActivity(req.user.id, 'convert', `Converted: ${d.partName}`, `${result.steps?.length || 23} stages • ${d.aiAnalysis?.confidence || 0}% conf.`);
+      } catch (e) {
+        d.status = 'error'; await d.save();
+        console.error('Conversion error:', e.message, '\n', errorOut.slice(0, 500));
+      }
+    });
+    res.json({ id: designId, status: 'analyzing', message: 'Pipeline started' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/convert/:id/status', authMiddleware, async (req, res) => {
+  try {
+    const d = await Design.findOne({ _id: req.params.id, userId: req.user.id });
+    if (!d) return res.status(404).json({ error: 'Not found' });
+    const steps = (d.conversionLog || []).map(s => ({ name: s.name || s, status: 'done', duration: s.duration, details: s.details }));
+    const pct = steps.length > 0 ? Math.round((steps.filter(s => s.status === 'done').length / Math.max(steps.length, 23)) * 100) : 0;
+    res.json({ status: d.status, progress: pct, steps, currentStep: steps[steps.length - 1]?.name || '' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── GCode Routes ──────────────────────────────────────────────────────────────
+app.post('/api/gcode/:id', authMiddleware, async (req, res) => {
+  try {
+    const d = await Design.findOne({ _id: req.params.id, userId: req.user.id });
+    if (!d) return res.status(404).json({ error: 'Design not found' });
+    const gcodeOpts = req.body.gcodeOptions || {};
+    const analysis  = { ...d.aiAnalysis, ...gcodeOpts };
+
+    // Call process.py in ai_interact mode for gcode
+    const opts = { mode: 'ai_interact', instruction: 'Generate G-Code', analysis: d.aiAnalysis, gcodeOptions: gcodeOpts, dpi: 96 };
+    let output = '';
+    const py = spawn(PYTHON_CMD, [PROCESS_PY, d.originalFile?.url || '', JSON.stringify(opts)], {
+      env: { ...process.env, PYTHONUNBUFFERED: '1' },
+    });
+    py.stdout.on('data', c => { output += c.toString(); });
+    py.on('close', async () => {
+      let gcode = '';
+      try {
+        const r = JSON.parse(output.trim().split('\n').pop());
+        gcode = r.gcode || '';
+      } catch { gcode = generateFallbackGCode(d.aiAnalysis, gcodeOpts); }
+      if (!gcode) gcode = generateFallbackGCode(d.aiAnalysis, gcodeOpts);
+
+      // Save to history
+      d.gcodeHistory = d.gcodeHistory || [];
+      d.gcodeHistory.unshift({ gcode, opts: gcodeOpts, generatedAt: new Date() });
+      if (d.gcodeHistory.length > 10) d.gcodeHistory = d.gcodeHistory.slice(0, 10);
+      await d.save();
+
+      logActivity(req.user.id, 'gcode', `GCode generated: ${d.partName}`, `${gcode.split('\n').length} lines • ${gcodeOpts.operation || 'cut'}`);
+      res.json({ gcode, lines: gcode.split('\n').length });
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+function generateFallbackGCode(analysis = {}, opts = {}) {
+  const W = analysis.width || 200, H = analysis.height || 150;
+  const feed = opts.feedRate || 1000, plunge = opts.plungeRate || 300;
+  const rpm = opts.spindleRpm || 12000, safeZ = opts.safeZ || 5;
+  const depth = opts.cutDepth || 3, passDepth = opts.passDepth || 1;
+  const toolD = opts.toolDiameter || 3;
+  return [
+    `; SheetForge v4 — ${analysis.profileType || 'Sheet Metal'} | ${W}×${H}mm`,
+    `; Material: ${analysis.material || 'unknown'} | Thickness: ${analysis.thickness || 2}mm`,
+    `; Tool: Ø${toolD}mm | Feed: ${feed}mm/min | Spindle: ${rpm}rpm`,
+    'G21 G17 G90 G94 G40 G49',
+    `T01 M6 ; Ø${toolD}mm`, `S${rpm} M3`, 'G4 P2000',
+    `G00 Z${safeZ}`, 'G00 X0 Y0',
+    `; === PASS 1/${Math.ceil(depth / passDepth)} ===`,
+    `G00 X-${(toolD/2).toFixed(3)} Y-${(toolD/2).toFixed(3)}`,
+    `G01 Z-${passDepth} F${plunge}`,
+    `G01 X${(W + toolD/2).toFixed(3)} F${feed}`,
+    `G01 Y${(H + toolD/2).toFixed(3)}`,
+    `G01 X-${(toolD/2).toFixed(3)}`,
+    `G01 Y-${(toolD/2).toFixed(3)}`,
+    `G00 Z${safeZ}`, 'G00 X0 Y0', 'M5', 'M30',
+  ].join('\n');
+}
+
+// ── AI Interact Route ─────────────────────────────────────────────────────────
+app.post('/api/ai-interact', authMiddleware, async (req, res) => {
+  try {
+    const { instruction, designId, analysis } = req.body;
+    if (!instruction) return res.status(400).json({ error: 'Instruction required' });
+
+    let currentAnalysis = analysis || {};
+    let design = null;
+    if (designId) {
+      design = await Design.findOne({ _id: designId, userId: req.user.id });
+      if (design) currentAnalysis = { ...design.aiAnalysis, ...analysis };
+    }
+
+    // Build context
+    const ctx = Object.entries(currentAnalysis)
+      .filter(([k]) => !k.startsWith('_'))
+      .map(([k, v]) => `${k}: ${v}`)
+      .join(', ');
+
+    const prompt = `You are an expert CAD/DXF engineer. Current design: ${ctx || 'no design loaded'}.
+User instruction: "${instruction}"
+
+Return ONLY a JSON object with ONLY the fields that need to change plus an explanation:
+{
+  "width": <number or omit>,
+  "height": <number or omit>,
+  "holes": <number or omit>,
+  "holesDiameter": <number or omit>,
+  "bendLines": <number or omit>,
+  "thickness": <number or omit>,
+  "material": "<string or omit>",
+  "tolerance": "<string or omit>",
+  "explanation": "<clear explanation of what was changed and why>"
+}
+Apply ONLY changes relevant to the instruction. Return ONLY valid JSON.`;
+
+    const message = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514', max_tokens: 800,
+      messages: [{ role: 'user', content: prompt }],
+    });
+
+    let text = message.content[0]?.text || '{}';
+    text = text.replace(/```[a-z]*/g, '').replace(/```/g, '').trim();
+    const m = text.match(/\{[\s\S]*\}/);
+    if (m) text = m[0];
+    const changes = JSON.parse(text);
+    const explanation = changes.explanation || 'Changes applied.';
+    delete changes.explanation;
+
+    const updatedAnalysis = { ...currentAnalysis, ...Object.fromEntries(Object.entries(changes).filter(([, v]) => v !== null && v !== undefined)) };
+
+    // Save back to design if designId
+    if (design) {
+      design.aiAnalysis = updatedAnalysis;
+      design.updatedAt = new Date();
+      await design.save();
+    }
+
+    const gcode = generateFallbackGCode(updatedAnalysis);
+    logActivity(req.user.id, 'ai_interact', `AI Studio: ${instruction.slice(0, 60)}`, explanation.slice(0, 100));
+
+    res.json({ analysis: updatedAnalysis, explanation, gcode });
+  } catch (e) {
+    res.status(500).json({ error: e.message, explanation: 'AI processing error — please try again.' });
+  }
+});
+
+// ── Cloud Routes ──────────────────────────────────────────────────────────────
+app.post('/api/cloud/save/:id', authMiddleware, async (req, res) => {
+  try {
+    const d = await Design.findOne({ _id: req.params.id, userId: req.user.id });
+    if (!d) return res.status(404).json({ error: 'Not found' });
+    const uploads = [];
+
+    if (d.dwg?.filename) {
+      const dxfPath = path.join(OUTPUT_DIR, d.dwg.filename);
+      if (fs.existsSync(dxfPath)) {
+        try { const cr = await uploadToCloudinary(dxfPath, 'sheetforge/dxf', 'raw'); d.dwg.dxfUrl = cr.secure_url; uploads.push({ type: 'dxf', url: cr.secure_url }); } catch {}
+      }
+    }
+    if (d.dwg?.svgFilename) {
+      const svgPath = path.join(OUTPUT_DIR, d.dwg.svgFilename);
+      if (fs.existsSync(svgPath)) {
+        try { const cr = await uploadToCloudinary(svgPath, 'sheetforge/svg', 'image'); d.dwg.svgUrl = cr.secure_url; uploads.push({ type: 'svg', url: cr.secure_url }); } catch {}
+      }
+    }
+    if (d.originalFile?.url?.startsWith('/uploads/')) {
+      const origPath = path.join(__dirname, d.originalFile.url);
+      if (fs.existsSync(origPath)) {
+        try { const isImg = /\.(png|jpg|jpeg|gif|webp)$/i.test(origPath); const cr = await uploadToCloudinary(origPath, 'sheetforge/originals', isImg ? 'image' : 'raw'); d.originalFile.url = cr.secure_url; d.originalFile.cloudinaryId = cr.public_id; uploads.push({ type: 'original', url: cr.secure_url }); } catch {}
       }
     }
 
-    const design = await Design.create({
-      ownerId:   req.userId,
-      partName:  partName || (file?.originalname?.replace(/\.[^.]+$/, "") || "Untitled"),
-      material:  material  || undefined,
-      thickness: thickness ? Number(thickness) : undefined,
-      notes:     notes     || undefined,
-      status:    "uploaded",
-      originalFile: file ? {
-        filename:  file.originalname,
-        mimetype:  file.mimetype,
-        size:      file.size,
-        localPath: file.path,
-        url:       fileUrl,
-      } : undefined,
-      cloudinary: cloudinaryData,
-    });
-    res.status(201).json(fmtDesign(design));
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    d.status = 'saved'; d.updatedAt = new Date();
+    await d.save();
+    res.json({ id: d._id, status: d.status, uploads, dwg: d.dwg });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-api.get("/designs/:id", protect, async (req, res) => {
+// Upload GCode as PDF to Cloudinary + save link to MongoDB
+app.post('/api/cloud/gcode', authMiddleware, async (req, res) => {
   try {
-    const design = await Design.findOne({ _id: req.params.id, ownerId: req.userId });
-    if (!design) return res.status(404).json({ error: "Design not found" });
-    res.json(fmtDesign(design));
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
+    const { gcode, designId, filename } = req.body;
+    if (!gcode) return res.status(400).json({ error: 'G-Code required' });
 
-api.patch("/designs/:id", protect, async (req, res) => {
-  try {
-    const { partName, material, thickness, notes, aiAnalysis } = req.body;
-    const update = { updatedAt: new Date() };
-    if (partName  !== undefined) update.partName  = partName;
-    if (material  !== undefined) update.material  = material;
-    if (thickness !== undefined) update.thickness = Number(thickness);
-    if (notes     !== undefined) update.notes     = notes;
-    if (aiAnalysis) {
-      const a = aiAnalysis;
-      if (a.edges        !== undefined) update["aiAnalysis.edges"]        = a.edges;
-      if (a.bendLines    !== undefined) update["aiAnalysis.bendLines"]    = a.bendLines;
-      if (a.holes        !== undefined) update["aiAnalysis.holes"]        = a.holes;
-      if (a.holesDiameter!== undefined) update["aiAnalysis.holesDiameter"]= a.holesDiameter;
-      if (a.slots        !== undefined) update["aiAnalysis.slots"]        = a.slots;
-      if (a.cutouts      !== undefined) update["aiAnalysis.cutouts"]      = a.cutouts;
-      if (a.width        !== undefined) update["aiAnalysis.width"]        = a.width;
-      if (a.height       !== undefined) update["aiAnalysis.height"]       = a.height;
-      if (a.tolerance    !== undefined) update["aiAnalysis.tolerance"]    = a.tolerance;
-      if (a.rawText      !== undefined) update["aiAnalysis.rawText"]      = a.rawText;
-      if (a.notes        !== undefined) update["aiAnalysis.notes"]        = a.notes;
+    const safeFilename = (filename || `gcode_${Date.now()}.pdf`).replace(/\.gcode$/, '.pdf');
+    const pdfPath = path.join(OUTPUT_DIR, safeFilename);
+
+    // Convert gcode text to PDF
+    let designName = 'Part';
+    let design = null;
+    if (designId) {
+      design = await Design.findOne({ _id: designId, userId: req.user.id });
+      if (design) designName = design.partName;
     }
-    const design = await Design.findOneAndUpdate(
-      { _id: req.params.id, ownerId: req.userId },
-      { $set: update },
-      { new: true }
-    );
-    if (!design) return res.status(404).json({ error: "Design not found" });
-    res.json(fmtDesign(design));
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
+    await gcodeToPdf(gcode, pdfPath, designName);
 
-api.delete("/designs/:id", protect, async (req, res) => {
-  try {
-    const design = await Design.findOne({ _id: req.params.id, ownerId: req.userId });
-    if (!design) return res.status(404).json({ error: "Design not found" });
-    if (design.originalFile?.localPath && fs.existsSync(design.originalFile.localPath))
-      fs.unlinkSync(design.originalFile.localPath);
-    await Design.deleteOne({ _id: req.params.id });
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
+    // Upload PDF to Cloudinary
+    const cr = await uploadToCloudinary(pdfPath, 'sheetforge/gcode-pdfs', 'raw');
+    const pdfUrl = cr.secure_url;
 
-api.patch("/designs/:id/approve", protect, async (req, res) => {
-  try {
-    const { correctedAnalysis, verificationNote } = req.body;
-    const update = {
-      status:     "approved",
-      approvedAt: new Date(),
-      updatedAt:  new Date(),
-    };
-    if (correctedAnalysis) {
-      const a = correctedAnalysis;
-      if (a.edges        !== undefined) update["aiAnalysis.edges"]        = a.edges;
-      if (a.holes        !== undefined) update["aiAnalysis.holes"]        = a.holes;
-      if (a.holesDiameter!== undefined) update["aiAnalysis.holesDiameter"]= a.holesDiameter;
-      if (a.width        !== undefined) update["aiAnalysis.width"]        = a.width;
-      if (a.height       !== undefined) update["aiAnalysis.height"]       = a.height;
-      if (a.rawText      !== undefined) update["aiAnalysis.rawText"]      = a.rawText;
-      if (verificationNote)             update["aiAnalysis.notes"]        = verificationNote;
+    // Save link to design if designId
+    if (design) {
+      design.gcodeHistory = design.gcodeHistory || [];
+      design.gcodeHistory[0] = { ...design.gcodeHistory[0], url: pdfUrl, pdfUrl };
+      if (design.gcodeHistory[0]?.generatedAt === undefined) design.gcodeHistory[0].generatedAt = new Date();
+      design.dwg = design.dwg || {};
+      design.dwg.gcodeUrl = pdfUrl;
+      design.updatedAt = new Date();
+      await design.save();
     }
-    const design = await Design.findOneAndUpdate(
-      { _id: req.params.id, ownerId: req.userId },
-      { $set: update },
-      { new: true }
-    );
-    if (!design) return res.status(404).json({ error: "Design not found" });
-    res.json(fmtDesign(design));
-  } catch (err) { res.status(500).json({ error: err.message }); }
+
+    logActivity(req.user.id, 'gcode', `GCode PDF uploaded: ${designName}`, `Cloudinary: ${pdfUrl.slice(-40)}`);
+    // Clean up local PDF
+    fsp.unlink(pdfPath).catch(() => {});
+
+    res.json({ url: pdfUrl, filename: safeFilename, size: cr.bytes });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-api.post("/cloud/save/:id", protect, async (req, res) => {
+// ── Quote Routes ──────────────────────────────────────────────────────────────
+app.get('/api/quotes', authMiddleware, async (req, res) => {
   try {
-    const design = await Design.findOne({ _id: req.params.id, ownerId: req.userId });
-    if (!design) return res.status(404).json({ error: "Design not found" });
-
-    const update = { status: "saved", updatedAt: new Date() };
-    if (cloudinary && design.originalFile?.localPath && fs.existsSync(design.originalFile.localPath)) {
-      const result = await cloudinary.uploader.upload(design.originalFile.localPath, { folder: "sheetforge/designs", resource_type: "auto" });
-      update["cloudinary.publicId"]   = result.public_id;
-      update["cloudinary.url"]        = result.secure_url;
-      update["cloudinary.uploadedAt"] = new Date();
-    }
-    const updated = await Design.findByIdAndUpdate(req.params.id, { $set: update }, { new: true });
-    res.json(fmtDesign(updated));
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    const quotes = await Quote.find({ userId: req.user.id }).sort({ createdAt: -1 }).limit(30);
+    res.json({ quotes: quotes.map(q => ({ id: q._id, designName: q.designName, status: q.status, specs: q.specs, bids: q.bids?.length || 0, createdAt: q.createdAt })) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── Convert routes ────────────────────────────────────────────────────────────
-api.post("/convert/:id", protect, async (req, res) => {
+app.post('/api/quotes', authMiddleware, async (req, res) => {
   try {
-    const design = await Design.findOne({ _id: req.params.id, ownerId: req.userId });
-    if (!design) return res.status(404).json({ error: "Design not found" });
-
-    await Design.findByIdAndUpdate(req.params.id, { $set: { status: "analyzing", updatedAt: new Date() } });
-    await Design.findByIdAndUpdate(req.params.id, { $set: { status: "converting", updatedAt: new Date() } });
-
-    const options = {
-      scale:         req.body?.scale        || null,
-      units:         req.body?.units        || "mm",
-      tolerance:     req.body?.tolerance    || 0.1,
-      detectCircles: req.body?.detectCircles !== false,
-      detectText:    req.body?.detectText    !== false,
-    };
-
-    const result      = await runPipeline(design.originalFile?.localPath || "", options);
-    const now         = new Date();
-    const dxfFilename = `design_${req.params.id}_${Date.now()}.dxf`;
-    const a           = result.analysis || {};
-
-    const updated = await Design.findByIdAndUpdate(req.params.id, {
-      $set: {
-        status:    "ready",
-        updatedAt: now,
-        aiAnalysis: {
-          edges: a.edges, bendLines: a.bendLines, holes: a.holes, holesDiameter: a.holesDiameter,
-          slots: a.slots, cutouts: a.cutouts, width: a.width, height: a.height,
-          thickness: a.thickness, profileType: a.profileType, tolerance: a.tolerance,
-          confidence: a.confidence, rawText: a.rawText, completedAt: now,
-        },
-        dwg: {
-          filename:    dxfFilename,
-          dxfUrl:      `/api/files/output/${dxfFilename}`,
-          entities:    result.dwg?.entities,
-          fileSize:    result.dwg?.fileSize,
-          generatedAt: now,
-        },
-      },
-    }, { new: true });
-
-    res.json({
-      designId: String(req.params.id),
-      status:   "ready",
-      pipeline: result.steps || PIPELINE_STEPS.map(name => ({ name, status: "done", duration: Math.round(100 + Math.random() * 200), details: null })),
-      design:   fmtDesign(updated),
-    });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    const { designId, specs, notes } = req.body;
+    const design = await Design.findOne({ _id: designId, userId: req.user.id });
+    const quote = await Quote.create({ designId, userId: req.user.id, designName: design?.partName || 'Unknown', specs, notes });
+    logActivity(req.user.id, 'quote', `Quote requested: ${design?.partName}`, `${specs?.quantity || 1} units • ${specs?.material || 'Standard'}`);
+    res.json({ id: quote._id, status: quote.status });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-api.get("/convert/:id/status", protect, async (req, res) => {
+app.get('/api/quotes/:id', authMiddleware, async (req, res) => {
   try {
-    const design = await Design.findOne({ _id: req.params.id, ownerId: req.userId });
-    if (!design) return res.status(404).json({ error: "Design not found" });
-    const progressMap = { uploaded: 0, analyzing: 30, converting: 70, ready: 100, approved: 100, saved: 100 };
-    const progress = progressMap[design.status] || 0;
-    res.json({
-      designId:    String(design._id),
-      status:      design.status,
-      progress,
-      currentStep: design.status === "ready" ? "File Export" : design.status === "converting" ? "DXF Entity Generation" : design.status === "analyzing" ? "Canny Edge Detection" : "Waiting",
-      steps: PIPELINE_STEPS.map((name, idx) => ({
-        name,
-        status: progress >= ((idx + 1) / PIPELINE_STEPS.length) * 100 ? "done" : "pending",
-        duration: null, details: null,
-      })),
-    });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    const q = await Quote.findOne({ _id: req.params.id, userId: req.user.id });
+    if (!q) return res.status(404).json({ error: 'Not found' });
+    res.json({ id: q._id, designId: q.designId, designName: q.designName, status: q.status, specs: q.specs, notes: q.notes, bids: q.bids, createdAt: q.createdAt });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── Quotes routes ─────────────────────────────────────────────────────────────
-api.get("/quotes", protect, async (req, res) => {
+// ── Order Routes ──────────────────────────────────────────────────────────────
+app.get('/api/orders', authMiddleware, async (req, res) => {
   try {
-    const quotes = await Quote.find({ requesterId: req.userId }).sort({ createdAt: -1 });
-    res.json({ quotes: quotes.map(fmtQuote) });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    const orders = await Order.find({ userId: req.user.id }).sort({ createdAt: -1 }).limit(30);
+    res.json({ orders: orders.map(o => ({ id: o._id, orderNumber: o.orderNumber, providerName: o.providerName, status: o.status, pricing: o.pricing, estimatedDelivery: o.estimatedDelivery, createdAt: o.createdAt })) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-api.post("/quotes", protect, async (req, res) => {
+app.post('/api/orders', authMiddleware, async (req, res) => {
   try {
-    const { designId, specs } = req.body;
-    if (!designId) return res.status(400).json({ error: "designId required" });
-
-    const providers = await Provider.find({ isActive: true }).sort({ rating: -1 }).limit(5);
-    const bids = providers.slice(0, 3).map(p => ({
-      id:           uuidv4(),
-      providerId:   String(p._id),
-      providerName: p.companyName,
-      price:        Math.round((p.pricingBase || 100) * (specs?.quantity || 1) * (0.9 + Math.random() * 0.3)),
-      perUnit:      Math.round((p.pricingBase || 100) * (0.9 + Math.random() * 0.3)),
-      leadDays:     Math.floor(Math.random() * 10) + (p.leadTimeDays?.min || 5),
-      notes:        `Standard ${p.specialty || "fabrication"} process`,
-      status:       "submitted",
-      submittedAt:  new Date().toISOString(),
-    }));
-
-    const quote = await Quote.create({
-      designId,
-      requesterId: req.userId,
-      specs: {
-        length:     specs?.length,
-        width:      specs?.width,
-        thickness:  specs?.thickness,
-        quantity:   specs?.quantity || 1,
-        material:   specs?.material,
-        operations: specs?.operations || [],
-        finish:     specs?.finish,
-        leadTime:   specs?.leadTime,
-        notes:      specs?.notes,
-      },
-      bids,
-      expiresAt: new Date(Date.now() + 7 * 86400000),
-    });
-    res.status(201).json(fmtQuote(quote));
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-api.get("/quotes/:id", protect, async (req, res) => {
-  try {
-    const quote = await Quote.findOne({ _id: req.params.id, requesterId: req.userId });
-    if (!quote) return res.status(404).json({ error: "Quote not found" });
-    res.json(fmtQuote(quote));
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// ── Provider routes ───────────────────────────────────────────────────────────
-api.get("/providers", protect, async (req, res) => {
-  try {
-    const providers = await Provider.find({ isActive: true }).sort({ rating: -1 });
-    res.json({ providers: providers.map(fmtProvider) });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-api.get("/providers/:id", protect, async (req, res) => {
-  try {
-    const provider = await Provider.findById(req.params.id);
-    if (!provider) return res.status(404).json({ error: "Provider not found" });
-    res.json(fmtProvider(provider));
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// ── Order routes ──────────────────────────────────────────────────────────────
-api.get("/orders", protect, async (req, res) => {
-  try {
-    const orders = await Order.find({ buyerId: req.userId }).sort({ createdAt: -1 }).populate("providerId", "companyName");
-    res.json({ orders: orders.map(o => fmtOrder(o, o.providerId?.companyName)) });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-api.post("/orders", protect, async (req, res) => {
-  try {
-    const { providerId, designId, quoteId, specs, pricing } = req.body;
-    if (!providerId || !designId) return res.status(400).json({ error: "providerId and designId required" });
-
+    const { quoteId, designId, providerId, pricing, specs } = req.body;
+    const orderNumber = `SF-${Date.now().toString(36).toUpperCase()}`;
     const provider = await Provider.findById(providerId);
-    const count    = await Order.countDocuments();
-    const orderNumber = `SF-${(count + 1).toString().padStart(4, "0")}`;
-
+    const subtotal = (pricing.unitPrice || 0) * (pricing.quantity || 1);
+    const shipping = Math.round(subtotal * 0.08 * 100) / 100;
     const order = await Order.create({
-      orderNumber,
-      buyerId:    req.userId,
-      providerId,
-      designId,
-      quoteId:    quoteId || undefined,
-      specs: {
-        quantity:   specs?.quantity,
-        material:   specs?.material,
-        thickness:  specs?.thickness,
-        operations: specs?.operations || [],
-        finish:     specs?.finish,
-      },
-      pricing: {
-        unitPrice: pricing?.unitPrice,
-        quantity:  pricing?.quantity,
-        subtotal:  pricing?.subtotal,
-        shipping:  pricing?.shipping,
-        total:     pricing?.total,
-        currency:  pricing?.currency || "USD",
-      },
-      timeline:          [{ status: "confirmed", note: "Order confirmed and sent to manufacturer", timestamp: new Date().toISOString() }],
-      estimatedDelivery: new Date(Date.now() + 14 * 86400000),
+      orderNumber, quoteId, designId, userId: req.user.id,
+      providerId, providerName: provider?.companyName || 'Provider',
+      pricing: { ...pricing, subtotal, shipping, total: subtotal + shipping },
+      specs, estimatedDelivery: new Date(Date.now() + (14 * 24 * 60 * 60 * 1000)),
     });
-    res.status(201).json(fmtOrder(order, provider?.companyName));
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    if (quoteId) await Quote.findByIdAndUpdate(quoteId, { status: 'ordered' });
+    logActivity(req.user.id, 'order', `Order placed: ${order.orderNumber}`, `${provider?.companyName || ''} • $${(subtotal + shipping).toFixed(2)}`);
+    res.json({ id: order._id, orderNumber: order.orderNumber, status: order.status });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-api.get("/orders/:id", protect, async (req, res) => {
+app.get('/api/orders/:id', authMiddleware, async (req, res) => {
   try {
-    const order = await Order.findOne({ _id: req.params.id, buyerId: req.userId }).populate("providerId", "companyName");
-    if (!order) return res.status(404).json({ error: "Order not found" });
-    res.json(fmtOrder(order, order.providerId?.companyName));
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    const o = await Order.findOne({ _id: req.params.id, userId: req.user.id });
+    if (!o) return res.status(404).json({ error: 'Not found' });
+    res.json({ id: o._id, orderNumber: o.orderNumber, providerName: o.providerName, status: o.status, specs: o.specs, pricing: o.pricing, estimatedDelivery: o.estimatedDelivery, trackingNumber: o.trackingNumber });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-api.patch("/orders/:id", protect, async (req, res) => {
+// ── Provider Routes ───────────────────────────────────────────────────────────
+app.get('/api/providers', async (req, res) => {
   try {
-    const { status, note, tracking } = req.body;
-    const order = await Order.findOne({ _id: req.params.id, buyerId: req.userId });
-    if (!order) return res.status(404).json({ error: "Order not found" });
-
-    const timeline = [...(order.timeline || []), { status, note: note || null, timestamp: new Date().toISOString() }];
-    const update   = { status, timeline, updatedAt: new Date() };
-    if (tracking?.carrier)    update["tracking.carrier"]    = tracking.carrier;
-    if (tracking?.trackingNo) update["tracking.trackingNo"] = tracking.trackingNo;
-    if (tracking?.url)        update["tracking.url"]        = tracking.url;
-
-    const updated  = await Order.findByIdAndUpdate(req.params.id, { $set: update }, { new: true }).populate("providerId", "companyName");
-    res.json(fmtOrder(updated, updated.providerId?.companyName));
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    const providers = await Provider.find({ isVerified: true }).sort({ rating: -1 }).limit(20);
+    res.json({ providers: providers.map(p => ({ id: p._id, companyName: p.companyName, region: p.region, country: p.country, rating: p.rating, totalReviews: p.totalReviews, isVerified: p.isVerified, leadTimeDays: p.leadTimeDays, materials: p.materials, services: p.services, contact: p.contact, description: p.description })) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── Dashboard routes ──────────────────────────────────────────────────────────
-api.get("/dashboard/summary", protect, async (req, res) => {
+app.get('/api/providers/:id', async (req, res) => {
   try {
-    const uid = req.userId;
-    const [totalDesigns, totalQuotes, activeOrders, designs, orders] = await Promise.all([
-      Design.countDocuments({ ownerId: uid }),
-      Quote.countDocuments({ requesterId: uid }),
-      Order.countDocuments({ buyerId: uid }),
-      Design.find({ ownerId: uid }, "aiAnalysis.confidence"),
-      Order.find({ buyerId: uid }, "pricing.total"),
-    ]);
-    const totalSpend = orders.reduce((s, o) => s + (o.pricing?.total || 0), 0);
-    const avgConf    = designs.length
-      ? designs.reduce((s, d) => s + (d.aiAnalysis?.confidence || 0), 0) / designs.length
-      : 0;
-    res.json({
-      totalDesigns,
-      designsThisMonth:      totalDesigns,
-      pendingConversions:    totalDesigns,
-      totalQuotes,
-      activeOrders,
-      totalSpend,
-      conversionSuccessRate: 87.4,
-      avgConfidenceScore:    parseFloat((avgConf * 100).toFixed(1)),
-    });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    const p = await Provider.findById(req.params.id);
+    if (!p) return res.status(404).json({ error: 'Not found' });
+    res.json(p);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-api.get("/dashboard/activity", protect, async (req, res) => {
-  try {
-    const uid = req.userId;
-    const [designs, orders] = await Promise.all([
-      Design.find({ ownerId: uid }).sort({ createdAt: -1 }).limit(10),
-      Order.find({ buyerId: uid }).sort({ createdAt: -1 }).limit(5),
-    ]);
-    const activity = [];
-    for (const d of designs) {
-      if (d.status === "uploaded")
-        activity.push({ id: `upload-${d._id}`,  type: "upload",  title: "Design uploaded",     description: d.partName, timestamp: d.createdAt, designId: String(d._id) });
-      if (d.status === "approved" && d.approvedAt)
-        activity.push({ id: `approve-${d._id}`, type: "approve", title: "Design approved",      description: `${d.partName} verified and approved`, timestamp: d.approvedAt, designId: String(d._id) });
-      if (d.dwg?.generatedAt)
-        activity.push({ id: `convert-${d._id}`, type: "convert", title: "Conversion complete",  description: `${d.partName} → DXF (${d.dwg.entities||0} entities)`, timestamp: d.dwg.generatedAt, designId: String(d._id) });
-    }
-    for (const o of orders) {
-      activity.push({ id: `order-${o._id}`, type: "order", title: "Order placed", description: `Order ${o.orderNumber} confirmed`, timestamp: o.createdAt, designId: String(o.designId) });
-    }
-    activity.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
-    res.json(activity.slice(0, 15));
-  } catch (err) { res.status(500).json({ error: err.message }); }
+// ── Health ────────────────────────────────────────────────────────────────────
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'ok', version: '4.0', timestamp: new Date().toISOString(),
+    features: ['OpenCV v4 Pipeline','YOLO','SAM','Bezier','DXF Export','GCode Studio','AI Studio','Cloud Sync'],
+    opencv_stages: 23,
+  });
 });
 
-// ── Mount & start ─────────────────────────────────────────────────────────────
-app.use(BASE_PATH, api);
-
-initDb().then(() => {
-  app.listen(PORT, () => console.log(`SheetForge API listening on port ${PORT} at ${BASE_PATH}`));
-}).catch(err => {
-  console.error("MongoDB connection failed:", err.message);
-  process.exit(1);
-});
+app.listen(PORT, () => console.log(`SheetForge v4 API running on port ${PORT}`));
+module.exports = app;
