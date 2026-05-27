@@ -402,7 +402,7 @@ app.post('/api/gcode/:id', authMiddleware, async (req, res) => {
     const analysis  = { ...d.aiAnalysis, ...gcodeOpts };
 
     // Call process.py in ai_interact mode for gcode
-    const opts = { ...req.body, anthropicApiKey: process.env.ANTHROPIC_API_KEY, thickness: d.thickness || 2.0 };
+    const opts = { ...req.body, anthropicApiKey: process.env.GEMINI_API_KEY, thickness: d.thickness || 2.0 };
 
     // === IMPROVED LOCAL FILE PATH RESOLUTION ===
     let localImagePath = null;
