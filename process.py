@@ -36,12 +36,13 @@ pytesseract   = _try(lambda: __import__("pytesseract"))
 Image         = _try(lambda: __import__("PIL.Image",      fromlist=["Image"]))
 ImageFilter   = _try(lambda: __import__("PIL.ImageFilter", fromlist=["ImageFilter"]))
 ImageEnhance  = _try(lambda: __import__("PIL.ImageEnhance", fromlist=["ImageEnhance"]))
-anthropic_mod = _try(lambda: __import__("anthropic"))
 scipy_mod     = _try(lambda: __import__("scipy"))
 skimage_mod   = _try(lambda: __import__("skimage"))
 reportlab_mod = _try(lambda: __import__("reportlab"))
 svgwrite_mod  = _try(lambda: __import__("svgwrite"))
 matplotlib_mod= _try(lambda: __import__("matplotlib"))
+genai_mod = _try(lambda: __import__("google.genai"))
+
 
 # Optional heavy AI imports
 torch_mod     = _try(lambda: __import__("torch"))
