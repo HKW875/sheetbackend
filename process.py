@@ -21,7 +21,7 @@ v4.0 New Features:
   - AI-powered DXF interaction/correction endpoint
 """
 
-import sys, os, json, math, time, base64, re, traceback
+import sys, os, json, math, time, base64, re, traceback, cv2
 from pathlib import Path
 
 # ─── Graceful optional imports ────────────────────────────────────────────────
@@ -84,6 +84,13 @@ def load_image(image_path):
     img = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
     if img is None: return None, 96.0
     dpi = 96.0
+    if img.size == 0:
+        raise ValueError(f"Image loaded but has 0 pixels. Shape: {img.shape}")
+
+    if img.shape[0] == 0 or img.shape[1] == 0:
+        raise ValueError(f"Image has zero width or height: {img.shape}")
+
+    print(f"✓ Image loaded: {img.shape[1]}×{img.shape[0]}px, {img.shape[2]} channels")
     if HAS_PIL:
         try:
             pil  = Image.open(str(image_path))
