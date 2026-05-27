@@ -36,13 +36,12 @@ pytesseract   = _try(lambda: __import__("pytesseract"))
 Image         = _try(lambda: __import__("PIL.Image",      fromlist=["Image"]))
 ImageFilter   = _try(lambda: __import__("PIL.ImageFilter", fromlist=["ImageFilter"]))
 ImageEnhance  = _try(lambda: __import__("PIL.ImageEnhance", fromlist=["ImageEnhance"]))
+genai_mod     = _try(lambda: __import__("google.genai", fromlist=["genai"]))
 scipy_mod     = _try(lambda: __import__("scipy"))
 skimage_mod   = _try(lambda: __import__("skimage"))
 reportlab_mod = _try(lambda: __import__("reportlab"))
 svgwrite_mod  = _try(lambda: __import__("svgwrite"))
 matplotlib_mod= _try(lambda: __import__("matplotlib"))
-genai_mod = _try(lambda: __import__("google.genai"))
-
 
 # Optional heavy AI imports
 torch_mod     = _try(lambda: __import__("torch"))
@@ -52,7 +51,7 @@ HAS_CV     = cv2 is not None and np is not None
 HAS_DXF    = ezdxf is not None
 HAS_OCR    = pytesseract is not None
 HAS_PIL    = Image is not None
-HAS_AI     = anthropic_mod is not None
+HAS_AI     = genai_mod is not None
 HAS_SCIPY  = scipy_mod is not None
 HAS_SKIMAGE= skimage_mod is not None
 HAS_TORCH  = torch_mod is not None
@@ -855,23 +854,40 @@ def calibrate_px_to_mm(hull_data, ocr_dims, dpi):
     return round(scale, 6), w_mm, h_mm
 
 
-# ─── Claude Vision Analysis ───────────────────────────────────────────────────
-def claude_vision_analysis(image_path, cv_data):
+# ─── Gemini Vision Analysis ───────────────────────────────────────────────────
+def gemini_vision_analysis(image_path, cv_data):
+    """
+    Google AI Studio Gemini vision analysis.
+    Uses cv2 pre-processed image data as context alongside the raw image.
+    Falls back gracefully if GEMINI_API_KEY is not set or google-genai unavailable.
+    """
     if not HAS_AI: return {}
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key: return {}
     try:
-        client = anthropic_mod.Anthropic(api_key=api_key)
+        from google import genai
+        from google.genai import types as genai_types
+
+        client = genai.Client(api_key=api_key)
+
         with open(image_path, "rb") as f:
-            img_b64 = base64.standard_b64encode(f.read()).decode()
+            img_bytes = f.read()
         ext        = Path(image_path).suffix.lower().lstrip(".")
-        media_type = {"jpg":"image/jpeg","jpeg":"image/jpeg","png":"image/png",
-                      "bmp":"image/bmp","tiff":"image/tiff"}.get(ext, "image/jpeg")
+        mime_type  = {"jpg":"image/jpeg","jpeg":"image/jpeg","png":"image/png",
+                      "bmp":"image/bmp","tiff":"image/tiff","pdf":"application/pdf"}.get(ext, "image/jpeg")
+
         ocr_hint     = json.dumps(cv_data.get("ocr_dims", {}))
         circles_hint = json.dumps(cv_data.get("circles", [])[:10])
+
         prompt = f"""You are an expert mechanical / sheet-metal CAD engineer.
 Analyse this engineering sketch. Extract ALL dimensions and feature positions.
-Return ONLY valid JSON — no markdown:
+OpenCV pre-analysis context:
+  Image size: {cv_data.get('img_w',0)}×{cv_data.get('img_h',0)}px
+  Detected circles (pixel coords): {circles_hint}
+  OCR dimensions: {ocr_hint}
+  Estimated size: {cv_data.get('width_mm',0):.0f}×{cv_data.get('height_mm',0):.0f}mm
+
+Return ONLY valid JSON — no markdown, no explanation:
 {{
   "profileType": "sheet metal",
   "widthMM": <number>, "heightMM": <number>, "thicknessMM": <number or null>,
@@ -888,18 +904,17 @@ Return ONLY valid JSON — no markdown:
     "margin_left_mm":<n>,"margin_top_mm":<n>
   }}
 }}
-OpenCV context: Image {cv_data.get('img_w',0)}×{cv_data.get('img_h',0)}px,
-circles={circles_hint}, ocr_dims={ocr_hint},
-estimated size: {cv_data.get('width_mm',0):.0f}×{cv_data.get('height_mm',0):.0f}mm
-Return ONLY the JSON."""
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514", max_tokens=2000,
-            messages=[{"role": "user", "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_b64}},
-                {"type": "text",  "text": prompt},
-            ]}]
+Return ONLY the JSON object."""
+
+        # Build inline image part using google-genai types
+        image_part = genai_types.Part.from_bytes(data=img_bytes, mime_type=mime_type)
+        text_part  = genai_types.Part.from_text(text=prompt)
+
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=[genai_types.Content(parts=[image_part, text_part], role="user")],
         )
-        text = "".join(b.text for b in response.content if hasattr(b, "text"))
+        text = response.text or ""
         text = re.sub(r"```[a-z]*", "", text).strip().strip("`")
         m = re.search(r"\{.*\}", text, re.DOTALL)
         if m: text = m.group(0)
@@ -907,21 +922,30 @@ Return ONLY the JSON."""
     except Exception as e:
         return {"error": str(e)}
 
+# Keep old name as alias for callers that used it
+claude_vision_analysis = gemini_vision_analysis
+
 
 # ─── AI-Powered DXF Interaction / Correction ─────────────────────────────────
 def ai_dxf_interaction(instruction, current_analysis, image_path=None):
     """
     Allow users to interact with the AI to modify/correct the DXF.
-    Parses natural language instructions into analysis corrections.
+    Uses Google Gemini to parse natural language instructions into analysis corrections.
     """
     if not HAS_AI: return current_analysis, "AI not available"
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key: return current_analysis, "No API key"
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key: return current_analysis, "No GEMINI_API_KEY set"
 
     try:
-        client = anthropic_mod.Anthropic(api_key=api_key)
-        content = [{"type": "text", "text": f"""You are a CAD engineer modifying a DXF design.
-Current analysis (JSON): {json.dumps({k:v for k,v in current_analysis.items() if not k.startswith('_')}, indent=2)}
+        from google import genai
+        from google.genai import types as genai_types
+
+        client = genai.Client(api_key=api_key)
+
+        clean_analysis = {k: v for k, v in current_analysis.items() if not k.startswith("_")}
+        text_prompt = f"""You are a CAD engineer modifying a DXF design.
+Current analysis (JSON):
+{json.dumps(clean_analysis, indent=2)}
 
 User instruction: "{instruction}"
 
@@ -938,26 +962,29 @@ Return ONLY a JSON object with ONLY the fields that need to change:
   "_ai_circles": [<new_circles_or_omit>],
   "explanation": "<brief explanation of changes>"
 }}
-Apply ONLY changes relevant to the instruction. Return ONLY JSON."""}]
+Apply ONLY changes relevant to the instruction. Return ONLY JSON."""
 
+        parts = [genai_types.Part.from_text(text=text_prompt)]
+
+        # Attach image if available
         if image_path and os.path.exists(str(image_path)):
             ext = Path(image_path).suffix.lower().lstrip(".")
-            media_type = {"jpg":"image/jpeg","jpeg":"image/jpeg","png":"image/png"}.get(ext, "image/jpeg")
+            mime_type = {"jpg":"image/jpeg","jpeg":"image/jpeg","png":"image/png"}.get(ext, "image/jpeg")
             with open(image_path, "rb") as f:
-                img_b64 = base64.standard_b64encode(f.read()).decode()
-            content.insert(0, {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_b64}})
+                img_bytes = f.read()
+            parts.insert(0, genai_types.Part.from_bytes(data=img_bytes, mime_type=mime_type))
 
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514", max_tokens=1500,
-            messages=[{"role": "user", "content": content}]
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=[genai_types.Content(parts=parts, role="user")],
         )
-        text = "".join(b.text for b in response.content if hasattr(b, "text"))
+        text = response.text or ""
         text = re.sub(r"```[a-z]*", "", text).strip().strip("`")
         m    = re.search(r"\{.*\}", text, re.DOTALL)
         if m: text = m.group(0)
-        changes = json.loads(text)
+        changes     = json.loads(text)
         explanation = changes.pop("explanation", "Changes applied")
-        updated = {**current_analysis, **{k: v for k, v in changes.items() if v is not None}}
+        updated     = {**current_analysis, **{k: v for k, v in changes.items() if v is not None}}
         return updated, explanation
     except Exception as e:
         return current_analysis, f"Error: {str(e)}"
@@ -1133,7 +1160,7 @@ def build_dxf_ezdxf(analysis, dpi, image_path):
         (tb_x,tb_y+26,f"MATERIAL: {analysis.get('material','—')}",           3.5),
         (tb_x,tb_y+18,f"TOLERANCE: {analysis.get('tolerance','±0.1mm')}",    3.5),
         (tb_x,tb_y+10,f"CONFIDENCE: {analysis.get('confidence',0)}%",        3.0),
-        (tb_x,tb_y+ 2,"SheetForge v4.0 — AI+OpenCV DXF",                     2.5),
+        (tb_x,tb_y+ 2,"SheetForge v4.0 — Gemini+OpenCV DXF",                     2.5),
     ]:
         msp.add_text(text, dxfattribs={"layer":"TITLE_BLOCK","height":h_t,"insert":(tx,ty)})
         entity_count += 1
@@ -1668,7 +1695,7 @@ def main():
     ai_data = {}
     if image_path and os.path.exists(image_path):
         ai_data = claude_vision_analysis(image_path, cv_ctx)
-    steps.append(step_record("AI-4: Claude Vision Deep Analysis", f"conf={ai_data.get('confidence',0):.2f} profile={ai_data.get('profileType','?')}", t0))
+    steps.append(step_record("AI-4: Gemini Vision Deep Analysis", f"conf={ai_data.get('confidence',0):.2f} profile={ai_data.get('profileType','?')}", t0))
 
     # Merge
     t0 = now_ms()
