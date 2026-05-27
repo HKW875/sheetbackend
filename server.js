@@ -307,18 +307,57 @@ app.patch('/api/designs/:id/approve', authMiddleware, async (req, res) => {
 });
 
 // ── Conversion Pipeline ───────────────────────────────────────────────────────
-    // === RUN PYTHON PIPELINE (Improved) ===
+    const opts = { ...req.body, anthropicApiKey: process.env.GEMINI_API_KEY, thickness: d.thickness || 2.0 };
+
+    // === IMPROVED LOCAL FILE PATH RESOLUTION ===
+    let localImagePath = null;
+
+    if (d.originalFile?.localPath && fs.existsSync(d.originalFile.localPath)) {
+      localImagePath = d.originalFile.localPath;
+    }
+
+    if (!localImagePath && d.originalFile?.url?.startsWith('/uploads/')) {
+      const urlBased = path.join(__dirname, d.originalFile.url);
+      if (urlBased && fs.existsSync(urlBased)) localImagePath = urlBased;
+    }
+
+    if (!localImagePath) {
+      try {
+        const files = fs.readdirSync(UPLOAD_DIR)
+          .filter(f => !fs.statSync(path.join(UPLOAD_DIR, f)).isDirectory());
+
+        const origStem = path.parse(d.originalFile?.filename || '').name;
+        const designIdShort = d._id.toString().slice(-8);
+
+        const match = files.find(f => 
+          (origStem && (f.startsWith(origStem) || f.includes(origStem))) ||
+          f.includes(designIdShort)
+        );
+
+        if (match) localImagePath = path.join(UPLOAD_DIR, match);
+      } catch (e) {
+        console.error('File search failed:', e.message);
+      }
+    }
+
+    if (!localImagePath || !fs.existsSync(localImagePath)) {
+      console.error(`[Convert] Source file not found for design ${designId}`);
+      d.status = 'error';
+      await d.save();
+      return res.status(404).json({ error: 'Source file not found on server' });
+    }
+
+    // === RUN PYTHON PIPELINE ===
     let output = '', errorOut = '';
     console.log(`[Convert] Starting pipeline for design ${designId}`);
     console.log(`[Convert] Using file: ${localImagePath}`);
 
-    const py = spawn(PYTHON_CMD, [PROCESS_PY, localImagePath || '', JSON.stringify(opts)], {
+    const py = spawn(PYTHON_CMD, [PROCESS_PY, localImagePath, JSON.stringify(opts)], {
       env: { ...process.env, PYTHONUNBUFFERED: '1' },
     });
 
     py.stdout.on('data', chunk => { 
       output += chunk.toString(); 
-      // console.log('[py stdout]', chunk.toString().slice(0, 200)); // uncomment for debugging
     });
 
     py.stderr.on('data', chunk => { 
@@ -337,7 +376,6 @@ app.patch('/api/designs/:id/approve', authMiddleware, async (req, res) => {
       }
 
       try {
-        // Get the last JSON line (process.py prints multiple things)
         const lastLine = output.trim().split('\n').pop();
         const result = JSON.parse(lastLine);
 
@@ -374,13 +412,17 @@ app.patch('/api/designs/:id/approve', authMiddleware, async (req, res) => {
 
       } catch (e) {
         console.error('Conversion parsing error:', e.message);
-        console.error('Raw output:', output.slice(0, 600));
+        console.error('Raw output preview:', output.slice(0, 500));
         d.status = 'error';
         await d.save();
       }
     });
+
     res.json({ id: designId, status: 'analyzing', message: 'Pipeline started' });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { 
+    console.error('Convert route error:', e.message);
+    res.status(500).json({ error: e.message }); 
+  }
 });
 
 app.get('/api/convert/:id/status', authMiddleware, async (req, res) => {
