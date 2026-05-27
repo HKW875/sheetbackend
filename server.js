@@ -711,6 +711,9 @@ app.get('/api/convert/:id/progress', protect, (req, res) => {
  *   3. Parse JSON output — analysis, DXF path, G-code
  *   4. Save results to MongoDB
  */
+// ================================================================
+// ROUTES — AI CONVERSION (orchestrates process.py)
+// ================================================================
 app.post('/api/convert/:id', protect, async (req, res) => {
   let design;
   try {
@@ -718,8 +721,15 @@ app.post('/api/convert/:id', protect, async (req, res) => {
     if (!design) return res.status(404).json({ error: 'Design not found' });
     if (!design.originalFile?.path) return res.status(400).json({ error: 'No file attached to design' });
 
-    const filePath = design.originalFile.path;
-    if (!fs.existsSync(filePath)) return res.status(400).json({ error: 'Uploaded file not found on disk' });
+    // ─── FIX A: SANITIZE AND FORCE FULL ABSOLUTE RESOLUTION ───
+    const filePath = path.resolve(design.originalFile.path); 
+    
+    // Debug log to terminal to verify the disk layout
+    console.log(`[SheetForge Debug] Passing absolute image path to Python: ${filePath}`);
+
+    if (!fs.existsSync(filePath)) {
+      return res.status(400).json({ error: `Uploaded file not found on disk at: ${filePath}` });
+    }
 
     // Step 1: Mark as analyzing
     design.status = 'analyzing';
@@ -746,9 +756,7 @@ app.post('/api/convert/:id', protect, async (req, res) => {
     };
 
     // Step 2: Call process.py via spawn — stream steps to SSE clients
-    design.status = 'analyzing';
-    await design.save();
-
+    // FIXED: Using the fully resolved absolute 'filePath' here safely
     const pyResult = await runProcessPy(filePath, opts, (event, message) => {
       pushProgress(design._id.toString(), event, { message });
     });
