@@ -20,3 +20,16 @@ google-genai>=1.0.0
 # Scientific / clustering
 scipy>=1.11.0
 scikit-learn>=1.3.0
+
+# Additional dependencies for process.py v4.0
+
+# AI / Vision
+anthropic>=0.30.0
+ultralytics>=8.2.0
+segment-anything>=1.0
+easyocr>=1.7.0
+
+# Export libraries
+matplotlib>=3.8.0
+svgwrite>=1.4.0
+reportlab>=4.0.0
