@@ -549,6 +549,23 @@ function pushProgress(designId, event, data) {
   job.steps.push({ event, ...data, ts: Date.now() });
 }
 
+
+// Add this route right near your other conversion endpoints in server.js
+app.get('/api/convert/:id/status', protect, async (req, res) => {
+  try {
+    const design = await Design.findById(req.params.id);
+    if (!design) return res.status(404).json({ error: 'Design not found' });
+    
+    // Return a standard JSON payload that Cloudflare handles perfectly
+    res.json({
+      status: design.status, // e.g., 'analyzing', 'completed', 'failed'
+      progress: global.currentProgressMessage?.[req.params.id] || "Processing layout..."
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ================================================================
 // ROUTES — AUTH
 // ================================================================
