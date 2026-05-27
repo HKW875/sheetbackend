@@ -307,45 +307,42 @@ app.patch('/api/designs/:id/approve', authMiddleware, async (req, res) => {
 });
 
 // ── Conversion Pipeline ───────────────────────────────────────────────────────
-app.post('/api/convert/:id', authMiddleware, async (req, res) => {
-  const designId = req.params.id;
-  try {
-    const d = await Design.findOne({ _id: designId, userId: req.user.id });
-    if (!d) return res.status(404).json({ error: 'Design not found' });
-    d.status = 'analyzing'; d.conversionLog = []; await d.save();
-
-    const opts = { ...req.body, anthropicApiKey: process.env.ANTHROPIC_API_KEY, thickness: d.thickness || 2.0 };
-    // Determine local path: prefer saved localPath, then /uploads/ URL, then scan by original filename
-    let localImagePath = d.originalFile?.localPath || null;
-    if (!localImagePath || !fs.existsSync(localImagePath)) {
-      const urlBased = d.originalFile?.url?.startsWith('/uploads/')
-        ? path.join(__dirname, d.originalFile.url) : null;
-      if (urlBased && fs.existsSync(urlBased)) localImagePath = urlBased;
-    }
-    if (!localImagePath || !fs.existsSync(localImagePath)) {
-      // Fallback: scan uploads dir — match by original filename stem (multer generates random hex names)
-      const origName = require('path').parse(d.originalFile?.filename || '').name;
-      try {
-        const allFiles = fs.readdirSync(UPLOAD_DIR)
-          .filter(f => !fs.statSync(path.join(UPLOAD_DIR, f)).isDirectory());
-        const match = origName
-          ? allFiles.find(f => f.startsWith(origName) || f.includes(origName))
-          : allFiles.find(f => f.includes(d._id.toString().slice(-6)));
-        if (match) localImagePath = path.join(UPLOAD_DIR, match);
-      } catch (_) {}
-    }
-
-    // Run process.py asynchronously
+    // === RUN PYTHON PIPELINE (Improved) ===
     let output = '', errorOut = '';
+    console.log(`[Convert] Starting pipeline for design ${designId}`);
+    console.log(`[Convert] Using file: ${localImagePath}`);
+
     const py = spawn(PYTHON_CMD, [PROCESS_PY, localImagePath || '', JSON.stringify(opts)], {
       env: { ...process.env, PYTHONUNBUFFERED: '1' },
     });
-    py.stdout.on('data', chunk => { output += chunk.toString(); });
-    py.stderr.on('data', chunk => { errorOut += chunk.toString(); console.error('[py]', chunk.toString().slice(0, 200)); });
-    py.on('close', async code => {
+
+    py.stdout.on('data', chunk => { 
+      output += chunk.toString(); 
+      // console.log('[py stdout]', chunk.toString().slice(0, 200)); // uncomment for debugging
+    });
+
+    py.stderr.on('data', chunk => { 
+      errorOut += chunk.toString(); 
+      console.error('[py stderr]', chunk.toString().slice(0, 300)); 
+    });
+
+    py.on('close', async (code) => {
+      console.log(`[Convert] Python process exited with code: ${code}`);
+
+      if (code !== 0 || !output.trim()) {
+        console.error('[Convert] Python failed!', errorOut);
+        d.status = 'error';
+        await d.save();
+        return;
+      }
+
       try {
-        const result = JSON.parse(output.trim().split('\n').pop());
+        // Get the last JSON line (process.py prints multiple things)
+        const lastLine = output.trim().split('\n').pop();
+        const result = JSON.parse(lastLine);
+
         if (result.error) throw new Error(result.error);
+
         d.aiAnalysis    = result.analysis;
         d.dwg           = { ...result.dwg };
         d.conversionLog = result.steps;
@@ -373,10 +370,13 @@ app.post('/api/convert/:id', authMiddleware, async (req, res) => {
         }
 
         await d.save();
-        logActivity(req.user.id, 'convert', `Converted: ${d.partName}`, `${result.steps?.length || 23} stages • ${d.aiAnalysis?.confidence || 0}% conf.`);
+        logActivity(req.user.id, 'convert', `Converted: ${d.partName}`, `${result.steps?.length || 23} stages`);
+
       } catch (e) {
-        d.status = 'error'; await d.save();
-        console.error('Conversion error:', e.message, '\n', errorOut.slice(0, 500));
+        console.error('Conversion parsing error:', e.message);
+        console.error('Raw output:', output.slice(0, 600));
+        d.status = 'error';
+        await d.save();
       }
     });
     res.json({ id: designId, status: 'analyzing', message: 'Pipeline started' });
