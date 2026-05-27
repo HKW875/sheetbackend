@@ -402,28 +402,115 @@ app.post('/api/gcode/:id', authMiddleware, async (req, res) => {
     const analysis  = { ...d.aiAnalysis, ...gcodeOpts };
 
     // Call process.py in ai_interact mode for gcode
-    const opts = { mode: 'ai_interact', instruction: 'Generate G-Code', analysis: d.aiAnalysis, gcodeOptions: gcodeOpts, dpi: 96 };
-    let output = '';
-    const py = spawn(PYTHON_CMD, [PROCESS_PY, d.originalFile?.url || '', JSON.stringify(opts)], {
+    const opts = { ...req.body, anthropicApiKey: process.env.ANTHROPIC_API_KEY, thickness: d.thickness || 2.0 };
+
+    // === IMPROVED LOCAL FILE PATH RESOLUTION ===
+    let localImagePath = null;
+
+    if (d.originalFile?.localPath && fs.existsSync(d.originalFile.localPath)) {
+      localImagePath = d.originalFile.localPath;
+    }
+
+    if (!localImagePath && d.originalFile?.url?.startsWith('/uploads/')) {
+      const urlBased = path.join(__dirname, d.originalFile.url);
+      if (fs.existsSync(urlBased)) localImagePath = urlBased;
+    }
+
+    if (!localImagePath) {
+      try {
+        const files = fs.readdirSync(UPLOAD_DIR)
+          .filter(f => !fs.statSync(path.join(UPLOAD_DIR, f)).isDirectory());
+
+        const origStem = path.parse(d.originalFile?.filename || '').name;
+        const designIdShort = d._id.toString().slice(-8);
+
+        const match = files.find(f => 
+          (origStem && (f.startsWith(origStem) || f.includes(origStem))) ||
+          f.includes(designIdShort)
+        );
+
+        if (match) localImagePath = path.join(UPLOAD_DIR, match);
+      } catch (e) {
+        console.error('File search failed:', e.message);
+      }
+    }
+
+    if (!localImagePath || !fs.existsSync(localImagePath)) {
+      console.error(`[Convert] Source file not found for design ${designId}`);
+      d.status = 'error';
+      await d.save();
+      return res.status(404).json({ error: 'Source file not found on server' });
+    }
+
+    // === RUN PYTHON PIPELINE ===
+    let output = '', errorOut = '';
+    console.log(`[Convert] Starting pipeline for design ${designId}`);
+    console.log(`[Convert] Using file: ${localImagePath}`);
+
+    const py = spawn(PYTHON_CMD, [PROCESS_PY, localImagePath, JSON.stringify(opts)], {
       env: { ...process.env, PYTHONUNBUFFERED: '1' },
     });
-    py.stdout.on('data', c => { output += c.toString(); });
-    py.on('close', async () => {
-      let gcode = '';
+
+    py.stdout.on('data', chunk => { 
+      output += chunk.toString(); 
+    });
+
+    py.stderr.on('data', chunk => { 
+      errorOut += chunk.toString(); 
+      console.error('[py stderr]', chunk.toString().slice(0, 300)); 
+    });
+
+    py.on('close', async (code) => {
+      console.log(`[Convert] Python process exited with code: ${code}`);
+
+      if (code !== 0 || !output.trim()) {
+        console.error('[Convert] Python failed!', errorOut);
+        d.status = 'error';
+        await d.save();
+        return;
+      }
+
       try {
-        const r = JSON.parse(output.trim().split('\n').pop());
-        gcode = r.gcode || '';
-      } catch { gcode = generateFallbackGCode(d.aiAnalysis, gcodeOpts); }
-      if (!gcode) gcode = generateFallbackGCode(d.aiAnalysis, gcodeOpts);
+        const lastLine = output.trim().split('\n').pop();
+        const result = JSON.parse(lastLine);
 
-      // Save to history
-      d.gcodeHistory = d.gcodeHistory || [];
-      d.gcodeHistory.unshift({ gcode, opts: gcodeOpts, generatedAt: new Date() });
-      if (d.gcodeHistory.length > 10) d.gcodeHistory = d.gcodeHistory.slice(0, 10);
-      await d.save();
+        if (result.error) throw new Error(result.error);
 
-      logActivity(req.user.id, 'gcode', `GCode generated: ${d.partName}`, `${gcode.split('\n').length} lines • ${gcodeOpts.operation || 'cut'}`);
-      res.json({ gcode, lines: gcode.split('\n').length });
+        d.aiAnalysis    = result.analysis;
+        d.dwg           = { ...result.dwg };
+        d.conversionLog = result.steps;
+        d.status        = 'ready';
+        d.updatedAt     = new Date();
+
+        // Upload DXF + SVG to Cloudinary
+        const dxfPath = path.join(OUTPUT_DIR, result.dwg.filename || '');
+        const svgPath = path.join(OUTPUT_DIR, result.dwg.svgFilename || '');
+        if (fs.existsSync(dxfPath)) {
+          try { const cr = await uploadToCloudinary(dxfPath, 'sheetforge/dxf', 'raw'); d.dwg.dxfUrl = cr.secure_url; } catch {}
+        }
+        if (fs.existsSync(svgPath)) {
+          try { const cr = await uploadToCloudinary(svgPath, 'sheetforge/svg', 'image'); d.dwg.svgUrl = cr.secure_url; } catch {}
+        }
+
+        // Store GCode if generated
+        if (result.gcode) {
+          d.gcodeHistory = [{ gcode: result.gcode, opts: opts, generatedAt: new Date() }];
+          d.dwg.gcodeFilename = result.dwg.gcodeFilename || '';
+          const gcodePath = path.join(OUTPUT_DIR, d.dwg.gcodeFilename || '');
+          if (fs.existsSync(gcodePath)) {
+            try { const cr = await uploadToCloudinary(gcodePath, 'sheetforge/gcode', 'raw'); d.dwg.gcodeUrl = cr.secure_url; } catch {}
+          }
+        }
+
+        await d.save();
+        logActivity(req.user.id, 'convert', `Converted: ${d.partName}`, `${result.steps?.length || 23} stages`);
+
+      } catch (e) {
+        console.error('Conversion parsing error:', e.message);
+        console.error('Raw output preview:', output.slice(0, 500));
+        d.status = 'error';
+        await d.save();
+      }
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
