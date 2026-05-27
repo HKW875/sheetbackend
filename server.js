@@ -343,18 +343,29 @@ const Order = mongoose.model('Order', orderSchema);
 // ================================================================
 // AUTH MIDDLEWARE
 // ================================================================
+// Inside server.js -> const protect = async (req, res, next) => { ... }
 const protect = async (req, res, next) => {
+  let token;
+
+  // 1. Check standard Authorization Header
+  if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
+    token = req.headers.authorization.split(' ')[1];
+  } 
+  // 2. FALLBACK FIX: Check query parameters for EventSource (SSE) compatibility
+  else if (req.query && req.query.token) {
+    token = req.query.token;
+  }
+
+  if (!token) {
+    return res.status(401).json({ error: 'Not authorized, token missing' });
+  }
+
   try {
-    const token = req.headers.authorization?.startsWith('Bearer ')
-      ? req.headers.authorization.split(' ')[1]
-      : null;
-    if (!token) return res.status(401).json({ error: 'Not authenticated' });
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'sheetforge_jwt_secret_2026');
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-fallback-secret');
     req.user = await User.findById(decoded.id).select('-password');
-    if (!req.user) return res.status(401).json({ error: 'User not found' });
     next();
-  } catch (err) {
-    return res.status(401).json({ error: 'Invalid token' });
+  } catch (error) {
+    return res.status(401).json({ error: 'Not authorized, token invalid' });
   }
 };
 
@@ -485,6 +496,47 @@ function execProcessPy(imagePath, opts = {}) {
 // ================================================================
 // SSE PROGRESS — in-memory store for active conversion jobs
 // ================================================================
+
+// ================================================================
+// SSE PROGRESS STREAM — MATCHING FRONTEND DEMAND
+// ================================================================
+app.get('/api/convert/:id/progress', async (req, res) => {
+  const designId = req.params.id;
+
+  // Establish SSE Header configs
+  res.writeHead(200, {
+    'Content-Type':  'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection':    'keep-alive',
+  });
+  res.write('\n');
+
+  // Register this response handle into your global progress registry
+  if (!global.progressClients) {
+    global.progressClients = {};
+  }
+  if (!global.progressClients[designId]) {
+    global.progressClients[designId] = [];
+  }
+  
+  global.progressClients[designId].push(res);
+  console.log(`[SSE Connected] Progress listener attached for design: ${designId}`);
+
+  // Keep connection alive with a periodic heartbeat ping
+  const heartbeat = setInterval(() => {
+    res.write(':\n\n');
+  }, 15000);
+
+  // Clean up if user closes page or disconnects browser tab
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    if (global.progressClients[designId]) {
+      global.progressClients[designId] = global.progressClients[designId].filter(client => client !== res);
+    }
+    console.log(`[SSE Disconnected] Progress listener removed for design: ${designId}`);
+  });
+});
+
 const activeJobs = new Map(); // designId → { clients: Set<res>, steps: Array }
 
 function pushProgress(designId, event, data) {
