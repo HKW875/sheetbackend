@@ -19,7 +19,6 @@ require('dotenv').config();
 const express       = require('express');
 const mongoose      = require('mongoose');
 const cors          = require('cors');
-const helmet        = require('helmet');
 const morgan        = require('morgan');
 const multer        = require('multer');
 const cloudinary    = require('cloudinary').v2;
