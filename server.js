@@ -406,8 +406,18 @@ function runProcessPy(imagePath, opts = {}, onStep = null) {
       return reject(new Error('process.py not found next to server.js'));
     }
 
+    // Validate the image path before spawning — surfaces a clear error
+    // instead of the silent '0x0px @ 96dpi' result.
+    if (!imagePath || !fs.existsSync(imagePath)) {
+      return reject(new Error(
+        'Image file not found on disk: ' + imagePath +
+        '. Ensure Multer saved the upload and path.resolve() is used.'
+      ));
+    }
+
     const args    = [scriptPath, imagePath, JSON.stringify(opts)];
-    const py      = spawn('python', args, {
+    // Use python3 explicitly — 'python' may map to Python 2 on some systems.
+    const py      = spawn('python3', args, {
       env: {
         ...process.env,
         GEMINI_API_KEY: process.env.GEMINI_API_KEY || '',
@@ -466,7 +476,7 @@ function execProcessPy(imagePath, opts = {}) {
   return new Promise((resolve, reject) => {
     const scriptPath = path.join(__dirname, 'process.py');
     const optsJson   = JSON.stringify(opts).replace(/'/g, "'\\''");
-    const cmd        = `python "${scriptPath}" "${imagePath}" '${optsJson}'`;
+    const cmd        = `python3 "${scriptPath}" "${imagePath}" '${optsJson}'`;
 
     exec(cmd, {
       maxBuffer: 50 * 1024 * 1024,  // 50 MB stdout buffer
