@@ -43,28 +43,39 @@ app.use((req, res, next) => {
 // MIDDLEWARE
 // ================================================================
 
-// Allow only your specific frontend origin
-app.use(cors({
-  origin: 'https://sheetfg.hkw875.workers.dev'
-}));
+// ── CORS ─────────────────────────────────────────────────────────────────────
+// Single, authoritative CORS config (having two cors() calls is the bug —
+// the second one silently overwrites the first).
+// Always allows the hardcoded Cloudflare Workers frontend PLUS anything
+// listed in CLIENT_URL (comma-separated).  Handles preflight OPTIONS as well.
+const HARDCODED_ORIGINS = [
+  'https://sheetfg.hkw875.workers.dev',
+];
+const allowedOrigins = [
+  ...HARDCODED_ORIGINS,
+  ...(process.env.CLIENT_URL || '').split(',').map(o => o.trim()).filter(Boolean),
+];
 
-app.use(helmet({ contentSecurityPolicy: false }));
-
-// CORS — supports comma-separated CLIENT_URL env var for multiple origins
-const allowedOrigins = (process.env.CLIENT_URL || '')
-  .split(',')
-  .map(o => o.trim())
-  .filter(Boolean);
-
-app.use(cors({
-  origin: function(origin, callback) {
-    if (!origin) return callback(null, true);
-    if (allowedOrigins.length === 0) return callback(null, true);
-    if (allowedOrigins.includes(origin)) return callback(null, true);
+const corsOptions = {
+  origin: function (origin, callback) {
+    // Allow server-to-server requests (no Origin header) and all allowed origins.
+    if (!origin || allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    console.warn(`[CORS] Blocked origin: ${origin}`);
     callback(new Error(`CORS: Origin ${origin} not allowed`));
   },
   credentials: true,
-}));
+  methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+};
+
+app.use(cors(corsOptions));
+// Explicitly handle pre-flight OPTIONS for every route so browsers never
+// receive a missing Access-Control-Allow-Origin header on preflight.
+app.options('*', cors(corsOptions));
+
+app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 app.use(morgan('dev'));
