@@ -42,6 +42,12 @@ app.use((req, res, next) => {
 // ================================================================
 // MIDDLEWARE
 // ================================================================
+
+// Allow only your specific frontend origin
+app.use(cors({
+  origin: 'https://sheetfg.hkw875.workers.dev'
+}));
+
 app.use(helmet({ contentSecurityPolicy: false }));
 
 // CORS — supports comma-separated CLIENT_URL env var for multiple origins
@@ -417,13 +423,15 @@ function runProcessPy(imagePath, opts = {}, onStep = null) {
 
     const args    = [scriptPath, imagePath, JSON.stringify(opts)];
     // Use python3 explicitly — 'python' may map to Python 2 on some systems.
-    const py      = spawn('python3', args, {
+    // Replace the spawn part with this more robust version:
+    const py = spawn('python', args, {
       env: {
         ...process.env,
         GEMINI_API_KEY: process.env.GEMINI_API_KEY || '',
-        // Keep PATH so python can find system libs
         PATH: process.env.PATH,
-      },
+        PYTHONUNBUFFERED: '1'   // <-- Add this for real-time output
+     },
+      stdio: ['ignore', 'pipe', 'pipe']
     });
 
     let stdout = '';
