@@ -36,7 +36,7 @@ pytesseract   = _try(lambda: __import__("pytesseract"))
 Image         = _try(lambda: __import__("PIL.Image",      fromlist=["Image"]))
 ImageFilter   = _try(lambda: __import__("PIL.ImageFilter", fromlist=["ImageFilter"]))
 ImageEnhance  = _try(lambda: __import__("PIL.ImageEnhance", fromlist=["ImageEnhance"]))
-genai_mod     = _try(lambda: __import__("google.genai", fromlist=["genai"]))
+anthropic_mod = _try(lambda: __import__("anthropic"))
 scipy_mod     = _try(lambda: __import__("scipy"))
 skimage_mod   = _try(lambda: __import__("skimage"))
 reportlab_mod = _try(lambda: __import__("reportlab"))
@@ -51,7 +51,7 @@ HAS_CV     = cv2 is not None and np is not None
 HAS_DXF    = ezdxf is not None
 HAS_OCR    = pytesseract is not None
 HAS_PIL    = Image is not None
-HAS_AI     = genai_mod is not None
+HAS_AI     = anthropic_mod is not None
 HAS_SCIPY  = scipy_mod is not None
 HAS_SKIMAGE= skimage_mod is not None
 HAS_TORCH  = torch_mod is not None
@@ -84,13 +84,6 @@ def load_image(image_path):
     img = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
     if img is None: return None, 96.0
     dpi = 96.0
-    if img.size == 0:
-        raise ValueError(f"Image loaded but has 0 pixels. Shape: {img.shape}")
-
-    if img.shape[0] == 0 or img.shape[1] == 0:
-        raise ValueError(f"Image has zero width or height: {img.shape}")
-
-    print(f"✓ Image loaded: {img.shape[1]}×{img.shape[0]}px, {img.shape[2]} channels")
     if HAS_PIL:
         try:
             pil  = Image.open(str(image_path))
@@ -110,69 +103,6 @@ def separate_channels(img):
     _, blue_bin= cv2.threshold(blue_mask, 30, 255, cv2.THRESH_BINARY)
     gray       = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     return blue_bin, red_bin, gray
-
-
-# ─── PRE-2b — HSV Ink Masking ─────────────────────────────────────────────────
-def hsv_ink_mask(img):
-    """
-    Hybrid HSV pipeline for raw, colored scans.
-
-    Steps:
-      1. Convert BGR → HSV  (cv2.cvtColor with COLOR_BGR2HSV)
-      2. Mask background paper using cv2.inRange() — retains only ink pixels
-         by rejecting high-saturation / high-value (near-white) regions.
-      3. Build a combined ink mask that captures dark inks of any hue as well
-         as saturated colored inks (e.g. blue/red pen on white paper).
-      4. Apply the mask so downstream processing operates only on ink pixels,
-         improving skeletonization and feature-extraction quality.
-
-    Returns
-    -------
-    masked_color : ndarray  — original colors preserved, background zeroed
-    ink_mask     : ndarray  — 8-bit single-channel binary mask (255 = ink)
-    hsv          : ndarray  — HSV image (for optional downstream use)
-    """
-    if not HAS_CV or img is None:
-        return img, None, None
-
-    # Step 1 — BGR → HSV
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-
-    # Step 2 — Paper/background rejection with cv2.inRange()
-    # White / near-white paper: low saturation AND high value
-    paper_lower = np.array([0,   0, 180], dtype=np.uint8)
-    paper_upper = np.array([180, 50, 255], dtype=np.uint8)
-    paper_mask  = cv2.inRange(hsv, paper_lower, paper_upper)   # 255 = paper
-    not_paper   = cv2.bitwise_not(paper_mask)                  # 255 = potential ink
-
-    # Step 3 — Dark-ink mask (any hue, low value → pencil / black pen)
-    dark_lower = np.array([0,   0,   0], dtype=np.uint8)
-    dark_upper = np.array([180, 255, 100], dtype=np.uint8)
-    dark_mask  = cv2.inRange(hsv, dark_lower, dark_upper)
-
-    # Saturated-ink mask (colored pens: blue, red, green …)
-    sat_lower = np.array([0,  60,  40], dtype=np.uint8)
-    sat_upper = np.array([180, 255, 230], dtype=np.uint8)
-    sat_mask  = cv2.inRange(hsv, sat_lower, sat_upper)
-
-    # Union: ink = dark OR saturated AND NOT pure paper
-    raw_ink   = cv2.bitwise_or(dark_mask, sat_mask)
-    ink_mask  = cv2.bitwise_and(raw_ink, not_paper)
-
-    # Small morphological cleanup — close micro-gaps, remove salt noise
-    k3 = np.ones((3, 3), np.uint8)
-    ink_mask = cv2.morphologyEx(ink_mask, cv2.MORPH_CLOSE, k3, iterations=1)
-    ink_mask = cv2.morphologyEx(ink_mask, cv2.MORPH_OPEN,  k3, iterations=1)
-
-    # Step 4 — Apply mask: zero out background in the color image
-    masked_color = cv2.bitwise_and(img, img, mask=ink_mask)
-
-    ink_px = int(np.count_nonzero(ink_mask))
-    total  = ink_mask.size
-    print(f"✓ HSV ink mask: {ink_px} ink pixels "
-          f"({100.0 * ink_px / total:.1f}% of image)")
-
-    return masked_color, ink_mask, hsv
 
 
 # ─── PRE-3 — PREPROCESSING: Gaussian Blur ─────────────────────────────────────
@@ -924,40 +854,23 @@ def calibrate_px_to_mm(hull_data, ocr_dims, dpi):
     return round(scale, 6), w_mm, h_mm
 
 
-# ─── Gemini Vision Analysis ───────────────────────────────────────────────────
-def gemini_vision_analysis(image_path, cv_data):
-    """
-    Google AI Studio Gemini vision analysis.
-    Uses cv2 pre-processed image data as context alongside the raw image.
-    Falls back gracefully if GEMINI_API_KEY is not set or google-genai unavailable.
-    """
+# ─── Claude Vision Analysis ───────────────────────────────────────────────────
+def claude_vision_analysis(image_path, cv_data):
     if not HAS_AI: return {}
-    api_key = os.environ.get("GEMINI_API_KEY")
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key: return {}
     try:
-        from google import genai
-        from google.genai import types as genai_types
-
-        client = genai.Client(api_key=api_key)
-
+        client = anthropic_mod.Anthropic(api_key=api_key)
         with open(image_path, "rb") as f:
-            img_bytes = f.read()
+            img_b64 = base64.standard_b64encode(f.read()).decode()
         ext        = Path(image_path).suffix.lower().lstrip(".")
-        mime_type  = {"jpg":"image/jpeg","jpeg":"image/jpeg","png":"image/png",
-                      "bmp":"image/bmp","tiff":"image/tiff","pdf":"application/pdf"}.get(ext, "image/jpeg")
-
+        media_type = {"jpg":"image/jpeg","jpeg":"image/jpeg","png":"image/png",
+                      "bmp":"image/bmp","tiff":"image/tiff"}.get(ext, "image/jpeg")
         ocr_hint     = json.dumps(cv_data.get("ocr_dims", {}))
         circles_hint = json.dumps(cv_data.get("circles", [])[:10])
-
         prompt = f"""You are an expert mechanical / sheet-metal CAD engineer.
 Analyse this engineering sketch. Extract ALL dimensions and feature positions.
-OpenCV pre-analysis context:
-  Image size: {cv_data.get('img_w',0)}×{cv_data.get('img_h',0)}px
-  Detected circles (pixel coords): {circles_hint}
-  OCR dimensions: {ocr_hint}
-  Estimated size: {cv_data.get('width_mm',0):.0f}×{cv_data.get('height_mm',0):.0f}mm
-
-Return ONLY valid JSON — no markdown, no explanation:
+Return ONLY valid JSON — no markdown:
 {{
   "profileType": "sheet metal",
   "widthMM": <number>, "heightMM": <number>, "thicknessMM": <number or null>,
@@ -974,17 +887,18 @@ Return ONLY valid JSON — no markdown, no explanation:
     "margin_left_mm":<n>,"margin_top_mm":<n>
   }}
 }}
-Return ONLY the JSON object."""
-
-        # Build inline image part using google-genai types
-        image_part = genai_types.Part.from_bytes(data=img_bytes, mime_type=mime_type)
-        text_part  = genai_types.Part.from_text(text=prompt)
-
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=[genai_types.Content(parts=[image_part, text_part], role="user")],
+OpenCV context: Image {cv_data.get('img_w',0)}×{cv_data.get('img_h',0)}px,
+circles={circles_hint}, ocr_dims={ocr_hint},
+estimated size: {cv_data.get('width_mm',0):.0f}×{cv_data.get('height_mm',0):.0f}mm
+Return ONLY the JSON."""
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514", max_tokens=2000,
+            messages=[{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_b64}},
+                {"type": "text",  "text": prompt},
+            ]}]
         )
-        text = response.text or ""
+        text = "".join(b.text for b in response.content if hasattr(b, "text"))
         text = re.sub(r"```[a-z]*", "", text).strip().strip("`")
         m = re.search(r"\{.*\}", text, re.DOTALL)
         if m: text = m.group(0)
@@ -992,30 +906,21 @@ Return ONLY the JSON object."""
     except Exception as e:
         return {"error": str(e)}
 
-# Keep old name as alias for callers that used it
-claude_vision_analysis = gemini_vision_analysis
-
 
 # ─── AI-Powered DXF Interaction / Correction ─────────────────────────────────
 def ai_dxf_interaction(instruction, current_analysis, image_path=None):
     """
     Allow users to interact with the AI to modify/correct the DXF.
-    Uses Google Gemini to parse natural language instructions into analysis corrections.
+    Parses natural language instructions into analysis corrections.
     """
     if not HAS_AI: return current_analysis, "AI not available"
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key: return current_analysis, "No GEMINI_API_KEY set"
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key: return current_analysis, "No API key"
 
     try:
-        from google import genai
-        from google.genai import types as genai_types
-
-        client = genai.Client(api_key=api_key)
-
-        clean_analysis = {k: v for k, v in current_analysis.items() if not k.startswith("_")}
-        text_prompt = f"""You are a CAD engineer modifying a DXF design.
-Current analysis (JSON):
-{json.dumps(clean_analysis, indent=2)}
+        client = anthropic_mod.Anthropic(api_key=api_key)
+        content = [{"type": "text", "text": f"""You are a CAD engineer modifying a DXF design.
+Current analysis (JSON): {json.dumps({k:v for k,v in current_analysis.items() if not k.startswith('_')}, indent=2)}
 
 User instruction: "{instruction}"
 
@@ -1032,29 +937,26 @@ Return ONLY a JSON object with ONLY the fields that need to change:
   "_ai_circles": [<new_circles_or_omit>],
   "explanation": "<brief explanation of changes>"
 }}
-Apply ONLY changes relevant to the instruction. Return ONLY JSON."""
+Apply ONLY changes relevant to the instruction. Return ONLY JSON."""}]
 
-        parts = [genai_types.Part.from_text(text=text_prompt)]
-
-        # Attach image if available
         if image_path and os.path.exists(str(image_path)):
             ext = Path(image_path).suffix.lower().lstrip(".")
-            mime_type = {"jpg":"image/jpeg","jpeg":"image/jpeg","png":"image/png"}.get(ext, "image/jpeg")
+            media_type = {"jpg":"image/jpeg","jpeg":"image/jpeg","png":"image/png"}.get(ext, "image/jpeg")
             with open(image_path, "rb") as f:
-                img_bytes = f.read()
-            parts.insert(0, genai_types.Part.from_bytes(data=img_bytes, mime_type=mime_type))
+                img_b64 = base64.standard_b64encode(f.read()).decode()
+            content.insert(0, {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_b64}})
 
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=[genai_types.Content(parts=parts, role="user")],
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514", max_tokens=1500,
+            messages=[{"role": "user", "content": content}]
         )
-        text = response.text or ""
+        text = "".join(b.text for b in response.content if hasattr(b, "text"))
         text = re.sub(r"```[a-z]*", "", text).strip().strip("`")
         m    = re.search(r"\{.*\}", text, re.DOTALL)
         if m: text = m.group(0)
-        changes     = json.loads(text)
+        changes = json.loads(text)
         explanation = changes.pop("explanation", "Changes applied")
-        updated     = {**current_analysis, **{k: v for k, v in changes.items() if v is not None}}
+        updated = {**current_analysis, **{k: v for k, v in changes.items() if v is not None}}
         return updated, explanation
     except Exception as e:
         return current_analysis, f"Error: {str(e)}"
@@ -1230,7 +1132,7 @@ def build_dxf_ezdxf(analysis, dpi, image_path):
         (tb_x,tb_y+26,f"MATERIAL: {analysis.get('material','—')}",           3.5),
         (tb_x,tb_y+18,f"TOLERANCE: {analysis.get('tolerance','±0.1mm')}",    3.5),
         (tb_x,tb_y+10,f"CONFIDENCE: {analysis.get('confidence',0)}%",        3.0),
-        (tb_x,tb_y+ 2,"SheetForge v4.0 — Gemini+OpenCV DXF",                     2.5),
+        (tb_x,tb_y+ 2,"SheetForge v4.0 — AI+OpenCV DXF",                     2.5),
     ]:
         msp.add_text(text, dxfattribs={"layer":"TITLE_BLOCK","height":h_t,"insert":(tx,ty)})
         entity_count += 1
@@ -1602,36 +1504,16 @@ def main():
     outline_bin, annot_bin, gray_raw = separate_channels(img) if img is not None else (None, None, None)
     steps.append(step_record("PRE-2: Channel Separation (Red/Blue)", "Annotation vs geometry isolation", t0))
 
-    # PRE-2b: HSV Ink Masking
-    # Pipeline: BGR→HSV → cv2.inRange() background rejection
-    #           → dark-ink ∪ saturated-ink → morphological cleanup
-    #           → masked image fed to all downstream stages
-    t0 = now_ms()
-    img_hsv_masked, ink_mask, hsv_image = (None, None, None)
-    if img is not None and HAS_CV:
-        img_hsv_masked, ink_mask, hsv_image = hsv_ink_mask(img)
-    ink_px = int(np.count_nonzero(ink_mask)) if (ink_mask is not None and HAS_CV) else 0
-    # Use HSV-masked image as primary source; fall back if mask is empty
-    if img_hsv_masked is not None and ink_px > 500:
-        img_for_pipeline = img_hsv_masked
-        gray_raw = cv2.cvtColor(img_hsv_masked, cv2.COLOR_BGR2GRAY)
-    else:
-        img_for_pipeline = img
-    steps.append(step_record(
-        "PRE-2b: HSV Ink Masking (cv2.cvtColor + cv2.inRange)",
-        f"{ink_px} ink pixels isolated — background paper removed", t0))
-
     # PRE-3: Gaussian Blur (cv2.GaussianBlur)
     t0 = now_ms()
     blurred_color, blurred_gray, blurred_strong = None, None, None
-    if img_for_pipeline is not None and gray_raw is not None:
-        blurred_color, blurred_gray, blurred_strong = preprocess_gaussian_blur(
-            img_for_pipeline, gray_raw)
+    if img is not None and gray_raw is not None:
+        blurred_color, blurred_gray, blurred_strong = preprocess_gaussian_blur(img, gray_raw)
     steps.append(step_record("PRE-3: Gaussian Blur (cv2.GaussianBlur)", "5×5 + 9×9 kernels applied", t0))
 
     # PRE-4: Denoising
     t0 = now_ms()
-    img_denoised = preprocess_denoise(img_for_pipeline) if img_for_pipeline is not None else img_for_pipeline
+    img_denoised = preprocess_denoise(img) if img is not None else img
     steps.append(step_record("PRE-4: Denoising (Bilateral + NLM)", "fastNlMeansDenoising applied", t0))
 
     # PRE-5: Thresholding
@@ -1700,7 +1582,7 @@ def main():
     # CV-5: Line/Circle Fitting (cv2.HoughLines + cv2.HoughCircles + cv2.fitEllipse)
     t0 = now_ms()
     all_lines, circles, ellipses = cv_line_circle_fitting(edges, gray_ds, simplified_contours)
-    steps.append(step_record("CV-5: Feature Extraction — HoughLines (dimension lines) + findContours (enclosed symbols) + HoughCircles + fitEllipse", f"{len(all_lines)} lines, {len(circles)} circles, {len(ellipses)} ellipses", t0))
+    steps.append(step_record("CV-5: Line+Circle Fitting (HoughLines+HoughCircles+fitEllipse)", f"{len(all_lines)} lines, {len(circles)} circles, {len(ellipses)} ellipses", t0))
 
     # CV-6: Skeletonization (cv2.ximgproc.thinning)
     t0 = now_ms()
@@ -1785,7 +1667,7 @@ def main():
     ai_data = {}
     if image_path and os.path.exists(image_path):
         ai_data = claude_vision_analysis(image_path, cv_ctx)
-    steps.append(step_record("AI-4: Gemini Vision Deep Analysis", f"conf={ai_data.get('confidence',0):.2f} profile={ai_data.get('profileType','?')}", t0))
+    steps.append(step_record("AI-4: Claude Vision Deep Analysis", f"conf={ai_data.get('confidence',0):.2f} profile={ai_data.get('profileType','?')}", t0))
 
     # Merge
     t0 = now_ms()
