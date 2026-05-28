@@ -44,22 +44,37 @@ app.use((req, res, next) => {
 // ================================================================
 
 // ── CORS ─────────────────────────────────────────────────────────
-// ONE unified config.  The original code called cors() TWICE which
-// caused the second call to silently overwrite the first, blocking
-// every cross-origin request when CLIENT_URL was not set.
-// 1. Build your dynamic list of allowed origins
+// ONE unified config. Explicitly allowlist the permitted origins so
+// the Access-Control-Allow-Origin header is never a bare wildcard,
+// which is required when requests carry credentials (cookies / JWT).
+const ALLOWED_ORIGINS = [
+  'https://sheetfg.hkw875.workers.dev',
+  // Add further trusted origins here, e.g. process.env.CLIENT_URL
+  ...(process.env.CLIENT_URL ? [process.env.CLIENT_URL] : []),
+];
 
-app.use(cors({ origin: '*' }));
+const corsOptions = {
+  origin: (origin, callback) => {
+    // Allow server-to-server requests (no Origin header) and listed origins
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error(`CORS: origin '${origin}' is not allowed`));
+    }
+  },
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,       // allow cookies / Authorization header
+  optionsSuccessStatus: 204,
+};
 
+app.use(cors(corsOptions));
 
 // Respond to ALL preflight OPTIONS requests immediately so browsers
 // never get a missing Access-Control-Allow-Origin header on preflight.
 
 
-app.use(helmet({
-  contentSecurityPolicy: false,
-  crossOriginResourcePolicy: { policy: "cross-origin" } // or false to disable entirely
-}));
+app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 app.use(morgan('dev'));
