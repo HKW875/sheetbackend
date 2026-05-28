@@ -43,36 +43,31 @@ app.use((req, res, next) => {
 // MIDDLEWARE
 // ================================================================
 
-// ── CORS ─────────────────────────────────────────────────────────────────────
-// Single, authoritative CORS config (having two cors() calls is the bug —
-// the second one silently overwrites the first).
-// Always allows the hardcoded Cloudflare Workers frontend PLUS anything
-// listed in CLIENT_URL (comma-separated).  Handles preflight OPTIONS as well.
-const HARDCODED_ORIGINS = [
-  'https://sheetfg.hkw875.workers.dev',
-];
+// ── CORS ─────────────────────────────────────────────────────────
+// ONE unified config.  The original code called cors() TWICE which
+// caused the second call to silently overwrite the first, blocking
+// every cross-origin request when CLIENT_URL was not set.
 const allowedOrigins = [
-  ...HARDCODED_ORIGINS,
-  ...(process.env.CLIENT_URL || '').split(',').map(o => o.trim()).filter(Boolean),
+  'https://sheetfg.hkw875.workers.dev',        // hardcoded CF Workers frontend
+  ...(process.env.CLIENT_URL || '')              // any extra origins from env
+      .split(',').map(o => o.trim()).filter(Boolean),
 ];
 
 const corsOptions = {
-  origin: function (origin, callback) {
-    // Allow server-to-server requests (no Origin header) and all allowed origins.
-    if (!origin || allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
-    console.warn(`[CORS] Blocked origin: ${origin}`);
-    callback(new Error(`CORS: Origin ${origin} not allowed`));
+  origin(origin, cb) {
+    // Allow same-origin / server-to-server (no Origin header) + whitelist
+    if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
+    console.warn('[CORS] Blocked:', origin);
+    cb(new Error('CORS: origin not allowed'));
   },
   credentials: true,
-  methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  methods: ['GET','HEAD','PUT','PATCH','POST','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization','X-Requested-With'],
 };
 
 app.use(cors(corsOptions));
-// Explicitly handle pre-flight OPTIONS for every route so browsers never
-// receive a missing Access-Control-Allow-Origin header on preflight.
+// Respond to ALL preflight OPTIONS requests immediately so browsers
+// never get a missing Access-Control-Allow-Origin header on preflight.
 app.options('*', cors(corsOptions));
 
 app.use(helmet({ contentSecurityPolicy: false }));
