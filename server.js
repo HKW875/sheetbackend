@@ -49,40 +49,12 @@ app.use((req, res, next) => {
 // every cross-origin request when CLIENT_URL was not set.
 // 1. Build your dynamic list of allowed origins
 
-const allowedOrigins = [
-  'https://sheetfg.hkw875.workers.dev',
-  ...(process.env.CLIENT_URL || '')
-      .split(',').map(o => o.trim()).filter(Boolean),
-];
+app.use(cors({ origin: '*' }));
 
-// 2. Pass that array into the CORS middleware
-app.use(cors({
-  origin: function (origin, callback) {
-    // If the request has no origin (like mobile apps or curl requests), or if it's in our allowed list
-    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
-      callback(null, true);
-    } else {
-      callback(new Error('Not allowed by CORS'));
-    }
-  }
-}));
 
-const corsOptions = {
-  origin(origin, cb) {
-    // Allow same-origin / server-to-server (no Origin header) + whitelist
-    if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
-    console.warn('[CORS] Blocked:', origin);
-    cb(new Error('CORS: origin not allowed'));
-  },
-  credentials: true,
-  methods: ['GET','HEAD','PUT','PATCH','POST','DELETE','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization','X-Requested-With'],
-};
-
-app.use(cors(corsOptions));
 // Respond to ALL preflight OPTIONS requests immediately so browsers
 // never get a missing Access-Control-Allow-Origin header on preflight.
-app.options('*', cors(corsOptions));
+
 
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json({ limit: '50mb' }));
