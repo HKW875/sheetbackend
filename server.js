@@ -56,7 +56,10 @@ app.use(cors({ origin: '*' }));
 // never get a missing Access-Control-Allow-Origin header on preflight.
 
 
-app.use(helmet({ contentSecurityPolicy: false }));
+app.use(helmet({
+  contentSecurityPolicy: false,
+  crossOriginResourcePolicy: { policy: "false" } // or false to disable entirely
+}));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 app.use(morgan('dev'));
