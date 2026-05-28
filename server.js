@@ -58,7 +58,7 @@ app.use(cors({ origin: '*' }));
 
 app.use(helmet({
   contentSecurityPolicy: false,
-  crossOriginResourcePolicy: { policy: "false" } // or false to disable entirely
+  crossOriginResourcePolicy: { policy: "cross-origin" } // or false to disable entirely
 }));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
