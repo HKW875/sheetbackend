@@ -12,7 +12,9 @@
     "server.js",
     "process.py",
     "requirements.txt",
-    "runtime.txt"
+    "runtime.txt",
+    "uploads/",
+    ".env.example"
   ],
 
   "dependencies": {
