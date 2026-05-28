@@ -80,23 +80,75 @@ def step_record(name, details, t0):
 
 # ─── PRE-1 — Image ingestion ──────────────────────────────────────────────────
 def load_image(image_path):
-    if not HAS_CV: return None, 96.0
-    img = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
-    if img is None: return None, 96.0
+    """
+    Load an image robustly.
+
+    Uses np.fromfile + imdecode so that paths with non-ASCII characters,
+    spaces, or unicode work on every OS (cv2.imread silently returns None
+    for such paths on Windows and some Linux setups).
+
+    Raises ValueError with a clear message if the image cannot be loaded
+    so that the pipeline fails fast rather than producing a 0×0 result.
+    """
+    if not HAS_CV:
+        raise RuntimeError("OpenCV (cv2) is not installed. Run: pip install opencv-python")
+
+    image_path = str(image_path).strip()
+
+    # ── Path existence check ──────────────────────────────────────────────────
+    if not image_path:
+        raise ValueError("image_path is empty. Make sure the Node server passes the "
+                         "absolute path to the uploaded file.")
+    if not os.path.isfile(image_path):
+        raise FileNotFoundError(
+            f"Image file not found on disk: '{image_path}'\n"
+            "Check that Multer saved the file and that server.js passes "
+            "path.resolve(design.originalFile.path) to process.py."
+        )
+
+    # ── Decode via imdecode (handles all path encodings) ─────────────────────
+    try:
+        buf = np.fromfile(image_path, dtype=np.uint8)
+    except Exception as e:
+        raise IOError(f"Cannot read file bytes from '{image_path}': {e}")
+
+    img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+
+    if img is None:
+        # Try loading with PIL and converting as a last resort
+        if HAS_PIL:
+            try:
+                pil_img = Image.open(image_path).convert("RGB")
+                img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+            except Exception:
+                pass
+
+    if img is None:
+        ext = os.path.splitext(image_path)[1].lower()
+        raise ValueError(
+            f"cv2.imdecode returned None for '{image_path}' (extension: '{ext}').\n"
+            f"Supported formats: JPEG, PNG, BMP, TIFF, WebP.\n"
+            f"File size on disk: {os.path.getsize(image_path)} bytes.\n"
+            "The file may be corrupt, password-protected, or an unsupported format."
+        )
+
+    if img.size == 0 or img.shape[0] == 0 or img.shape[1] == 0:
+        raise ValueError(f"Image decoded but has zero pixels. Shape: {img.shape}")
+
+    # ── DPI from EXIF / PIL ───────────────────────────────────────────────────
     dpi = 96.0
-    if img.size == 0:
-        raise ValueError(f"Image loaded but has 0 pixels. Shape: {img.shape}")
-
-    if img.shape[0] == 0 or img.shape[1] == 0:
-        raise ValueError(f"Image has zero width or height: {img.shape}")
-
-    print(f"✓ Image loaded: {img.shape[1]}×{img.shape[0]}px, {img.shape[2]} channels")
     if HAS_PIL:
         try:
-            pil  = Image.open(str(image_path))
-            xdpi = pil.info.get("dpi", (96, 96))
-            dpi  = float(xdpi[0]) if xdpi[0] > 1 else 96.0
-        except Exception: pass
+            pil_img = Image.open(image_path)
+            xdpi    = pil_img.info.get("dpi", (96, 96))
+            if xdpi and xdpi[0] > 1:
+                dpi = float(xdpi[0])
+        except Exception:
+            pass
+
+    print(f"✓ Image loaded: {img.shape[1]}×{img.shape[0]}px @ {dpi:.0f}dpi, "
+          f"{img.shape[2]} channels, file={os.path.getsize(image_path)//1024}KB",
+          file=sys.stderr)
     return img, dpi
 
 
@@ -1529,9 +1581,13 @@ def main():
 
     # PRE-1: Load
     t0 = now_ms()
+    # load_image raises descriptive errors on failure — let them propagate to
+    # the outer try/except so the frontend receives a meaningful error message
+    # instead of a silent 0×0px result.
     img, detected_dpi = load_image(image_path)
-    if detected_dpi > 1: dpi = detected_dpi
-    img_h, img_w = (img.shape[:2] if img is not None and HAS_CV else (0, 0))
+    if detected_dpi > 1:
+        dpi = detected_dpi
+    img_h, img_w = img.shape[:2]
     steps.append(step_record("PRE-1: Image Ingestion", f"{img_w}×{img_h}px @ {dpi:.0f}dpi", t0))
 
     # PRE-2: Channel separation
