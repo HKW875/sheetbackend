@@ -53,6 +53,10 @@ const allowedOrigins = [
       .split(',').map(o => o.trim()).filter(Boolean),
 ];
 
+app.use(cors({
+  origin: 'https://sheetfg.hkw875.workers.dev'
+}));
+
 const corsOptions = {
   origin(origin, cb) {
     // Allow same-origin / server-to-server (no Origin header) + whitelist
