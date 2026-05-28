@@ -47,8 +47,6 @@ app.use((req, res, next) => {
 // the Access-Control-Allow-Origin header is never a bare wildcard,
 // which is required when requests carry credentials (cookies / JWT).
 
-app.use(cors({ origin: 'https://sheetfg.hkw875.workers.dev' })); 
-
 const ALLOWED_ORIGINS = [
   'https://sheetfg.hkw875.workers.dev',
   // Add further trusted origins here, e.g. process.env.CLIENT_URL
@@ -119,8 +117,8 @@ cloudinary.config({
 // ================================================================
 // MULTER — File uploads to /uploads/tmp
 // ================================================================
-const uploadDir = path.join(__dirname, 'uploads', 'tmp');
-const outputDir = path.join(__dirname, 'uploads', 'output');
+const uploadDir = '/opt/render/project/src/uploads/tmp';
+const outputDir = '/opt/render/project/src/uploads/output';
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
 if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
 
@@ -534,11 +532,17 @@ app.get('/api/convert/:id/progress', async (req, res) => {
   const designId = req.params.id;
 
   // Establish SSE Header configs
-  res.writeHead(200, {
+  const sseOrigin = req.headers.origin;
+  const sseHeaders = {
     'Content-Type':  'text/event-stream',
     'Cache-Control': 'no-cache',
     'Connection':    'keep-alive',
-  });
+  };
+  if (sseOrigin && ALLOWED_ORIGINS.includes(sseOrigin)) {
+    sseHeaders['Access-Control-Allow-Origin']      = sseOrigin;
+    sseHeaders['Access-Control-Allow-Credentials'] = 'true';
+  }
+  res.writeHead(200, sseHeaders);
   res.write('\n');
 
   // Register this response handle into your global progress registry
