@@ -47,6 +47,9 @@ app.use((req, res, next) => {
 // ONE unified config. Explicitly allowlist the permitted origins so
 // the Access-Control-Allow-Origin header is never a bare wildcard,
 // which is required when requests carry credentials (cookies / JWT).
+
+app.use(cors({ origin: 'https://sheetfg.hkw875.workers.dev' })); 
+
 const ALLOWED_ORIGINS = [
   'https://sheetfg.hkw875.workers.dev',
   // Add further trusted origins here, e.g. process.env.CLIENT_URL
@@ -74,7 +77,7 @@ app.use(cors(corsOptions));
 // never get a missing Access-Control-Allow-Origin header on preflight.
 
 
-app.use(helmet({ contentSecurityPolicy: false }));
+
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 app.use(morgan('dev'));
