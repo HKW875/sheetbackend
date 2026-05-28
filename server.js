@@ -47,14 +47,24 @@ app.use((req, res, next) => {
 // ONE unified config.  The original code called cors() TWICE which
 // caused the second call to silently overwrite the first, blocking
 // every cross-origin request when CLIENT_URL was not set.
+// 1. Build your dynamic list of allowed origins
+
 const allowedOrigins = [
-  'https://sheetfg.hkw875.workers.dev',        // hardcoded CF Workers frontend
-  ...(process.env.CLIENT_URL || '')              // any extra origins from env
+  'https://sheetfg.hkw875.workers.dev',
+  ...(process.env.CLIENT_URL || '')
       .split(',').map(o => o.trim()).filter(Boolean),
 ];
 
+// 2. Pass that array into the CORS middleware
 app.use(cors({
-  origin: 'https://sheetfg.hkw875.workers.dev'
+  origin: function (origin, callback) {
+    // If the request has no origin (like mobile apps or curl requests), or if it's in our allowed list
+    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  }
 }));
 
 const corsOptions = {
