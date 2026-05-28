@@ -29,7 +29,15 @@ def _try(fn):
     try: return fn()
     except Exception: return None
 
-cv2           = _try(lambda: __import__("cv2"))
+# Capture the real cv2 import error so load_image() can report it clearly.
+_cv2_import_error = None
+try:
+    import cv2 as _cv2_mod
+    cv2 = _cv2_mod
+except Exception as _e:
+    cv2 = None
+    _cv2_import_error = str(_e)
+
 np            = _try(lambda: __import__("numpy"))
 ezdxf         = _try(lambda: __import__("ezdxf"))
 pytesseract   = _try(lambda: __import__("pytesseract"))
@@ -81,32 +89,35 @@ def step_record(name, details, t0):
 # ─── PRE-1 — Image ingestion ──────────────────────────────────────────────────
 def load_image(image_path):
     """
-    Load an image robustly.
+    Load an image robustly and fail fast with a clear error.
 
-    Uses np.fromfile + imdecode so that paths with non-ASCII characters,
-    spaces, or unicode work on every OS (cv2.imread silently returns None
-    for such paths on Windows and some Linux setups).
-
-    Raises ValueError with a clear message if the image cannot be loaded
-    so that the pipeline fails fast rather than producing a 0×0 result.
+    Uses np.fromfile + cv2.imdecode so paths with spaces, unicode, or
+    special characters work on every OS (cv2.imread silently returns None
+    for such paths on some systems).
     """
     if not HAS_CV:
-        raise RuntimeError("OpenCV (cv2) is not installed. Run: pip install opencv-python")
+        reason = _cv2_import_error or "unknown import error"
+        raise RuntimeError(
+            f"OpenCV failed to import: {reason}\n"
+            "Fix: ensure ONLY 'opencv-contrib-python-headless' is in requirements.txt. "
+            "Remove opencv-python and opencv-python-headless — all three ship the same "
+            "cv2.so and overwrite each other when installed together."
+        )
 
     image_path = str(image_path).strip()
-
-    # ── Path existence check ──────────────────────────────────────────────────
     if not image_path:
-        raise ValueError("image_path is empty. Make sure the Node server passes the "
-                         "absolute path to the uploaded file.")
+        raise ValueError(
+            "image_path is empty. Make sure server.js passes the absolute "
+            "path to the uploaded file (use path.resolve())."
+        )
     if not os.path.isfile(image_path):
         raise FileNotFoundError(
-            f"Image file not found on disk: '{image_path}'\n"
+            f"Image not found on disk: '{image_path}'\n"
             "Check that Multer saved the file and that server.js passes "
             "path.resolve(design.originalFile.path) to process.py."
         )
 
-    # ── Decode via imdecode (handles all path encodings) ─────────────────────
+    # np.fromfile + imdecode handles all path encodings correctly
     try:
         buf = np.fromfile(image_path, dtype=np.uint8)
     except Exception as e:
@@ -114,28 +125,27 @@ def load_image(image_path):
 
     img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
 
-    if img is None:
-        # Try loading with PIL and converting as a last resort
-        if HAS_PIL:
-            try:
-                pil_img = Image.open(image_path).convert("RGB")
-                img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-            except Exception:
-                pass
+    # PIL fallback for unusual formats (WebP, TIFF variants, etc.)
+    if img is None and HAS_PIL:
+        try:
+            pil_img = Image.open(image_path).convert("RGB")
+            img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+        except Exception:
+            pass
 
     if img is None:
-        ext = os.path.splitext(image_path)[1].lower()
+        ext  = os.path.splitext(image_path)[1].lower()
+        size = os.path.getsize(image_path)
         raise ValueError(
-            f"cv2.imdecode returned None for '{image_path}' (extension: '{ext}').\n"
-            f"Supported formats: JPEG, PNG, BMP, TIFF, WebP.\n"
-            f"File size on disk: {os.path.getsize(image_path)} bytes.\n"
-            "The file may be corrupt, password-protected, or an unsupported format."
+            f"cv2.imdecode returned None for '{image_path}' "
+            f"(ext='{ext}', size={size} bytes).\n"
+            "The file may be corrupt, in an unsupported format, or a 0-byte upload."
         )
 
     if img.size == 0 or img.shape[0] == 0 or img.shape[1] == 0:
-        raise ValueError(f"Image decoded but has zero pixels. Shape: {img.shape}")
+        raise ValueError(f"Image decoded but has zero pixels: shape={img.shape}")
 
-    # ── DPI from EXIF / PIL ───────────────────────────────────────────────────
+    # Read DPI from EXIF via PIL
     dpi = 96.0
     if HAS_PIL:
         try:
@@ -146,9 +156,11 @@ def load_image(image_path):
         except Exception:
             pass
 
-    print(f"✓ Image loaded: {img.shape[1]}×{img.shape[0]}px @ {dpi:.0f}dpi, "
-          f"{img.shape[2]} channels, file={os.path.getsize(image_path)//1024}KB",
-          file=sys.stderr)
+    print(
+        f"✓ Image loaded: {img.shape[1]}×{img.shape[0]}px @ {dpi:.0f}dpi, "
+        f"{img.shape[2]} ch, {os.path.getsize(image_path)//1024}KB",
+        file=sys.stderr
+    )
     return img, dpi
 
 
@@ -1580,10 +1592,9 @@ def main():
     # ═══ PHASE 1: PREPROCESSING ═══
 
     # PRE-1: Load
+    # load_image() raises descriptive errors on failure — let them propagate to
+    # the outer except so the frontend receives a clear message instead of 0×0px.
     t0 = now_ms()
-    # load_image raises descriptive errors on failure — let them propagate to
-    # the outer try/except so the frontend receives a meaningful error message
-    # instead of a silent 0×0px result.
     img, detected_dpi = load_image(image_path)
     if detected_dpi > 1:
         dpi = detected_dpi
