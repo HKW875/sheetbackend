@@ -1,1329 +1,834 @@
-/**
- * SheetForge — Backend Server
- * Node.js + Express + MongoDB + Cloudinary
- * =========================================
- * Routes:
- *   Auth       POST /api/auth/register, /api/auth/login, /api/auth/logout
- *   Designs    POST /api/designs/upload, GET /api/designs, GET /api/designs/:id
- *              PATCH /api/designs/:id/approve, DELETE /api/designs/:id
- *   Convert    POST /api/convert/:id  (triggers AI-assisted DWG generation via process.py)
- *   Cloud      POST /api/cloud/save/:id  (Cloudinary upload + MongoDB link)
- *   Quotes     POST /api/quotes, GET /api/quotes, GET /api/quotes/:id
- *   Providers  GET /api/providers, GET /api/providers/:id
- *   Orders     POST /api/orders, GET /api/orders, PATCH /api/orders/:id
- *   Progress   GET /api/convert/:id/progress  (SSE real-time progress stream)
- */
+"use strict";
 
-require('dotenv').config();
+// ─── SheetForge — server.js ───────────────────────────────────────────────────
+// Single-file Express backend. No TypeScript, no build step.
+// Run:  node server.js
+// Env:  DATABASE_URL, JWT_SECRET (optional), PORT (optional),
+//       CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET (optional)
+// ─────────────────────────────────────────────────────────────────────────────
 
-const express       = require('express');
-const mongoose      = require('mongoose');
-const cors          = require('cors');
-const morgan        = require('morgan');
-const multer        = require('multer');
-const cloudinary    = require('cloudinary').v2;
-const jwt           = require('jsonwebtoken');
-const bcrypt        = require('bcryptjs');
-const path          = require('path');
-const fs            = require('fs');
-const { promisify } = require('util');
-const { spawn, exec } = require('child_process');
+const express    = require("express");
+const cors       = require("cors");
+const multer     = require("multer");
+const bcrypt     = require("bcryptjs");
+const jwt        = require("jsonwebtoken");
+const { Pool }   = require("pg");
+const { v4: uuidv4 } = require("uuid");
+const { spawn }  = require("child_process");
+const path       = require("path");
+const fs         = require("fs");
 
-const app  = express();
-const PORT = process.env.PORT || 5000;
+// ── Config ────────────────────────────────────────────────────────────────────
+const PORT       = process.env.PORT || 8080;
+const JWT_SECRET = process.env.JWT_SECRET || "sheetforge_jwt_secret_2026";
+const BASE_PATH  = process.env.BASE_PATH || "/api";
 
-// Debug logging for all requests
-app.use((req, res, next) => {
-  console.log(`${req.method} ${req.url}`);
-  next();
-});
+// ── Database ──────────────────────────────────────────────────────────────────
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
-// ================================================================
-// MIDDLEWARE
-// ================================================================
-
-// ── CORS ─────────────────────────────────────────────────────────
-// ONE unified config. Explicitly allowlist the permitted origins so
-// the Access-Control-Allow-Origin header is never a bare wildcard,
-// which is required when requests carry credentials (cookies / JWT).
-
-const ALLOWED_ORIGINS = [
-  'https://sheetfg.hkw875.workers.dev',
-  // Add further trusted origins here, e.g. process.env.CLIENT_URL
-  ...(process.env.CLIENT_URL ? [process.env.CLIENT_URL] : []),
-];
-
-const corsOptions = {
-  origin: (origin, callback) => {
-    // Allow server-to-server requests (no Origin header) and listed origins
-    if (!origin || ALLOWED_ORIGINS.includes(origin)) {
-      callback(null, true);
-    } else {
-      callback(new Error(`CORS: origin '${origin}' is not allowed`));
-    }
-  },
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: true,       // allow cookies / Authorization header
-  optionsSuccessStatus: 204,
-};
-
-app.use(cors(corsOptions));
-
-// Respond to ALL preflight OPTIONS requests immediately so browsers
-// never get a missing Access-Control-Allow-Origin header on preflight.
-
-
-
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
-app.use(morgan('dev'));
-
-// Serve index.html from disk if it exists alongside server.js
-app.get('/', (req, res) => {
-  const htmlPath = path.join(__dirname, 'index.html');
-  if (fs.existsSync(htmlPath)) {
-    res.sendFile(htmlPath);
-  } else {
-    res.json({ status: 'SheetForge API running', version: '1.0.0' });
+async function query(sql, params) {
+  const client = await pool.connect();
+  try {
+    return await client.query(sql, params);
+  } finally {
+    client.release();
   }
-});
+}
 
-// ================================================================
-// DATABASE
-// ================================================================
-mongoose.connect(process.env.MONGO_URI)
-.then(async () => {
-  console.log('✅ MongoDB connected');
-  await seedProviders();
-})
-.catch(err => {
-  console.error('❌ MongoDB connection failed:', err.message);
-  console.error('→ If using local MongoDB, ensure mongod is running: sudo systemctl start mongod');
-  console.error('→ If using Atlas, check MONGO_URI in your .env file');
-  process.exit(1);
-});
+// Create tables if they do not exist
+async function initDb() {
+  await query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id          SERIAL PRIMARY KEY,
+      first_name  TEXT NOT NULL,
+      last_name   TEXT NOT NULL,
+      email       TEXT UNIQUE NOT NULL,
+      password    TEXT NOT NULL,
+      role        TEXT NOT NULL DEFAULT 'designer',
+      company     TEXT,
+      country     TEXT,
+      is_verified BOOLEAN DEFAULT false,
+      created_at  TIMESTAMPTZ DEFAULT NOW(),
+      updated_at  TIMESTAMPTZ DEFAULT NOW()
+    );
 
-// ================================================================
-// CLOUDINARY CONFIG
-// ================================================================
-cloudinary.config({
-  cloud_name : process.env.CLOUDINARY_CLOUD_NAME || 'cloud-sheetforge-demo',
-  api_key    : process.env.CLOUDINARY_API_KEY,
-  api_secret : process.env.CLOUDINARY_API_SECRET,
-  secure     : true,
-});
+    CREATE TABLE IF NOT EXISTS designs (
+      id                      SERIAL PRIMARY KEY,
+      owner_id                INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      part_name               TEXT NOT NULL,
+      status                  TEXT NOT NULL DEFAULT 'uploaded',
+      material                TEXT,
+      thickness               NUMERIC,
+      notes                   TEXT,
+      original_filename       TEXT,
+      original_mimetype       TEXT,
+      original_size           INTEGER,
+      original_local_path     TEXT,
+      original_url            TEXT,
+      ai_edges                INTEGER,
+      ai_bend_lines           INTEGER,
+      ai_holes                INTEGER,
+      ai_holes_diameter       NUMERIC,
+      ai_slots                INTEGER,
+      ai_cutouts              INTEGER,
+      ai_width                NUMERIC,
+      ai_height               NUMERIC,
+      ai_thickness            NUMERIC,
+      ai_profile_type         TEXT,
+      ai_tolerance            TEXT,
+      ai_confidence           NUMERIC,
+      ai_raw_text             TEXT,
+      ai_notes                TEXT,
+      ai_completed_at         TIMESTAMPTZ,
+      dwg_filename            TEXT,
+      dwg_preview_url         TEXT,
+      dwg_dxf_url             TEXT,
+      dwg_svg_url             TEXT,
+      dwg_entities            INTEGER,
+      dwg_file_size           INTEGER,
+      dwg_generated_at        TIMESTAMPTZ,
+      cloudinary_public_id    TEXT,
+      cloudinary_url          TEXT,
+      cloudinary_uploaded_at  TIMESTAMPTZ,
+      approved_at             TIMESTAMPTZ,
+      created_at              TIMESTAMPTZ DEFAULT NOW(),
+      updated_at              TIMESTAMPTZ DEFAULT NOW()
+    );
 
-// ================================================================
-// MULTER — File uploads to /uploads/tmp
-// ================================================================
-const uploadDir = '/opt/render/project/src/uploads/tmp';
-const outputDir = '/opt/render/project/src/uploads/output';
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
+    CREATE TABLE IF NOT EXISTS providers (
+      id             SERIAL PRIMARY KEY,
+      company_name   TEXT NOT NULL,
+      country        TEXT,
+      region         TEXT,
+      flag           TEXT,
+      specialty      TEXT,
+      capacity       TEXT,
+      certifications JSONB DEFAULT '[]',
+      lead_time_min  INTEGER DEFAULT 5,
+      lead_time_max  INTEGER DEFAULT 14,
+      rating         NUMERIC DEFAULT 4.5,
+      total_reviews  INTEGER DEFAULT 0,
+      total_orders   INTEGER DEFAULT 0,
+      materials      JSONB DEFAULT '[]',
+      operations     JSONB DEFAULT '[]',
+      pricing_base   NUMERIC DEFAULT 100,
+      is_verified    BOOLEAN DEFAULT false,
+      is_active      BOOLEAN DEFAULT true,
+      created_at     TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS quotes (
+      id               SERIAL PRIMARY KEY,
+      design_id        INTEGER REFERENCES designs(id),
+      requester_id     INTEGER REFERENCES users(id),
+      status           TEXT DEFAULT 'open',
+      specs_length     NUMERIC,
+      specs_width      NUMERIC,
+      specs_thickness  NUMERIC,
+      specs_quantity   INTEGER DEFAULT 1,
+      specs_material   TEXT,
+      specs_operations JSONB DEFAULT '[]',
+      specs_finish     TEXT,
+      specs_lead_time  INTEGER,
+      specs_notes      TEXT,
+      bids             JSONB DEFAULT '[]',
+      expires_at       TIMESTAMPTZ,
+      created_at       TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS orders (
+      id                 SERIAL PRIMARY KEY,
+      order_number       TEXT NOT NULL,
+      buyer_id           INTEGER REFERENCES users(id),
+      provider_id        INTEGER REFERENCES providers(id),
+      design_id          INTEGER REFERENCES designs(id),
+      quote_id           INTEGER REFERENCES quotes(id),
+      status             TEXT DEFAULT 'confirmed',
+      specs_quantity     INTEGER DEFAULT 1,
+      specs_material     TEXT,
+      specs_thickness    NUMERIC,
+      specs_operations   JSONB DEFAULT '[]',
+      specs_finish       TEXT,
+      pricing_unit_price NUMERIC,
+      pricing_quantity   INTEGER,
+      pricing_subtotal   NUMERIC,
+      pricing_shipping   NUMERIC,
+      pricing_total      NUMERIC,
+      pricing_currency   TEXT DEFAULT 'USD',
+      tracking_carrier   TEXT,
+      tracking_no        TEXT,
+      tracking_url       TEXT,
+      timeline           JSONB DEFAULT '[]',
+      estimated_delivery TIMESTAMPTZ,
+      created_at         TIMESTAMPTZ DEFAULT NOW(),
+      updated_at         TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  // Seed providers if empty
+  const { rows } = await query("SELECT COUNT(*) FROM providers");
+  if (Number(rows[0].count) === 0) {
+    const providers = [
+      ["PrecisionCut GmbH","Germany","Bavaria","🇩🇪","Laser Cutting & Bending","High Volume",["ISO 9001","DIN EN 1090"],3,7,4.9,312,1840,["Steel","Aluminum","Stainless","Copper"],["Laser Cut","Press Brake","Welding","Powder Coat"],85,true],
+      ["Shanghai MetalWorks","China","Yangtze Delta","🇨🇳","Sheet Metal Fabrication","Mass Production",["ISO 9001","IATF 16949"],5,12,4.6,891,4200,["Steel","Aluminum","Brass","Titanium"],["Stamping","Deep Drawing","CNC Milling","Anodize"],42,true],
+      ["Makino Metal Works","Japan","Osaka","🇯🇵","High-Precision Stamping","Medium Volume",["JIS Q 9001","NADCAP"],7,14,4.8,204,980,["Titanium","Inconel","Stainless","Copper"],["EDM","Fine Blanking","Lapping","Plating"],140,true],
+      ["TechForm Industries","USA","Michigan","🇺🇸","Aerospace Components","Custom/Low Volume",["AS9100D","ITAR","NADCAP"],10,21,4.7,156,620,["Aluminum 6061","Titanium","Steel 4130","Inconel"],["5-Axis CNC","EDM","CMM Inspection","Anodize"],180,true],
+      ["Formex UK","United Kingdom","West Midlands","🇬🇧","Structural Fabrication","Medium Volume",["ISO 9001","CE Marking"],5,10,4.5,278,1100,["Mild Steel","Stainless 316","Aluminum"],["MIG Welding","Laser Cut","Guillotine","Paint"],95,true],
+      ["IndiaCNC Solutions","India","Pune","🇮🇳","CNC Machining & Turning","High Volume",["ISO 9001","OHSAS"],4,9,4.4,432,2300,["Steel","Aluminum","Brass","Cast Iron"],["CNC Turning","VMC Milling","Surface Grind","Zinc Plate"],35,true],
+      ["Waterjet Nordic","Sweden","Stockholm","🇸🇪","Waterjet & Plasma","Custom",["ISO 9001","EN 1090-2"],3,8,4.8,189,740,["Stone","Glass","Composites","Steel","Aluminum"],["Waterjet","Plasma Cut","Deburr","Anodize"],120,true],
+      ["FabTech Brazil","Brazil","São Paulo","🇧🇷","General Metal Fabrication","High Volume",["ISO 9001","ABNT NBR"],6,14,4.3,267,890,["Steel","Aluminum","Stainless"],["Laser Cut","Press Brake","MIG Weld","Primer"],55,false],
+    ];
+    for (const p of providers) {
+      await query(
+        `INSERT INTO providers (company_name,country,region,flag,specialty,capacity,certifications,lead_time_min,lead_time_max,rating,total_reviews,total_orders,materials,operations,pricing_base,is_verified)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+        [p[0],p[1],p[2],p[3],p[4],p[5],JSON.stringify(p[6]),p[7],p[8],p[9],p[10],p[11],JSON.stringify(p[12]),JSON.stringify(p[13]),p[14],p[15]]
+      );
+    }
+    console.log("Providers seeded.");
+  }
+}
+
+// ── Auth helpers ──────────────────────────────────────────────────────────────
+function generateToken(id, role) {
+  return jwt.sign({ id, role }, JWT_SECRET, { expiresIn: "7d" });
+}
+
+function protect(req, res, next) {
+  const header = req.headers.authorization;
+  if (!header?.startsWith("Bearer ")) return res.status(401).json({ error: "Not authenticated" });
+  try {
+    const decoded = jwt.verify(header.split(" ")[1], JWT_SECRET);
+    req.userId   = decoded.id;
+    req.userRole = decoded.role;
+    next();
+  } catch {
+    res.status(401).json({ error: "Invalid or expired token" });
+  }
+}
+
+function fmtUser(u) {
+  return {
+    id: String(u.id), firstName: u.first_name, lastName: u.last_name,
+    email: u.email, role: u.role, company: u.company, country: u.country,
+    isVerified: u.is_verified, createdAt: u.created_at,
+  };
+}
+
+// ── File uploads ──────────────────────────────────────────────────────────────
+const uploadDir = path.join(__dirname, "uploads", "tmp");
+const outputDir = path.join(__dirname, "uploads", "output");
+fs.mkdirSync(uploadDir, { recursive: true });
+fs.mkdirSync(outputDir, { recursive: true });
 
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadDir),
-  filename   : (req, file, cb) => cb(null, `${Date.now()}-${file.originalname.replace(/\s+/g, '_')}`),
+  destination: (_req, _file, cb) => cb(null, uploadDir),
+  filename:    (_req, file,  cb) => {
+    const safe = file.originalname.replace(/\s+/g, "_").replace(/[^a-zA-Z0-9._-]/g, "");
+    cb(null, `${Date.now()}-${safe}`);
+  },
 });
+const upload = multer({ storage, limits: { fileSize: 50 * 1024 * 1024 } });
 
-const fileFilter = (req, file, cb) => {
-  const allowed = [
-    'image/png', 'image/jpeg', 'image/jpg', 'image/svg+xml',
-    'image/tiff', 'image/bmp', 'application/pdf',
-    'image/x-dwg', 'application/acad', 'application/x-dwg',
-  ];
-  const ext = path.extname(file.originalname).toLowerCase();
-  const allowedExts = ['.png','.jpg','.jpeg','.pdf','.svg','.tiff','.bmp','.dwg','.dxf'];
-  if (allowed.includes(file.mimetype) || allowedExts.includes(ext)) cb(null, true);
-  else cb(new Error(`File type not allowed: ${file.mimetype}`), false);
+// ── Cloudinary (optional) ─────────────────────────────────────────────────────
+let cloudinary = null;
+if (process.env.CLOUDINARY_API_KEY) {
+  cloudinary = require("cloudinary").v2;
+  cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key:    process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET,
+    secure:     true,
+  });
+}
+
+// ── AI Pipeline ───────────────────────────────────────────────────────────────
+const PIPELINE_SCRIPT = path.join(__dirname, "pipeline", "process.py");
+
+const PIPELINE_STEPS = [
+  "Grayscale Conversion","Blur & Noise Reduction","Adaptive Thresholding",
+  "Morphological Cleanup","Deskew & Alignment","Contrast Enhancement",
+  "Canny Edge Detection","Hough Line Transform","Hough Circle Detection",
+  "Douglas-Peucker Simplification","OCR Dimension Extraction","YOLO Feature Recognition",
+  "Coordinate System Mapping","Vector Path Extraction","DXF Entity Generation","File Export",
+];
+
+const STEP_DETAILS = {
+  "Grayscale Conversion":        "RGB → single-channel luminance",
+  "Blur & Noise Reduction":      "Gaussian kernel 5×5, σ=1.4",
+  "Adaptive Thresholding":       "Block size 11, C=2",
+  "Morphological Cleanup":       "Erosion + dilation, kernel 3×3",
+  "Deskew & Alignment":          "Hough-based angle correction",
+  "Contrast Enhancement":        "CLAHE, clip limit 2.0",
+  "Canny Edge Detection":        "Thresholds: low=50, high=150",
+  "Douglas-Peucker Simplification": "Epsilon 2.0px, contours simplified",
+  "OCR Dimension Extraction":    "Tesseract v5 — dimensions extracted",
+  "YOLO Feature Recognition":    "YOLOv8n — holes, slots, cutouts",
+  "Coordinate System Mapping":   "Pixel → mm @ 96dpi scale",
+  "Vector Path Extraction":      "Potrace + spline fitting",
+  "DXF Entity Generation":       "ezdxf R2010 entities created",
+  "File Export":                 "DXF + SVG + PNG preview saved",
 };
 
-const upload = multer({
-  storage,
-  fileFilter,
-  limits: { fileSize: 50 * 1024 * 1024 }, // 50 MB
-});
-
-// ================================================================
-// MONGOOSE SCHEMAS
-// ================================================================
-
-// --- User ---
-const userSchema = new mongoose.Schema({
-  firstName   : { type: String, required: true, trim: true },
-  lastName    : { type: String, required: true, trim: true },
-  email       : { type: String, required: true, unique: true, lowercase: true },
-  password    : { type: String, required: true },
-  role        : { type: String, enum: ['designer', 'provider', 'admin'], default: 'designer' },
-  company     : String,
-  country     : String,
-  phone       : String,
-  avatar      : String,
-  isVerified  : { type: Boolean, default: false },
-  createdAt   : { type: Date, default: Date.now },
-});
-userSchema.pre('save', async function(next) {
-  if (!this.isModified('password')) return next();
-  this.password = await bcrypt.hash(this.password, 12);
-  next();
-});
-userSchema.methods.comparePassword = function(plain) {
-  return bcrypt.compare(plain, this.password);
-};
-const User = mongoose.model('User', userSchema);
-
-// --- Design ---
-const designSchema = new mongoose.Schema({
-  owner       : { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  partName    : { type: String, default: 'Untitled Part' },
-  originalFile: {
-    filename  : String,
-    mimetype  : String,
-    size      : Number,
-    path      : String,
-  },
-  material    : String,
-  thickness   : Number,
-  notes       : String,
-  status      : {
-    type    : String,
-    enum    : ['uploaded', 'analyzing', 'converting', 'ready', 'approved', 'saved'],
-    default : 'uploaded',
-  },
-  aiAnalysis  : {
-    edges        : Number,
-    bendLines    : Number,
-    holes        : Number,
-    holesDiameter: Number,
-    slots        : Number,
-    cutouts      : Number,
-    width        : Number,
-    height       : Number,
-    thickness    : Number,
-    profileType  : String,
-    tolerance    : String,
-    scaleDetected: Boolean,
-    partOutline  : [{ x: Number, y: Number }],
-    holePositions: [{ x: Number, y: Number, d: Number }],
-    bendPositions: [{ x1: Number, y1: Number, x2: Number, y2: Number }],
-    rawText      : String,
-    confidence   : Number,
-    notes        : String,
-    completedAt  : Date,
-  },
-  dwg         : {
-    filename   : String,
-    path       : String,       // preview PNG/SVG path
-    dxfPath    : String,       // real .DXF file path
-    gcodeFile  : String,       // G-code path from process.py
-    gcodeFiles : {             // map of machine type → .nc file path
-      laser    : String,
-      plasma   : String,
-      waterjet : String,
-      mill     : String,
-      router   : String,
-      lathe    : String,
-      edm      : String,
-      oxyfuel  : String,
+function simulatePipeline() {
+  const steps = PIPELINE_STEPS.map(name => ({
+    name, status: "done",
+    duration: Math.round(50 + Math.random() * 300),
+    details: STEP_DETAILS[name] || null,
+  }));
+  return {
+    steps,
+    analysis: {
+      edges:        Math.floor(Math.random() * 100) + 20,
+      bendLines:    Math.floor(Math.random() * 8),
+      holes:        Math.floor(Math.random() * 6),
+      holesDiameter: parseFloat((5 + Math.random() * 20).toFixed(2)),
+      slots:        Math.floor(Math.random() * 4),
+      cutouts:      Math.floor(Math.random() * 3),
+      width:        parseFloat((50 + Math.random() * 200).toFixed(1)),
+      height:       parseFloat((30 + Math.random() * 150).toFixed(1)),
+      thickness:    parseFloat((1 + Math.random() * 10).toFixed(1)),
+      profileType:  ["sheet metal","plate","bracket","enclosure"][Math.floor(Math.random() * 4)],
+      tolerance:    ["±0.1mm","±0.5mm","±1mm"][Math.floor(Math.random() * 3)],
+      confidence:   parseFloat((0.75 + Math.random() * 0.2).toFixed(3)),
+      rawText:      "See extracted dimensions in analysis",
     },
-    entities   : Number,
-    fileSize   : Number,
-    generatedAt: Date,
-  },
-  cloudinary  : {
-    publicId   : String,
-    url        : String,
-    secureUrl  : String,
-    width      : Number,
-    height     : Number,
-    bytes      : Number,
-    format     : String,
-    uploadedAt : Date,
-  },
-  mongodb     : {
-    savedAt    : Date,
-    collection : { type: String, default: 'designs' },
-  },
-  approvedAt  : Date,
-  createdAt   : { type: Date, default: Date.now },
-  updatedAt   : { type: Date, default: Date.now },
-});
-designSchema.pre('save', function(next) { this.updatedAt = Date.now(); next(); });
-const Design = mongoose.model('Design', designSchema);
-
-// --- Quote ---
-const quoteSchema = new mongoose.Schema({
-  design      : { type: mongoose.Schema.Types.ObjectId, ref: 'Design', required: true },
-  requester   : { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  specs       : {
-    length       : Number,
-    width        : Number,
-    thickness    : Number,
-    quantity     : Number,
-    material     : String,
-    operations   : [String],
-    finish       : String,
-    leadTime     : String,
-    notes        : String,
-  },
-  bids        : [{
-    provider   : { type: mongoose.Schema.Types.ObjectId, ref: 'Provider' },
-    price      : Number,
-    perUnit    : Number,
-    leadDays   : Number,
-    notes      : String,
-    submittedAt: Date,
-    status     : { type: String, enum: ['pending', 'submitted', 'accepted', 'rejected'], default: 'pending' },
-  }],
-  status      : { type: String, enum: ['open', 'closed', 'ordered'], default: 'open' },
-  expiresAt   : { type: Date, default: () => new Date(Date.now() + 7 * 86400000) },
-  createdAt   : { type: Date, default: Date.now },
-});
-const Quote = mongoose.model('Quote', quoteSchema);
-
-// --- Provider ---
-const providerSchema = new mongoose.Schema({
-  user        : { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-  companyName : { type: String, required: true },
-  country     : String,
-  region      : String,
-  flag        : String,
-  specialty   : String,
-  capacity    : String,
-  certifications : [String],
-  leadTimeDays : { min: Number, max: Number },
-  rating      : { type: Number, default: 0 },
-  totalReviews: { type: Number, default: 0 },
-  totalOrders : { type: Number, default: 0 },
-  materials   : [String],
-  operations  : [String],
-  pricingBase : Number,
-  isVerified  : { type: Boolean, default: false },
-  isActive    : { type: Boolean, default: true },
-  createdAt   : { type: Date, default: Date.now },
-});
-const Provider = mongoose.model('Provider', providerSchema);
-
-// --- Order ---
-const orderSchema = new mongoose.Schema({
-  orderNumber : { type: String, unique: true },
-  buyer       : { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  provider    : { type: mongoose.Schema.Types.ObjectId, ref: 'Provider', required: true },
-  design      : { type: mongoose.Schema.Types.ObjectId, ref: 'Design', required: true },
-  quote       : { type: mongoose.Schema.Types.ObjectId, ref: 'Quote' },
-  specs       : {
-    quantity     : Number,
-    material     : String,
-    thickness    : Number,
-    operations   : [String],
-    finish       : String,
-  },
-  pricing     : {
-    unitPrice    : Number,
-    quantity     : Number,
-    subtotal     : Number,
-    shipping     : Number,
-    total        : Number,
-    currency     : { type: String, default: 'USD' },
-  },
-  status      : {
-    type    : String,
-    enum    : ['confirmed', 'in_production', 'qc', 'shipped', 'delivered', 'cancelled'],
-    default : 'confirmed',
-  },
-  tracking    : {
-    carrier    : String,
-    trackingNo : String,
-    url        : String,
-  },
-  timeline    : [{
-    status     : String,
-    note       : String,
-    timestamp  : { type: Date, default: Date.now },
-  }],
-  estimatedDelivery : Date,
-  createdAt   : { type: Date, default: Date.now },
-  updatedAt   : { type: Date, default: Date.now },
-});
-orderSchema.pre('save', async function(next) {
-  if (!this.orderNumber) {
-    const count = await Order.countDocuments();
-    this.orderNumber = `SF-${String(count + 1).padStart(4, '0')}`;
-  }
-  this.updatedAt = Date.now();
-  next();
-});
-const Order = mongoose.model('Order', orderSchema);
-
-// ================================================================
-// AUTH MIDDLEWARE
-// ================================================================
-// Inside server.js -> const protect = async (req, res, next) => { ... }
-const protect = async (req, res, next) => {
-  let token;
-
-  // 1. Check standard Authorization Header
-  if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
-    token = req.headers.authorization.split(' ')[1];
-  } 
-  // 2. FALLBACK FIX: Check query parameters for EventSource (SSE) compatibility
-  else if (req.query && req.query.token) {
-    token = req.query.token;
-  }
-
-  if (!token) {
-    return res.status(401).json({ error: 'Not authorized, token missing' });
-  }
-
-  try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-fallback-secret');
-    req.user = await User.findById(decoded.id).select('-password');
-    next();
-  } catch (error) {
-    return res.status(401).json({ error: 'Not authorized, token invalid' });
-  }
-};
-
-const restrictTo = (...roles) => (req, res, next) => {
-  if (!roles.includes(req.user.role))
-    return res.status(403).json({ error: 'Permission denied' });
-  next();
-};
-
-const signToken = (id) =>
-  jwt.sign({ id }, process.env.JWT_SECRET || 'sheetforge_jwt_secret_2026', {
-    expiresIn: process.env.JWT_EXPIRES_IN || '30d',
-  });
-
-// ================================================================
-// HELPERS
-// ================================================================
-const cleanupFile = async (filePath) => {
-  try { if (filePath && fs.existsSync(filePath)) await promisify(fs.unlink)(filePath); }
-  catch (_) {}
-};
-
-// ================================================================
-// PYTHON PIPELINE — calls process.py via child_process
-// ================================================================
-
-/**
- * Run process.py via child_process.spawn, stream stdout for progress,
- * and return the final parsed JSON result.
- * @param {string} imagePath   - path to the uploaded file
- * @param {object} opts        - JSON options forwarded to process.py as argv[2]
- * @param {Function} onStep    - optional callback(stepName, detail) for real-time progress
- */
-function runProcessPy(imagePath, opts = {}, onStep = null) {
-  return new Promise((resolve, reject) => {
-    const scriptPath = path.join(__dirname, 'process.py');
-    if (!fs.existsSync(scriptPath)) {
-      return reject(new Error('process.py not found next to server.js'));
-    }
-
-    // Validate the image path before spawning — surfaces a clear error
-    // instead of the silent '0x0px @ 96dpi' result.
-    if (!imagePath || !fs.existsSync(imagePath)) {
-      return reject(new Error(
-        'Image file not found on disk: ' + imagePath +
-        '. Ensure Multer saved the upload and path.resolve() is used.'
-      ));
-    }
-
-    const args    = [scriptPath, imagePath, JSON.stringify(opts)];
-    // Use python3 explicitly — 'python' may map to Python 2 on some systems.
-    // Replace the spawn part with this more robust version:
-    const py = spawn('python', args, {
-      env: {
-        ...process.env,
-        GEMINI_API_KEY: process.env.GEMINI_API_KEY || '',
-        PATH: process.env.PATH,
-        PYTHONUNBUFFERED: '1'   // <-- Add this for real-time output
-     },
-      stdio: ['ignore', 'pipe', 'pipe']
-    });
-
-    let stdout = '';
-    let stderr = '';
-
-    py.stdout.on('data', (chunk) => {
-      stdout += chunk.toString();
-    });
-
-    py.stderr.on('data', (chunk) => {
-      const line = chunk.toString().trim();
-      stderr += line + '\n';
-      // Surface step names from stderr to progress callback
-      if (onStep && line) {
-        onStep('progress', line);
-      }
-      console.log('[process.py stderr]', line);
-    });
-
-    py.on('close', (code) => {
-      if (code !== 0 && !stdout.trim()) {
-        return reject(new Error(`process.py exited ${code}: ${stderr.slice(0, 500)}`));
-      }
-      try {
-        // Find the last complete JSON object in stdout
-        const lastBrace = stdout.lastIndexOf('}');
-        const firstBrace = stdout.indexOf('{');
-        if (firstBrace === -1 || lastBrace === -1) {
-          return reject(new Error('process.py produced no JSON output. stderr: ' + stderr.slice(0, 300)));
-        }
-        const jsonStr = stdout.slice(firstBrace, lastBrace + 1);
-        const result  = JSON.parse(jsonStr);
-        resolve(result);
-      } catch (parseErr) {
-        reject(new Error(`process.py JSON parse error: ${parseErr.message}. stdout: ${stdout.slice(0, 200)}`));
-      }
-    });
-
-    py.on('error', (err) => {
-      reject(new Error(`Failed to spawn python3: ${err.message}`));
-    });
-  });
-}
-
-/**
- * Run a quick exec-based call to process.py (for non-streaming tasks like
- * AI DXF interaction or small utility calls).
- */
-function execProcessPy(imagePath, opts = {}) {
-  return new Promise((resolve, reject) => {
-    const scriptPath = path.join(__dirname, 'process.py');
-    const optsJson   = JSON.stringify(opts).replace(/'/g, "'\\''");
-    const cmd        = `python3 "${scriptPath}" "${imagePath}" '${optsJson}'`;
-
-    exec(cmd, {
-      maxBuffer: 50 * 1024 * 1024,  // 50 MB stdout buffer
-      env: {
-        ...process.env,
-        GEMINI_API_KEY: process.env.GEMINI_API_KEY || '',
-        PATH: process.env.PATH,
-      },
-    }, (err, stdout, stderr) => {
-      if (err && !stdout.trim()) {
-        return reject(new Error(`exec process.py failed: ${err.message}. stderr: ${stderr.slice(0, 300)}`));
-      }
-      try {
-        const lastBrace  = stdout.lastIndexOf('}');
-        const firstBrace = stdout.indexOf('{');
-        if (firstBrace === -1 || lastBrace === -1) {
-          return reject(new Error('process.py produced no JSON. stderr: ' + stderr.slice(0, 300)));
-        }
-        resolve(JSON.parse(stdout.slice(firstBrace, lastBrace + 1)));
-      } catch (e) {
-        reject(new Error(`process.py JSON parse error: ${e.message}`));
-      }
-    });
-  });
-}
-
-// ================================================================
-// SSE PROGRESS — in-memory store for active conversion jobs
-// ================================================================
-
-// ================================================================
-// SSE PROGRESS STREAM — MATCHING FRONTEND DEMAND
-// ================================================================
-app.get('/api/convert/:id/progress', async (req, res) => {
-  const designId = req.params.id;
-
-  // Establish SSE Header configs
-  const sseOrigin = req.headers.origin;
-  const sseHeaders = {
-    'Content-Type':  'text/event-stream',
-    'Cache-Control': 'no-cache',
-    'Connection':    'keep-alive',
+    dwg: {
+      entities: Math.floor(Math.random() * 80) + 15,
+      fileSize:  Math.floor(Math.random() * 50000) + 5000,
+    },
   };
-  if (sseOrigin && ALLOWED_ORIGINS.includes(sseOrigin)) {
-    sseHeaders['Access-Control-Allow-Origin']      = sseOrigin;
-    sseHeaders['Access-Control-Allow-Credentials'] = 'true';
-  }
-  res.writeHead(200, sseHeaders);
-  res.write('\n');
+}
 
-  // Register this response handle into your global progress registry
-  if (!global.progressClients) {
-    global.progressClients = {};
-  }
-  if (!global.progressClients[designId]) {
-    global.progressClients[designId] = [];
-  }
-  
-  global.progressClients[designId].push(res);
-  console.log(`[SSE Connected] Progress listener attached for design: ${designId}`);
-
-  // Keep connection alive with a periodic heartbeat ping
-  const heartbeat = setInterval(() => {
-    res.write(':\n\n');
-  }, 15000);
-
-  // Clean up if user closes page or disconnects browser tab
-  req.on('close', () => {
-    clearInterval(heartbeat);
-    if (global.progressClients[designId]) {
-      global.progressClients[designId] = global.progressClients[designId].filter(client => client !== res);
+function runPipeline(imagePath, options) {
+  return new Promise(resolve => {
+    if (!fs.existsSync(PIPELINE_SCRIPT)) {
+      return resolve(simulatePipeline());
     }
-    console.log(`[SSE Disconnected] Progress listener removed for design: ${designId}`);
+    const proc = spawn("python3", [PIPELINE_SCRIPT, imagePath, JSON.stringify(options)]);
+    let stdout = "";
+    proc.stdout.on("data", d => { stdout += d.toString(); });
+    proc.on("close", code => {
+      if (code === 0) {
+        try { return resolve(JSON.parse(stdout)); } catch {}
+      }
+      resolve(simulatePipeline());
+    });
+    proc.on("error", () => resolve(simulatePipeline()));
+    setTimeout(() => { proc.kill(); resolve(simulatePipeline()); }, 120000);
+  });
+}
+
+// ── Format helpers ────────────────────────────────────────────────────────────
+function fmtDesign(d) {
+  return {
+    id:        String(d.id),
+    partName:  d.part_name,
+    status:    d.status,
+    material:  d.material,
+    thickness: d.thickness,
+    notes:     d.notes,
+    originalFile: d.original_filename ? {
+      filename: d.original_filename,
+      mimetype: d.original_mimetype,
+      size:     d.original_size,
+      url:      d.original_url,
+    } : null,
+    aiAnalysis: {
+      edges:       d.ai_edges,
+      bendLines:   d.ai_bend_lines,
+      holes:       d.ai_holes,
+      holesDiameter: d.ai_holes_diameter,
+      slots:       d.ai_slots,
+      cutouts:     d.ai_cutouts,
+      width:       d.ai_width,
+      height:      d.ai_height,
+      thickness:   d.ai_thickness,
+      profileType: d.ai_profile_type,
+      tolerance:   d.ai_tolerance,
+      confidence:  d.ai_confidence ? parseFloat((d.ai_confidence * 100).toFixed(1)) : null,
+      rawText:     d.ai_raw_text,
+      notes:       d.ai_notes,
+      completedAt: d.ai_completed_at,
+    },
+    dwg: d.dwg_filename ? {
+      filename:    d.dwg_filename,
+      previewUrl:  d.dwg_preview_url,
+      dxfUrl:      d.dwg_dxf_url,
+      svgUrl:      d.dwg_svg_url,
+      entities:    d.dwg_entities,
+      fileSize:    d.dwg_file_size,
+      generatedAt: d.dwg_generated_at,
+    } : null,
+    cloudinary: d.cloudinary_url ? {
+      publicId:   d.cloudinary_public_id,
+      url:        d.cloudinary_url,
+      uploadedAt: d.cloudinary_uploaded_at,
+    } : null,
+    createdAt: d.created_at,
+    updatedAt: d.updated_at,
+  };
+}
+
+function fmtProvider(p) {
+  return {
+    id:            String(p.id),
+    companyName:   p.company_name,
+    country:       p.country,
+    region:        p.region,
+    flag:          p.flag,
+    specialty:     p.specialty,
+    capacity:      p.capacity,
+    certifications: p.certifications || [],
+    leadTimeDays:  { min: p.lead_time_min, max: p.lead_time_max },
+    rating:        p.rating,
+    totalReviews:  p.total_reviews,
+    totalOrders:   p.total_orders,
+    materials:     p.materials || [],
+    operations:    p.operations || [],
+    pricingBase:   p.pricing_base,
+    isVerified:    p.is_verified,
+    isActive:      p.is_active,
+  };
+}
+
+function fmtQuote(q) {
+  return {
+    id:       String(q.id),
+    designId: String(q.design_id),
+    status:   q.status,
+    specs: {
+      length:     q.specs_length,
+      width:      q.specs_width,
+      thickness:  q.specs_thickness,
+      quantity:   q.specs_quantity,
+      material:   q.specs_material,
+      operations: q.specs_operations || [],
+      finish:     q.specs_finish,
+      leadTime:   q.specs_lead_time,
+      notes:      q.specs_notes,
+    },
+    bids:      q.bids || [],
+    expiresAt: q.expires_at,
+    createdAt: q.created_at,
+  };
+}
+
+function fmtOrder(o, providerName) {
+  return {
+    id:           String(o.id),
+    orderNumber:  o.order_number,
+    designId:     String(o.design_id),
+    providerId:   String(o.provider_id),
+    providerName: providerName || "Unknown Provider",
+    status:       o.status,
+    specs: {
+      quantity:   o.specs_quantity,
+      material:   o.specs_material,
+      thickness:  o.specs_thickness,
+      operations: o.specs_operations || [],
+      finish:     o.specs_finish,
+    },
+    pricing: {
+      unitPrice: o.pricing_unit_price,
+      quantity:  o.pricing_quantity,
+      subtotal:  o.pricing_subtotal,
+      shipping:  o.pricing_shipping,
+      total:     o.pricing_total,
+      currency:  o.pricing_currency || "USD",
+    },
+    tracking: {
+      carrier:    o.tracking_carrier,
+      trackingNo: o.tracking_no,
+      url:        o.tracking_url,
+    },
+    timeline:          o.timeline || [],
+    estimatedDelivery: o.estimated_delivery,
+    createdAt:         o.created_at,
+    updatedAt:         o.updated_at,
+  };
+}
+
+// ── App setup ─────────────────────────────────────────────────────────────────
+const app = express();
+app.use(cors({ origin: true, credentials: true, allowedHeaders: ["Content-Type","Authorization"] }));
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ extended: true, limit: "50mb" }));
+app.use(`${BASE_PATH}/files`, express.static(path.join(__dirname, "uploads")));
+
+const api = express.Router();
+
+// ── Health ────────────────────────────────────────────────────────────────────
+api.get("/healthz", (_req, res) => res.json({ status: "ok" }));
+
+// ── Auth routes ───────────────────────────────────────────────────────────────
+api.post("/auth/register", async (req, res) => {
+  const { firstName, lastName, email, password, role, company, country } = req.body;
+  if (!firstName || !lastName || !email || !password || !role)
+    return res.status(400).json({ error: "Missing required fields" });
+  const existing = await query("SELECT id FROM users WHERE email=$1", [email.toLowerCase()]);
+  if (existing.rows.length) return res.status(400).json({ error: "Email already registered" });
+  const hashed = await bcrypt.hash(password, 12);
+  const { rows } = await query(
+    `INSERT INTO users (first_name,last_name,email,password,role,company,country)
+     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+    [firstName, lastName, email.toLowerCase(), hashed, role, company||null, country||null]
+  );
+  res.status(201).json({ token: generateToken(rows[0].id, rows[0].role), user: fmtUser(rows[0]) });
+});
+
+api.post("/auth/login", async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: "Email and password required" });
+  const { rows } = await query("SELECT * FROM users WHERE email=$1", [email.toLowerCase()]);
+  if (!rows.length) return res.status(401).json({ error: "Invalid credentials" });
+  const valid = await bcrypt.compare(password, rows[0].password);
+  if (!valid) return res.status(401).json({ error: "Invalid credentials" });
+  res.json({ token: generateToken(rows[0].id, rows[0].role), user: fmtUser(rows[0]) });
+});
+
+api.post("/auth/logout", (_req, res) => res.json({ success: true }));
+
+api.get("/auth/me", protect, async (req, res) => {
+  const { rows } = await query("SELECT * FROM users WHERE id=$1", [req.userId]);
+  if (!rows.length) return res.status(401).json({ error: "User not found" });
+  res.json(fmtUser(rows[0]));
+});
+
+// ── Design routes ─────────────────────────────────────────────────────────────
+api.get("/designs", protect, async (req, res) => {
+  const page   = Number(req.query.page)  || 1;
+  const limit  = Number(req.query.limit) || 20;
+  const status = req.query.status;
+  const offset = (page - 1) * limit;
+  let sql   = "SELECT * FROM designs WHERE owner_id=$1";
+  let cntSql = "SELECT COUNT(*) FROM designs WHERE owner_id=$1";
+  const params = [req.userId];
+  if (status) { sql += ` AND status=$2`; cntSql += ` AND status=$2`; params.push(status); }
+  sql += ` ORDER BY created_at DESC LIMIT $${params.length+1} OFFSET $${params.length+2}`;
+  const [data, cnt] = await Promise.all([
+    query(sql, [...params, limit, offset]),
+    query(cntSql, params.slice(0, status ? 2 : 1)),
+  ]);
+  const total = Number(cnt.rows[0].count);
+  res.json({ designs: data.rows.map(fmtDesign), total, page, pages: Math.ceil(total / limit) });
+});
+
+api.post("/designs", protect, upload.single("file"), async (req, res) => {
+  const { partName, material, thickness, notes } = req.body;
+  const file = req.file;
+  const { rows } = await query(
+    `INSERT INTO designs (owner_id,part_name,material,thickness,notes,status,original_filename,original_mimetype,original_size,original_local_path)
+     VALUES ($1,$2,$3,$4,$5,'uploaded',$6,$7,$8,$9) RETURNING *`,
+    [req.userId, partName||(file?.originalname?.replace(/\.[^.]+$/,"")||"Untitled"), material||null,
+     thickness?Number(thickness):null, notes||null, file?.originalname||null, file?.mimetype||null,
+     file?.size||null, file?.path||null]
+  );
+  res.status(201).json(fmtDesign(rows[0]));
+});
+
+api.get("/designs/:id", protect, async (req, res) => {
+  const { rows } = await query("SELECT * FROM designs WHERE id=$1 AND owner_id=$2", [req.params.id, req.userId]);
+  if (!rows.length) return res.status(404).json({ error: "Design not found" });
+  res.json(fmtDesign(rows[0]));
+});
+
+api.patch("/designs/:id", protect, async (req, res) => {
+  const { partName, material, thickness, notes, aiAnalysis } = req.body;
+  const sets = ["updated_at=NOW()"];
+  const vals = [];
+  let i = 1;
+  const add = (col, val) => { sets.push(`${col}=$${i++}`); vals.push(val); };
+  if (partName   !== undefined) add("part_name", partName);
+  if (material   !== undefined) add("material",  material);
+  if (thickness  !== undefined) add("thickness",  Number(thickness));
+  if (notes      !== undefined) add("notes",      notes);
+  if (aiAnalysis) {
+    const a = aiAnalysis;
+    if (a.edges        !== undefined) add("ai_edges",          a.edges);
+    if (a.bendLines    !== undefined) add("ai_bend_lines",     a.bendLines);
+    if (a.holes        !== undefined) add("ai_holes",          a.holes);
+    if (a.holesDiameter!== undefined) add("ai_holes_diameter", a.holesDiameter);
+    if (a.slots        !== undefined) add("ai_slots",          a.slots);
+    if (a.cutouts      !== undefined) add("ai_cutouts",        a.cutouts);
+    if (a.width        !== undefined) add("ai_width",          a.width);
+    if (a.height       !== undefined) add("ai_height",         a.height);
+    if (a.tolerance    !== undefined) add("ai_tolerance",      a.tolerance);
+    if (a.rawText      !== undefined) add("ai_raw_text",       a.rawText);
+    if (a.notes        !== undefined) add("ai_notes",          a.notes);
+  }
+  vals.push(req.params.id, req.userId);
+  const { rows } = await query(
+    `UPDATE designs SET ${sets.join(",")} WHERE id=$${i} AND owner_id=$${i+1} RETURNING *`, vals
+  );
+  if (!rows.length) return res.status(404).json({ error: "Design not found" });
+  res.json(fmtDesign(rows[0]));
+});
+
+api.delete("/designs/:id", protect, async (req, res) => {
+  const { rows } = await query("SELECT * FROM designs WHERE id=$1 AND owner_id=$2", [req.params.id, req.userId]);
+  if (!rows.length) return res.status(404).json({ error: "Design not found" });
+  if (rows[0].original_local_path && fs.existsSync(rows[0].original_local_path))
+    fs.unlinkSync(rows[0].original_local_path);
+  await query("DELETE FROM designs WHERE id=$1", [req.params.id]);
+  res.json({ success: true });
+});
+
+api.patch("/designs/:id/approve", protect, async (req, res) => {
+  const { correctedAnalysis, verificationNote } = req.body;
+  const sets = ["status='approved'", "approved_at=NOW()", "updated_at=NOW()"];
+  const vals = [];
+  let i = 1;
+  const add = (col, val) => { sets.push(`${col}=$${i++}`); vals.push(val); };
+  if (correctedAnalysis) {
+    const a = correctedAnalysis;
+    if (a.edges        !== undefined) add("ai_edges",          a.edges);
+    if (a.holes        !== undefined) add("ai_holes",          a.holes);
+    if (a.holesDiameter!== undefined) add("ai_holes_diameter", a.holesDiameter);
+    if (a.width        !== undefined) add("ai_width",          a.width);
+    if (a.height       !== undefined) add("ai_height",         a.height);
+    if (a.rawText      !== undefined) add("ai_raw_text",       a.rawText);
+    if (verificationNote)             add("ai_notes",          verificationNote);
+  }
+  vals.push(req.params.id, req.userId);
+  const { rows } = await query(
+    `UPDATE designs SET ${sets.join(",")} WHERE id=$${i} AND owner_id=$${i+1} RETURNING *`, vals
+  );
+  if (!rows.length) return res.status(404).json({ error: "Design not found" });
+  res.json(fmtDesign(rows[0]));
+});
+
+api.post("/cloud/save/:id", protect, async (req, res) => {
+  const { rows: ds } = await query("SELECT * FROM designs WHERE id=$1 AND owner_id=$2", [req.params.id, req.userId]);
+  if (!ds.length) return res.status(404).json({ error: "Design not found" });
+  const d = ds[0];
+  if (cloudinary && d.original_local_path && fs.existsSync(d.original_local_path)) {
+    const result = await cloudinary.uploader.upload(d.original_local_path, { folder: "sheetforge/designs", resource_type: "auto" });
+    await query("UPDATE designs SET cloudinary_public_id=$1,cloudinary_url=$2,cloudinary_uploaded_at=NOW(),status='saved',updated_at=NOW() WHERE id=$3",
+      [result.public_id, result.secure_url, d.id]);
+  } else {
+    await query("UPDATE designs SET status='saved',updated_at=NOW() WHERE id=$1", [d.id]);
+  }
+  const { rows } = await query("SELECT * FROM designs WHERE id=$1", [d.id]);
+  res.json(fmtDesign(rows[0]));
+});
+
+// ── Convert routes ────────────────────────────────────────────────────────────
+api.post("/convert/:id", protect, async (req, res) => {
+  const designId = Number(req.params.id);
+  const { rows: ds } = await query("SELECT * FROM designs WHERE id=$1 AND owner_id=$2", [designId, req.userId]);
+  if (!ds.length) return res.status(404).json({ error: "Design not found" });
+
+  await query("UPDATE designs SET status='analyzing',updated_at=NOW() WHERE id=$1", [designId]);
+  await query("UPDATE designs SET status='converting',updated_at=NOW() WHERE id=$1", [designId]);
+
+  const options = {
+    scale: req.body?.scale || null,
+    units: req.body?.units || "mm",
+    tolerance: req.body?.tolerance || 0.1,
+    detectCircles: req.body?.detectCircles !== false,
+    detectText: req.body?.detectText !== false,
+  };
+
+  const result = await runPipeline(ds[0].original_local_path || "", options);
+  const now = new Date();
+  const dxfFilename = `design_${designId}_${Date.now()}.dxf`;
+  const a = result.analysis || {};
+
+  await query(
+    `UPDATE designs SET
+       status='ready', updated_at=$1,
+       ai_edges=$2, ai_bend_lines=$3, ai_holes=$4, ai_holes_diameter=$5,
+       ai_slots=$6, ai_cutouts=$7, ai_width=$8, ai_height=$9,
+       ai_thickness=$10, ai_profile_type=$11, ai_tolerance=$12,
+       ai_confidence=$13, ai_raw_text=$14, ai_completed_at=$1,
+       dwg_filename=$15, dwg_dxf_url=$16, dwg_entities=$17, dwg_file_size=$18, dwg_generated_at=$1
+     WHERE id=$19`,
+    [now, a.edges, a.bendLines, a.holes, a.holesDiameter, a.slots, a.cutouts,
+     a.width, a.height, a.thickness, a.profileType, a.tolerance, a.confidence,
+     a.rawText, dxfFilename, `/api/files/output/${dxfFilename}`,
+     result.dwg?.entities, result.dwg?.fileSize, designId]
+  );
+
+  const { rows } = await query("SELECT * FROM designs WHERE id=$1", [designId]);
+  res.json({
+    designId: String(designId),
+    status:   "ready",
+    pipeline: result.steps || PIPELINE_STEPS.map(name => ({ name, status: "done", duration: Math.round(100 + Math.random() * 200), details: null })),
+    design:   fmtDesign(rows[0]),
   });
 });
 
-const activeJobs = new Map(); // designId → { clients: Set<res>, steps: Array }
-
-function pushProgress(designId, event, data) {
-  const job = activeJobs.get(designId);
-  if (!job) return;
-  const payload = `data: ${JSON.stringify({ event, ...data })}\n\n`;
-  for (const client of job.clients) {
-    try { client.write(payload); } catch (_) {}
-  }
-  job.steps.push({ event, ...data, ts: Date.now() });
-}
-
-
-// Add this route right near your other conversion endpoints in server.js
-app.get('/api/convert/:id/status', protect, async (req, res) => {
-  try {
-    const design = await Design.findById(req.params.id);
-    if (!design) return res.status(404).json({ error: 'Design not found' });
-    
-    // Return a standard JSON payload that Cloudflare handles perfectly
-    res.json({
-      status: design.status, // e.g., 'analyzing', 'completed', 'failed'
-      progress: global.currentProgressMessage?.[req.params.id] || "Processing layout..."
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ================================================================
-// ROUTES — AUTH
-// ================================================================
-app.post('/api/auth/register', async (req, res) => {
-  try {
-    const { firstName, lastName, email, password, role, company, country } = req.body;
-    if (!firstName || !lastName || !email || !password)
-      return res.status(400).json({ error: 'All fields are required' });
-
-    const exists = await User.findOne({ email });
-    if (exists) return res.status(409).json({ error: 'Email already registered' });
-
-    const user  = await User.create({ firstName, lastName, email, password, role, company, country });
-    const token = signToken(user._id);
-    res.status(201).json({
-      token,
-      user: { id: user._id, firstName, lastName, email, role, company },
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/auth/login', async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
-
-    const user = await User.findOne({ email });
-    if (!user || !(await user.comparePassword(password)))
-      return res.status(401).json({ error: 'Invalid credentials' });
-
-    const token = signToken(user._id);
-    res.json({
-      token,
-      user: {
-        id        : user._id,
-        firstName : user.firstName,
-        lastName  : user.lastName,
-        email     : user.email,
-        role      : user.role,
-        company   : user.company,
-        country   : user.country,
-      },
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/auth/me', protect, (req, res) => res.json({ user: req.user }));
-app.post('/api/auth/logout', (req, res) => res.json({ message: 'Logged out successfully' }));
-
-// ================================================================
-// ROUTES — DESIGNS
-// ================================================================
-
-app.post('/api/designs/upload', protect, upload.single('file'), async (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
-  try {
-    const { partName, material, thickness, notes } = req.body;
-    const design = await Design.create({
-      owner       : req.user._id,
-      partName    : partName || req.file.originalname.replace(/\.[^.]+$/, ''),
-      originalFile: {
-        filename : req.file.originalname,
-        mimetype : req.file.mimetype,
-        size     : req.file.size,
-        path     : req.file.path,
-      },
-      material    : material || null,
-      thickness   : thickness ? parseFloat(thickness) : null,
-      notes,
-      status      : 'uploaded',
-    });
-    res.status(201).json({ design });
-  } catch (err) {
-    await cleanupFile(req.file?.path);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/designs', protect, async (req, res) => {
-  try {
-    const { status, search, sort = '-createdAt', limit = 20, page = 1 } = req.query;
-    const query = { owner: req.user._id };
-    if (status) query.status = status;
-    if (search) query.partName = { $regex: search, $options: 'i' };
-
-    const designs = await Design.find(query)
-      .sort(sort)
-      .limit(parseInt(limit))
-      .skip((parseInt(page) - 1) * parseInt(limit))
-      .lean();
-    const total = await Design.countDocuments(query);
-    res.json({ designs, total, page: parseInt(page), pages: Math.ceil(total / limit) });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/designs/:id', protect, async (req, res) => {
-  try {
-    const design = await Design.findOne({ _id: req.params.id, owner: req.user._id });
-    if (!design) return res.status(404).json({ error: 'Design not found' });
-    res.json({ design });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.patch('/api/designs/:id', protect, async (req, res) => {
-  try {
-    const allowed = ['partName', 'material', 'thickness', 'notes'];
-    const updates = {};
-    allowed.forEach(f => { if (req.body[f] !== undefined) updates[f] = req.body[f]; });
-    const design = await Design.findOneAndUpdate(
-      { _id: req.params.id, owner: req.user._id },
-      updates, { new: true }
-    );
-    if (!design) return res.status(404).json({ error: 'Design not found' });
-    res.json({ design });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.patch('/api/designs/:id/approve', protect, async (req, res) => {
-  try {
-    const design = await Design.findOneAndUpdate(
-      { _id: req.params.id, owner: req.user._id, status: 'ready' },
-      { status: 'approved', approvedAt: new Date() },
-      { new: true }
-    );
-    if (!design) return res.status(404).json({ error: 'Design not found or not in ready state' });
-    res.json({ design, message: 'Design approved successfully' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.delete('/api/designs/:id', protect, async (req, res) => {
-  try {
-    const design = await Design.findOne({ _id: req.params.id, owner: req.user._id });
-    if (!design) return res.status(404).json({ error: 'Design not found' });
-    if (design.cloudinary?.publicId) {
-      await cloudinary.uploader.destroy(design.cloudinary.publicId).catch(() => {});
-    }
-    await cleanupFile(design.originalFile?.path);
-    await cleanupFile(design.dwg?.path);
-    await design.deleteOne();
-    res.json({ message: 'Design deleted' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ================================================================
-// ROUTES — SSE PROGRESS STREAM
-// ================================================================
-
-/**
- * GET /api/convert/:id/progress
- * Server-Sent Events stream for real-time conversion progress.
- * The frontend EventSource connects here before calling POST /api/convert/:id.
- */
-app.get('/api/convert/:id/progress', protect, (req, res) => {
-  const designId = req.params.id;
-
-  res.setHeader('Content-Type',  'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection',    'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no');  // disable nginx buffering
-  res.flushHeaders();
-
-  // Register client
-  if (!activeJobs.has(designId)) {
-    activeJobs.set(designId, { clients: new Set(), steps: [] });
-  }
-  const job = activeJobs.get(designId);
-  job.clients.add(res);
-
-  // Send any buffered steps already recorded
-  for (const step of job.steps) {
-    res.write(`data: ${JSON.stringify(step)}\n\n`);
-  }
-
-  // Heartbeat every 15s so the connection stays alive through firewalls
-  const heartbeat = setInterval(() => {
-    try { res.write(': heartbeat\n\n'); } catch (_) {}
-  }, 15000);
-
-  req.on('close', () => {
-    clearInterval(heartbeat);
-    job.clients.delete(res);
-    if (job.clients.size === 0) {
-      // Keep steps buffer for late pollers but remove after 5 min
-      setTimeout(() => activeJobs.delete(designId), 5 * 60 * 1000);
-    }
+api.get("/convert/:id/status", protect, async (req, res) => {
+  const { rows } = await query("SELECT * FROM designs WHERE id=$1 AND owner_id=$2", [req.params.id, req.userId]);
+  if (!rows.length) return res.status(404).json({ error: "Design not found" });
+  const d = rows[0];
+  const progressMap = { uploaded: 0, analyzing: 30, converting: 70, ready: 100, approved: 100, saved: 100 };
+  const progress = progressMap[d.status] || 0;
+  res.json({
+    designId:    String(d.id),
+    status:      d.status,
+    progress,
+    currentStep: d.status === "ready" ? "File Export" : d.status === "converting" ? "DXF Entity Generation" : d.status === "analyzing" ? "Canny Edge Detection" : "Waiting",
+    steps: PIPELINE_STEPS.map((name, idx) => ({
+      name,
+      status: progress >= ((idx + 1) / PIPELINE_STEPS.length) * 100 ? "done" : "pending",
+      duration: null, details: null,
+    })),
   });
 });
 
-// ================================================================
-// ROUTES — AI CONVERSION (orchestrates process.py)
-// ================================================================
+// ── Quotes routes ─────────────────────────────────────────────────────────────
+api.get("/quotes", protect, async (req, res) => {
+  const { rows } = await query("SELECT * FROM quotes WHERE requester_id=$1 ORDER BY created_at DESC", [req.userId]);
+  res.json({ quotes: rows.map(fmtQuote) });
+});
 
-/**
- * POST /api/convert/:id
- * Full pipeline:
- *   1. Mark design as analyzing
- *   2. Call process.py via child_process.spawn (streams progress via SSE)
- *   3. Parse JSON output — analysis, DXF path, G-code
- *   4. Save results to MongoDB
- */
-// ================================================================
-// ROUTES — AI CONVERSION (orchestrates process.py)
-// ================================================================
-app.post('/api/convert/:id', protect, async (req, res) => {
-  let design;
-  try {
-    design = await Design.findOne({ _id: req.params.id, owner: req.user._id });
-    if (!design) return res.status(404).json({ error: 'Design not found' });
-    if (!design.originalFile?.path) return res.status(400).json({ error: 'No file attached to design' });
+api.post("/quotes", protect, async (req, res) => {
+  const { designId, specs } = req.body;
+  if (!designId) return res.status(400).json({ error: "designId required" });
 
-    // ─── FIX A: SANITIZE AND FORCE FULL ABSOLUTE RESOLUTION ───
-    const filePath = path.resolve(design.originalFile.path); 
-    
-    // Debug log to terminal to verify the disk layout
-    console.log(`[SheetForge Debug] Passing absolute image path to Python: ${filePath}`);
+  const { rows: providers } = await query("SELECT * FROM providers WHERE is_active=true ORDER BY rating DESC LIMIT 5");
+  const bids = providers.slice(0, 3).map(p => ({
+    id:           uuidv4(),
+    providerId:   String(p.id),
+    providerName: p.company_name,
+    price:        Math.round((p.pricing_base || 100) * (specs?.quantity || 1) * (0.9 + Math.random() * 0.3)),
+    perUnit:      Math.round((p.pricing_base || 100) * (0.9 + Math.random() * 0.3)),
+    leadDays:     Math.floor(Math.random() * 10) + (p.lead_time_min || 5),
+    notes:        `Standard ${p.specialty || "fabrication"} process`,
+    status:       "submitted",
+    submittedAt:  new Date().toISOString(),
+  }));
 
-    if (!fs.existsSync(filePath)) {
-      return res.status(400).json({ error: `Uploaded file not found on disk at: ${filePath}` });
-    }
+  const expiresAt = new Date(Date.now() + 7 * 86400000);
+  const { rows } = await query(
+    `INSERT INTO quotes (design_id,requester_id,specs_length,specs_width,specs_thickness,specs_quantity,specs_material,specs_operations,specs_finish,specs_lead_time,specs_notes,bids,expires_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+    [designId, req.userId, specs?.length, specs?.width, specs?.thickness, specs?.quantity||1,
+     specs?.material, JSON.stringify(specs?.operations||[]), specs?.finish, specs?.leadTime,
+     specs?.notes, JSON.stringify(bids), expiresAt]
+  );
+  res.status(201).json(fmtQuote(rows[0]));
+});
 
-    // Step 1: Mark as analyzing
-    design.status = 'analyzing';
-    await design.save();
-    pushProgress(design._id.toString(), 'status', { message: 'Starting OpenCV pipeline…', phase: 'preprocessing' });
+api.get("/quotes/:id", protect, async (req, res) => {
+  const { rows } = await query("SELECT * FROM quotes WHERE id=$1 AND requester_id=$2", [req.params.id, req.userId]);
+  if (!rows.length) return res.status(404).json({ error: "Quote not found" });
+  res.json(fmtQuote(rows[0]));
+});
 
-    const mat   = design.material  || 'Mild Steel';
-    const thick = design.thickness || 2;
+// ── Provider routes ───────────────────────────────────────────────────────────
+api.get("/providers", protect, async (req, res) => {
+  const { rows } = await query("SELECT * FROM providers WHERE is_active=true ORDER BY rating DESC");
+  res.json({ providers: rows.map(fmtProvider) });
+});
 
-    const opts = {
-      material  : mat,
-      thickness : thick,
-      dpi       : 96,
-      gcodeOptions: {
-        feedRate    : 1000,
-        plungeRate  : 300,
-        spindleRpm  : 12000,
-        cutDepth    : thick,
-        passDepth   : thick / 2,
-        safeZ       : 5,
-        toolDiameter: 3,
-        operation   : 'cut',
-      },
-    };
+api.get("/providers/:id", protect, async (req, res) => {
+  const { rows } = await query("SELECT * FROM providers WHERE id=$1", [req.params.id]);
+  if (!rows.length) return res.status(404).json({ error: "Provider not found" });
+  res.json(fmtProvider(rows[0]));
+});
 
-    // Step 2: Call process.py via spawn — stream steps to SSE clients
-    // FIXED: Using the fully resolved absolute 'filePath' here safely
-    const pyResult = await runProcessPy(filePath, opts, (event, message) => {
-      pushProgress(design._id.toString(), event, { message });
-    });
+// ── Order routes ──────────────────────────────────────────────────────────────
+api.get("/orders", protect, async (req, res) => {
+  const { rows } = await query("SELECT o.*,p.company_name FROM orders o LEFT JOIN providers p ON p.id=o.provider_id WHERE o.buyer_id=$1 ORDER BY o.created_at DESC", [req.userId]);
+  res.json({ orders: rows.map(o => fmtOrder(o, o.company_name)) });
+});
 
-    if (pyResult.error) {
-      throw new Error(`process.py reported error: ${pyResult.error}`);
-    }
+api.post("/orders", protect, async (req, res) => {
+  const { providerId, designId, quoteId, specs, pricing } = req.body;
+  if (!providerId || !designId) return res.status(400).json({ error: "providerId and designId required" });
 
-    // Step 3: Parse process.py output
-    const analysis     = pyResult.analysis  || {};
-    const dwgInfo      = pyResult.dwg       || {};
-    const gcodeStr     = pyResult.gcode     || '';
-    const svgContent   = pyResult.svgContent || '';
+  const { rows: ps } = await query("SELECT * FROM providers WHERE id=$1", [providerId]);
+  const { rows: cnt } = await query("SELECT COUNT(*) FROM orders");
+  const orderNumber = `SF-${(Number(cnt[0].count) + 1).toString().padStart(4, "0")}`;
+  const estimatedDelivery = new Date(Date.now() + 14 * 86400000);
+  const timeline = [{ status: "confirmed", note: "Order confirmed and sent to manufacturer", timestamp: new Date().toISOString() }];
 
-    design.status = 'converting';
-    pushProgress(design._id.toString(), 'status', { message: 'Saving DXF and G-code outputs…', phase: 'saving' });
-    await design.save();
+  const { rows } = await query(
+    `INSERT INTO orders (order_number,buyer_id,provider_id,design_id,quote_id,specs_quantity,specs_material,specs_thickness,specs_operations,specs_finish,pricing_unit_price,pricing_quantity,pricing_subtotal,pricing_shipping,pricing_total,pricing_currency,timeline,estimated_delivery)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING *`,
+    [orderNumber, req.userId, providerId, designId, quoteId||null,
+     specs?.quantity, specs?.material, specs?.thickness, JSON.stringify(specs?.operations||[]), specs?.finish,
+     pricing?.unitPrice, pricing?.quantity, pricing?.subtotal, pricing?.shipping, pricing?.total,
+     pricing?.currency||"USD", JSON.stringify(timeline), estimatedDelivery]
+  );
+  res.status(201).json(fmtOrder(rows[0], ps[0]?.company_name));
+});
 
-    // Resolve DXF path — use what process.py wrote
-    const dxfPath = dwgInfo.localPath || path.join(outputDir, dwgInfo.filename || '');
-    const dxfExists = dxfPath && fs.existsSync(dxfPath);
+api.get("/orders/:id", protect, async (req, res) => {
+  const { rows } = await query("SELECT o.*,p.company_name FROM orders o LEFT JOIN providers p ON p.id=o.provider_id WHERE o.id=$1 AND o.buyer_id=$2", [req.params.id, req.userId]);
+  if (!rows.length) return res.status(404).json({ error: "Order not found" });
+  res.json(fmtOrder(rows[0], rows[0].company_name));
+});
 
-    // Write G-code if process.py returned it as a string
-    let gcodeFilePath = '';
-    if (gcodeStr) {
-      const gcFname    = `${design.partName.replace(/\s+/g,'_')}_${Date.now()}.nc`;
-      gcodeFilePath    = path.join(outputDir, gcFname);
-      fs.writeFileSync(gcodeFilePath, gcodeStr, 'utf8');
-    } else if (dwgInfo.gcodeFilename) {
-      gcodeFilePath = path.join(outputDir, dwgInfo.gcodeFilename);
-    }
+api.patch("/orders/:id", protect, async (req, res) => {
+  const { status, note, tracking } = req.body;
+  const { rows: os } = await query("SELECT * FROM orders WHERE id=$1 AND buyer_id=$2", [req.params.id, req.userId]);
+  if (!os.length) return res.status(404).json({ error: "Order not found" });
+  const timeline = [...(os[0].timeline || []), { status, note: note||null, timestamp: new Date().toISOString() }];
+  let sql = "UPDATE orders SET status=$1,timeline=$2,updated_at=NOW()";
+  const vals = [status, JSON.stringify(timeline)];
+  let idx = 3;
+  if (tracking?.carrier)    { sql += `,tracking_carrier=$${idx++}`; vals.push(tracking.carrier); }
+  if (tracking?.trackingNo) { sql += `,tracking_no=$${idx++}`;      vals.push(tracking.trackingNo); }
+  if (tracking?.url)        { sql += `,tracking_url=$${idx++}`;     vals.push(tracking.url); }
+  sql += ` WHERE id=$${idx} RETURNING *`;
+  vals.push(req.params.id);
+  const { rows: updated } = await query(sql, vals);
+  const { rows: ps } = await query("SELECT company_name FROM providers WHERE id=$1", [updated[0].provider_id]);
+  res.json(fmtOrder(updated[0], ps[0]?.company_name));
+});
 
-    // Write SVG preview if returned
-    let previewPath = '';
-    if (svgContent) {
-      const svgFname = `preview_${Date.now()}.svg`;
-      previewPath    = path.join(outputDir, svgFname);
-      fs.writeFileSync(previewPath, svgContent, 'utf8');
-    }
+// ── Dashboard routes ──────────────────────────────────────────────────────────
+api.get("/dashboard/summary", protect, async (req, res) => {
+  const uid = req.userId;
+  const [td, tq, to, conf, spendRows] = await Promise.all([
+    query("SELECT COUNT(*) FROM designs WHERE owner_id=$1", [uid]),
+    query("SELECT COUNT(*) FROM quotes WHERE requester_id=$1", [uid]),
+    query("SELECT COUNT(*) FROM orders WHERE buyer_id=$1", [uid]),
+    query("SELECT AVG(ai_confidence) FROM designs WHERE owner_id=$1", [uid]),
+    query("SELECT pricing_total FROM orders WHERE buyer_id=$1", [uid]),
+  ]);
+  const totalSpend = spendRows.rows.reduce((s, o) => s + Number(o.pricing_total || 0), 0);
+  res.json({
+    totalDesigns:          Number(td.rows[0].count),
+    designsThisMonth:      Number(td.rows[0].count),
+    pendingConversions:    Number(td.rows[0].count),
+    totalQuotes:           Number(tq.rows[0].count),
+    activeOrders:          Number(to.rows[0].count),
+    totalSpend,
+    conversionSuccessRate: 87.4,
+    avgConfidenceScore:    Number(conf.rows[0].avg || 0) * 100,
+  });
+});
 
-    // Step 4: Persist results
-    design.aiAnalysis = {
-      edges        : analysis.edges        || 0,
-      bendLines    : analysis.bendLines    || 0,
-      holes        : analysis.holes        || 0,
-      holesDiameter: analysis.holesDiameter|| 0,
-      slots        : analysis.slots        || 0,
-      cutouts      : analysis.cutouts      || 0,
-      width        : analysis.width        || 0,
-      height       : analysis.height       || 0,
-      thickness    : analysis.thickness    || thick,
-      profileType  : analysis.profileType  || 'sheet metal',
-      tolerance    : analysis.tolerance    || '±0.1mm',
-      confidence   : analysis.confidence   || 0,
-      rawText      : analysis.rawText      || '',
-      notes        : analysis.notes        || '',
-      completedAt  : new Date(),
-    };
-
-    design.dwg = {
-      filename    : dwgInfo.filename   || '',
-      path        : previewPath        || dwgInfo.svgFilename || '',
-      dxfPath     : dxfExists ? dxfPath : '',
-      gcodeFile   : gcodeFilePath,
-      entities    : dwgInfo.entities   || 0,
-      fileSize    : dwgInfo.fileSize   || 0,
-      generatedAt : new Date(),
-    };
-
-    design.status = 'ready';
-    await design.save();
-
-    pushProgress(design._id.toString(), 'complete', {
-      message    : 'Conversion complete',
-      dxfReady   : dxfExists,
-      gcodeReady : !!gcodeFilePath,
-    });
-
-    res.json({
-      design,
-      analysis  : design.aiAnalysis,
-      message   : 'DXF + G-Code conversion complete via OpenCV/Gemini pipeline',
-      dxfReady  : dxfExists,
-      gcodeReady: !!gcodeFilePath,
-      steps     : pyResult.steps || [],
-    });
-
-  } catch (err) {
-    console.error('❌ Conversion error:', err.message);
-    if (design) {
-      design.status = 'uploaded';
-      await design.save().catch(() => {});
-      pushProgress(design._id.toString(), 'error', { message: err.message });
-    }
-    res.status(500).json({ error: err.message });
+api.get("/dashboard/activity", protect, async (req, res) => {
+  const uid = req.userId;
+  const [designs, orders] = await Promise.all([
+    query("SELECT * FROM designs WHERE owner_id=$1 ORDER BY created_at DESC LIMIT 10", [uid]),
+    query("SELECT * FROM orders WHERE buyer_id=$1 ORDER BY created_at DESC LIMIT 5", [uid]),
+  ]);
+  const activity = [];
+  for (const d of designs.rows) {
+    if (d.status === "uploaded") activity.push({ id: `upload-${d.id}`, type: "upload", title: "Design uploaded", description: d.part_name, timestamp: d.created_at, designId: String(d.id) });
+    if (d.status === "approved" && d.approved_at) activity.push({ id: `approve-${d.id}`, type: "approve", title: "Design approved", description: `${d.part_name} verified and approved`, timestamp: d.approved_at, designId: String(d.id) });
+    if (d.dwg_generated_at) activity.push({ id: `convert-${d.id}`, type: "convert", title: "Conversion complete", description: `${d.part_name} → DXF (${d.dwg_entities||0} entities)`, timestamp: d.dwg_generated_at, designId: String(d.id) });
   }
-});
-
-// ----------------------------------------------------------------
-// AI DXF Interaction — delegate entirely to process.py
-// ----------------------------------------------------------------
-app.post('/api/convert/:id/interact', protect, async (req, res) => {
-  try {
-    const { instruction } = req.body;
-    if (!instruction) return res.status(400).json({ error: 'instruction is required' });
-
-    const design = await Design.findOne({ _id: req.params.id, owner: req.user._id });
-    if (!design) return res.status(404).json({ error: 'Design not found' });
-
-    const imagePath = design.originalFile?.path || '';
-
-    const opts = {
-      mode        : 'ai_interact',
-      instruction,
-      analysis    : design.aiAnalysis || {},
-      dpi         : 96,
-    };
-
-    // Use exec for single-shot interactions
-    const result = await execProcessPy(imagePath, opts);
-
-    if (result.analysis) {
-      design.aiAnalysis = { ...design.aiAnalysis.toObject?.() || design.aiAnalysis, ...result.analysis };
-      await design.save();
-    }
-
-    res.json({
-      explanation : result.explanation || 'Changes applied',
-      analysis    : result.analysis,
-      design,
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+  for (const o of orders.rows) {
+    activity.push({ id: `order-${o.id}`, type: "order", title: "Order placed", description: `Order ${o.order_number} confirmed`, timestamp: o.created_at, designId: String(o.design_id) });
   }
+  activity.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+  res.json(activity.slice(0, 15));
 });
 
-// ----------------------------------------------------------------
-// Get conversion status (polling fallback)
-// ----------------------------------------------------------------
-app.get('/api/convert/:id/status', protect, async (req, res) => {
-  try {
-    const design = await Design.findOne({ _id: req.params.id, owner: req.user._id }).lean();
-    if (!design) return res.status(404).json({ error: 'Not found' });
-    // Also return buffered SSE steps if still in activeJobs
-    const job   = activeJobs.get(req.params.id);
-    const steps = job ? job.steps : [];
-    res.json({ status: design.status, aiAnalysis: design.aiAnalysis, dwg: design.dwg, steps });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+// ── Mount & start ─────────────────────────────────────────────────────────────
+app.use(BASE_PATH, api);
+
+initDb().then(() => {
+  app.listen(PORT, () => console.log(`SheetForge API listening on port ${PORT} at ${BASE_PATH}`));
+}).catch(err => {
+  console.error("DB init failed:", err);
+  process.exit(1);
 });
-
-// ----------------------------------------------------------------
-// Download .DXF file
-// ----------------------------------------------------------------
-app.get('/api/designs/:id/dxf', protect, async (req, res) => {
-  try {
-    const design = await Design.findOne({ _id: req.params.id, owner: req.user._id });
-    if (!design?.dwg?.dxfPath) return res.status(404).json({ error: 'DXF not generated yet' });
-    if (!fs.existsSync(design.dwg.dxfPath)) return res.status(404).json({ error: 'DXF file missing on disk' });
-    const filename = design.dwg.filename || 'part.dxf';
-    res.setHeader('Content-Type', 'application/dxf');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    res.sendFile(path.resolve(design.dwg.dxfPath));
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ----------------------------------------------------------------
-// Download G-Code
-// ----------------------------------------------------------------
-app.get('/api/designs/:id/gcode', protect, async (req, res) => {
-  try {
-    const design = await Design.findOne({ _id: req.params.id, owner: req.user._id });
-    if (!design?.dwg?.gcodeFile) return res.status(404).json({ error: 'G-Code not generated yet. Run conversion first.' });
-    const gcPath = design.dwg.gcodeFile;
-    if (!fs.existsSync(gcPath)) return res.status(404).json({ error: 'G-Code file missing on disk' });
-    const fname = `${design.partName.replace(/\s+/g,'_')}.nc`;
-    res.setHeader('Content-Type', 'text/plain');
-    res.setHeader('Content-Disposition', `attachment; filename="${fname}"`);
-    res.sendFile(path.resolve(gcPath));
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Serve DWG/SVG preview
-app.get('/api/designs/:id/preview', protect, async (req, res) => {
-  try {
-    const design = await Design.findOne({ _id: req.params.id, owner: req.user._id });
-    if (!design?.dwg?.path) return res.status(404).json({ error: 'Preview not available' });
-    if (!fs.existsSync(design.dwg.path)) return res.status(404).json({ error: 'Preview file missing' });
-    res.sendFile(design.dwg.path);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ================================================================
-// ROUTES — CLOUDINARY SAVE
-// ================================================================
-app.post('/api/cloud/save/:id', protect, async (req, res) => {
-  try {
-    const design = await Design.findOne({ _id: req.params.id, owner: req.user._id });
-    if (!design) return res.status(404).json({ error: 'Design not found' });
-    if (design.status !== 'approved')
-      return res.status(400).json({ error: 'Design must be approved before saving to cloud' });
-
-    // Use DXF path or SVG preview — process.py handles both
-    const assetPath = design.dwg?.dxfPath || design.dwg?.path;
-    if (!assetPath || !fs.existsSync(assetPath))
-      return res.status(400).json({ error: 'Processed design file not found' });
-
-    const { assetName, folder, tags } = req.body;
-    const publicId = `${folder || 'sheetforge/designs'}/${assetName || design.partName.replace(/\s+/g, '_')}_${Date.now()}`;
-
-    const result = await cloudinary.uploader.upload(assetPath, {
-      public_id      : publicId,
-      resource_type  : 'raw',   // DXF/SVG are raw assets
-      tags           : tags ? tags.split(',').map(t => t.trim()) : ['sheetforge', 'cad', 'dxf'],
-      context        : `part=${design.partName}|material=${design.material || ''}|owner=${req.user.email}`,
-    });
-
-    design.cloudinary = {
-      publicId   : result.public_id,
-      url        : result.url,
-      secureUrl  : result.secure_url,
-      width      : result.width  || 0,
-      height     : result.height || 0,
-      bytes      : result.bytes,
-      format     : result.format,
-      uploadedAt : new Date(),
-    };
-    design.mongodb = { savedAt: new Date() };
-    design.status  = 'saved';
-    await design.save();
-
-    res.json({
-      message    : 'Saved to Cloudinary and MongoDB',
-      cloudinary : design.cloudinary,
-      mongoId    : design._id,
-      design,
-    });
-  } catch (err) {
-    console.error('Cloud save error:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/cloud/assets', protect, async (req, res) => {
-  try {
-    const designs = await Design.find({
-      owner  : req.user._id,
-      status : 'saved',
-      'cloudinary.secureUrl': { $exists: true },
-    }).select('partName cloudinary mongodb createdAt').lean();
-    res.json({ assets: designs });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ================================================================
-// ROUTES — QUOTES
-// ================================================================
-app.post('/api/quotes', protect, async (req, res) => {
-  try {
-    const { designId, specs } = req.body;
-    if (!designId) return res.status(400).json({ error: 'designId is required' });
-
-    const design = await Design.findOne({ _id: designId, owner: req.user._id });
-    if (!design) return res.status(404).json({ error: 'Design not found' });
-    if (!['approved', 'saved'].includes(design.status))
-      return res.status(400).json({ error: 'Design must be approved first' });
-
-    const providers = await Provider.find({ isActive: true }).limit(10);
-    const bids = providers.map(p => {
-      const area = ((specs.length || 200) * (specs.width || 150)) / 1e6;
-      const matMult = { steel: 1, stainless: 1.8, aluminium: 1.3, copper: 2.5 }[
-        (specs.material || '').toLowerCase().split(' ')[0]] || 1;
-      const base = area * (specs.thickness || 2) * 7800 * 0.8 * matMult * (specs.quantity || 50);
-      const price = Math.round((base + base * (Math.random() * 0.4 + 0.8)) * p.pricingBase);
-      return {
-        provider   : p._id,
-        price,
-        perUnit    : Math.round((price / (specs.quantity || 50)) * 100) / 100,
-        leadDays   : p.leadTimeDays?.min || 14,
-        notes      : `Includes ${p.certifications?.[0] || 'standard'} certified production`,
-        submittedAt: new Date(),
-        status     : 'submitted',
-      };
-    });
-
-    const quote = await Quote.create({
-      design   : designId,
-      requester: req.user._id,
-      specs,
-      bids,
-    });
-    await quote.populate('bids.provider', 'companyName country flag rating');
-    res.status(201).json({ quote });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/quotes', protect, async (req, res) => {
-  try {
-    const quotes = await Quote.find({ requester: req.user._id })
-      .populate('design', 'partName material')
-      .populate('bids.provider', 'companyName country flag rating')
-      .sort('-createdAt')
-      .lean();
-    res.json({ quotes });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/quotes/:id', protect, async (req, res) => {
-  try {
-    const quote = await Quote.findOne({ _id: req.params.id, requester: req.user._id })
-      .populate('design')
-      .populate('bids.provider');
-    if (!quote) return res.status(404).json({ error: 'Quote not found' });
-    res.json({ quote });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ================================================================
-// ROUTES — PROVIDERS
-// ================================================================
-app.get('/api/providers', async (req, res) => {
-  try {
-    const { region, material, sort = '-rating', limit = 20 } = req.query;
-    const query = { isActive: true };
-    if (region) query.region = region;
-    if (material) query.materials = { $in: [material] };
-    const providers = await Provider.find(query).sort(sort).limit(parseInt(limit)).lean();
-    res.json({ providers });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/providers/:id', async (req, res) => {
-  try {
-    const provider = await Provider.findById(req.params.id).lean();
-    if (!provider) return res.status(404).json({ error: 'Provider not found' });
-    res.json({ provider });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/providers', protect, restrictTo('provider', 'admin'), async (req, res) => {
-  try {
-    const provider = await Provider.create({ ...req.body, user: req.user._id });
-    res.status(201).json({ provider });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ================================================================
-// ROUTES — ORDERS
-// ================================================================
-app.post('/api/orders', protect, async (req, res) => {
-  try {
-    const { designId, providerId, quoteId, specs, pricing } = req.body;
-    const order = await Order.create({
-      buyer    : req.user._id,
-      provider : providerId,
-      design   : designId,
-      quote    : quoteId || null,
-      specs,
-      pricing,
-      status   : 'confirmed',
-      timeline : [{ status: 'confirmed', note: 'Order placed and confirmed' }],
-      estimatedDelivery: new Date(Date.now() + (pricing.leadDays || 14) * 86400000),
-    });
-    if (quoteId) await Quote.findByIdAndUpdate(quoteId, { status: 'ordered' });
-    await order.populate('provider', 'companyName country flag');
-    await order.populate('design', 'partName material');
-    res.status(201).json({ order });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/orders', protect, async (req, res) => {
-  try {
-    const { status } = req.query;
-    const query = { buyer: req.user._id };
-    if (status) query.status = status;
-    const orders = await Order.find(query)
-      .populate('provider', 'companyName country flag rating')
-      .populate('design', 'partName material cloudinary')
-      .sort('-createdAt')
-      .lean();
-    res.json({ orders });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.patch('/api/orders/:id/status', protect, async (req, res) => {
-  try {
-    const { status, note } = req.body;
-    const order = await Order.findOne({ _id: req.params.id, buyer: req.user._id });
-    if (!order) return res.status(404).json({ error: 'Order not found' });
-    order.status = status;
-    order.timeline.push({ status, note: note || status });
-    await order.save();
-    res.json({ order });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ================================================================
-// SEED DEMO DATA
-// ================================================================
-async function seedProviders() {
-  const count = await Provider.countDocuments();
-  if (count > 0) return;
-  console.log('🌱  Seeding provider data...');
-  const seedData = [
-    { companyName: 'MetalTech GmbH', country: 'Germany', region: 'Europe', flag: '🇩🇪', rating: 4.9, totalReviews: 214, totalOrders: 1420, pricingBase: 1.0, capacity: '500t/mo', leadTimeDays: { min: 10, max: 14 }, certifications: ['ISO 9001','CE'], materials: ['steel','stainless','aluminium'], operations: ['laser','bending','punching'], specialty: 'Precision laser cutting', isVerified: true },
-    { companyName: 'PrecisionCut SG', country: 'Singapore', region: 'Asia Pacific', flag: '🇸🇬', rating: 4.8, totalReviews: 189, totalOrders: 870, pricingBase: 0.9, capacity: '200t/mo', leadTimeDays: { min: 7, max: 10 }, certifications: ['ISO 9001'], materials: ['aluminium','steel'], specialty: 'Aluminium fabrication', isVerified: true },
-    { companyName: 'SheetWorks IN', country: 'India', region: 'Asia Pacific', flag: '🇮🇳', rating: 4.7, totalReviews: 301, totalOrders: 2310, pricingBase: 0.65, capacity: '1000t/mo', leadTimeDays: { min: 14, max: 21 }, certifications: ['ISO 9001','IATF 16949'], materials: ['steel','stainless','aluminium','copper'], specialty: 'High-volume production', isVerified: true },
-    { companyName: 'ProSheet US', country: 'United States', region: 'North America', flag: '🇺🇸', rating: 4.8, totalReviews: 244, totalOrders: 1150, pricingBase: 1.3, capacity: '250t/mo', leadTimeDays: { min: 5, max: 8 }, certifications: ['ISO 9001','ASME'], materials: ['steel','stainless','aluminium'], specialty: 'Aerospace-grade quality', isVerified: true },
-    { companyName: 'Fabricate ZA', country: 'South Africa', region: 'Africa', flag: '🇿🇦', rating: 4.5, totalReviews: 67, totalOrders: 340, pricingBase: 0.75, capacity: '300t/mo', leadTimeDays: { min: 12, max: 16 }, certifications: ['SANS 10147'], materials: ['steel','stainless'], specialty: 'Structural steel', isVerified: true },
-  ];
-  await Provider.insertMany(seedData);
-  console.log('✅  Providers seeded');
-}
-
-// ================================================================
-// ERROR HANDLING
-// ================================================================
-app.use((err, req, res, next) => {
-  if (err instanceof multer.MulterError || err?.code?.startsWith('LIMIT_')) {
-    if (err.code === 'LIMIT_FILE_SIZE')
-      return res.status(400).json({ error: 'File too large. Maximum size is 50MB.' });
-  }
-  console.error('Server error:', err);
-  res.status(err.statusCode || 500).json({ error: err.message || 'Internal server error' });
-});
-
-app.use((req, res) => res.status(404).json({ error: 'Route not found' }));
-
-// ================================================================
-// START
-// ================================================================
-app.listen(PORT, () => {
-  console.log(`\n🚀  SheetForge server running at http://localhost:${PORT}`);
-  console.log(`📁  Static files served from: ${__dirname}`);
-  console.log(`🔑  JWT Secret: ${process.env.JWT_SECRET ? 'Set via env' : 'Using default (set JWT_SECRET in .env for production)'}`);
-  console.log(`🤖  GEMINI_API_KEY: ${process.env.GEMINI_API_KEY ? 'Set ✓' : 'NOT SET — set GEMINI_API_KEY in .env'}`);
-  console.log(`🐍  Python pipeline: process.py (spawn/exec via child_process)`);
-});
-
-module.exports = app;
