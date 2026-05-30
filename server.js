@@ -216,6 +216,7 @@ const designSchema = new mongoose.Schema({
     filename   : String,
     path       : String,       // preview PNG/SVG path
     dxfPath    : String,       // real .DXF file path
+    pdfPath    : String,       // PDF for dwg_main_viewer display
     gcodeFile  : String,       // G-code path from process.py
     gcodeFiles : {             // map of machine type → .nc file path
       laser    : String,
@@ -882,6 +883,11 @@ app.post('/api/convert/:id', protect, async (req, res) => {
     const dxfPath = dwgInfo.localPath || path.join(outputDir, dwgInfo.filename || '');
     const dxfExists = dxfPath && fs.existsSync(dxfPath);
 
+    // Resolve PDF path
+    const pdfFilename = dwgInfo.pdfFilename || '';
+    const pdfPath = pdfFilename ? path.join(outputDir, pdfFilename) : '';
+    const pdfExists = pdfPath && fs.existsSync(pdfPath);
+
     // Write G-code if process.py returned it as a string
     let gcodeFilePath = '';
     if (gcodeStr) {
@@ -923,6 +929,7 @@ app.post('/api/convert/:id', protect, async (req, res) => {
       filename    : dwgInfo.filename   || '',
       path        : previewPath        || dwgInfo.svgFilename || '',
       dxfPath     : dxfExists ? dxfPath : '',
+      pdfPath     : pdfExists ? pdfPath : '',
       gcodeFile   : gcodeFilePath,
       entities    : dwgInfo.entities   || 0,
       fileSize    : dwgInfo.fileSize   || 0,
@@ -935,14 +942,17 @@ app.post('/api/convert/:id', protect, async (req, res) => {
     pushProgress(design._id.toString(), 'complete', {
       message    : 'Conversion complete',
       dxfReady   : dxfExists,
+      pdfReady   : pdfExists,
       gcodeReady : !!gcodeFilePath,
     });
 
     res.json({
       design,
       analysis  : design.aiAnalysis,
-      message   : 'DXF + G-Code conversion complete via OpenCV/Gemini pipeline',
+      message   : 'DXF + PDF + G-Code conversion complete via OpenCV pipeline',
       dxfReady  : dxfExists,
+      pdfReady  : pdfExists,
+      pdfUrl    : pdfExists ? `/api/designs/${design._id}/pdf` : null,
       gcodeReady: !!gcodeFilePath,
       steps     : pyResult.steps || [],
     });
@@ -1030,8 +1040,23 @@ app.get('/api/designs/:id/dxf', protect, async (req, res) => {
 });
 
 // ----------------------------------------------------------------
-// Download G-Code
+// Serve PDF for dwg_main_viewer display
 // ----------------------------------------------------------------
+app.get('/api/designs/:id/pdf', protect, async (req, res) => {
+  try {
+    const design = await Design.findOne({ _id: req.params.id, owner: req.user._id });
+    if (!design?.dwg?.pdfPath) return res.status(404).json({ error: 'PDF not generated yet' });
+    if (!fs.existsSync(design.dwg.pdfPath)) return res.status(404).json({ error: 'PDF file missing on disk' });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${design.partName.replace(/\s+/g,'_')}.pdf"`);
+    res.setHeader('X-Frame-Options', 'SAMEORIGIN');   // allow embedding in iframe on same origin
+    res.sendFile(path.resolve(design.dwg.pdfPath));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
 app.get('/api/designs/:id/gcode', protect, async (req, res) => {
   try {
     const design = await Design.findOne({ _id: req.params.id, owner: req.user._id });
