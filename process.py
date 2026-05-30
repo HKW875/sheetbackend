@@ -76,14 +76,7 @@ def load_image(image_path):
     return img, dpi
 
 
-# ════════════════════════════════════════════════════════════════════════════════
-# PRE-2  Grayscale
-# ════════════════════════════════════════════════════════════════════════════════
 
-def to_grayscale(img):
-    """cv2.cvtColor — BGR → GRAY."""
-    if not HAS_CV or img is None: return None
-    return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -140,42 +133,8 @@ def detect_edges(gray):
     """
     if not HAS_CV or gray is None: return None
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    e1      = cv2.Canny(blurred, 30,  100)
-    e2      = cv2.Canny(blurred, 60,  150)
-    edges   = cv2.bitwise_or(e1, e2)
-    edges   = cv2.dilate(edges, np.ones((2, 2), np.uint8), iterations=1)
+    edges = cv2.Canny(blurred, 50, 150)
     return edges
-
-
-# ════════════════════════════════════════════════════════════════════════════════
-# CV-2  Line detection  →  cv2.HoughLines
-# ════════════════════════════════════════════════════════════════════════════════
-
-def detect_lines(edges):
-    """
-    cv2.HoughLines — standard Hough transform for full-length lines.
-    Returns list of line dicts with angle classification.
-    """
-    if not HAS_CV or edges is None: return []
-    raw = cv2.HoughLines(edges, rho=1, theta=np.pi / 180, threshold=90)
-    if raw is None: return []
-    lines = []
-    for line in raw[:80]:
-        rho, theta = line[0]
-        a, b  = math.cos(theta), math.sin(theta)
-        x0, y0 = a * rho, b * rho
-        x1, y1 = int(x0 + 1200 * (-b)), int(y0 + 1200 * a)
-        x2, y2 = int(x0 - 1200 * (-b)), int(y0 - 1200 * a)
-        ang = math.degrees(theta)
-        lines.append({
-            "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-            "rho": round(float(rho), 2), "theta": round(float(theta), 4),
-            "angle": round(ang, 2),
-            "is_horizontal": abs(ang - 90) < 10,
-            "is_vertical":   abs(ang) < 10 or abs(ang - 180) < 10,
-            "type": "hough",
-        })
-    return lines
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -200,16 +159,6 @@ def detect_circles(gray):
         for c in np.uint16(np.around(raw1[0])):
             found.append({"cx": int(c[0]), "cy": int(c[1]), "r": int(c[2])})
 
-    # Pass 2 — GRADIENT_ALT (better for weak circles)
-    try:
-        raw2 = cv2.HoughCircles(blurred, cv2.HOUGH_GRADIENT_ALT,
-                                dp=1.5, minDist=18,
-                                param1=220, param2=0.82,
-                                minRadius=4, maxRadius=0)
-        if raw2 is not None:
-            for c in np.uint16(np.around(raw2[0])):
-                found.append({"cx": int(c[0]), "cy": int(c[1]), "r": int(c[2])})
-    except Exception: pass
 
     # Deduplicate overlapping detections
     merged = []
@@ -1065,11 +1014,6 @@ def main():
     if detected_dpi > 1: dpi = detected_dpi
     img_h, img_w = (img.shape[:2] if img is not None else (0, 0))
     steps.append(step_record("PRE-1: Image Load", f"{img_w}×{img_h}px @ {dpi:.0f}dpi", t0))
-
-    # PRE-2: Grayscale
-    t0 = now_ms()
-    gray = to_grayscale(img)
-    steps.append(step_record("PRE-2: Grayscale (cvtColor)", "BGR → GRAY", t0))
 
     # PRE-3: Binarise
     t0 = now_ms()
