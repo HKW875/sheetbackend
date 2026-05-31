@@ -5,7 +5,6 @@
  */
 
 require("dotenv").config();
-const mongoose = require('mongoose');
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
@@ -29,10 +28,6 @@ const MONGODB_URI = process.env.MONGODB_URI;
 const DB_NAME = "cnc_sketch_db";
 
 let db, providersCol, chatsCol, scansCol;
-
-// ✅ Correct — only listen on the httpServer (which wraps app)
-const httpServer = require('http').createServer(app);
-const io = require('socket.io')(httpServer);
 
 // ─── Middleware ─────────────────────────────────────────────────────────────
 app.use(cors());
