@@ -38,3 +38,13 @@ torch>=2.0.0
 torchvision>=0.15.0
 # torchaudio is optional — only needed if you use audio features
 # torchaudio>=2.0.0
+
+
+flask==3.0.3
+flask-cors==4.0.1
+requests==2.31.0
+cloudinary==1.40.0
+pymongo==4.7.1
+python-dotenv==1.0.1
+imutils==0.5.4
+
