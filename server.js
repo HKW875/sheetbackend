@@ -30,6 +30,13 @@ const MONGO_URI = process.env.MONGO_URI;
 mongoose.connect(MONGO_URI);
 const DB_NAME = "cnc_sketch_db";
 
+
+const MONGODB_URI = process.env.MONGODB_URI;
+
+mongoose.connect(MONGODB_URI)
+  .then(() => console.log('MongoDB connected'))
+  .catch(err => console.error('Failed to connect to MongoDB:', err.message));
+
 let db, providersCol, chatsCol, scansCol;
 
 app.listen(PORT, () => {
