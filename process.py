@@ -20,7 +20,7 @@ Pipeline stages:
   PDF    Export PDF  →  reportlab
   GCODE  G-Code generation
 """
-
+gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 import sys, os, json, math, time, re, traceback
 from pathlib import Path
 
