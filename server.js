@@ -25,7 +25,8 @@ const io = new Server(server, {
 // ─── Config ────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 const PYTHON_SERVICE = process.env.PYTHON_SERVICE_URL || "http://localhost:5001";
-const MONGODB_URI = process.env.MONGODB_URI || "mongodb://localhost:27017";
+const MONGO_URI = process.env.MONGO_URI;
+mongoose.connect(MONGO_URI);
 const DB_NAME = "cnc_sketch_db";
 
 let db, providersCol, chatsCol, scansCol;
