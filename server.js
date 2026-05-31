@@ -39,8 +39,21 @@ mongoose.connect(MONGODB_URI)
 
 let db, providersCol, chatsCol, scansCol;
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+// ✅ Correct — only listen on the httpServer (which wraps app)
+const httpServer = require('http').createServer(app);
+const io = require('socket.io')(httpServer);
+httpServer.listen(PORT);
+
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`Port ${PORT} is in use. Retrying in 3s...`);
+    setTimeout(() => {
+      server.close();
+      server.listen(PORT);
+    }, 3000);
+  } else {
+    throw err;
+  }
 });
 
 // ─── Middleware ─────────────────────────────────────────────────────────────
