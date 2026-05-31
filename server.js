@@ -5,8 +5,8 @@
  */
 
 require("dotenv").config();
+require('socket.io');
 const express = require("express");
-const socket = require('socket');
 const http = require("http");
 const { Server } = require("socket.io");
 const multer = require("multer");
