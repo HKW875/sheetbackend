@@ -1,610 +1,408 @@
+#!/usr/bin/env python3
 """
-process.py - Sketch Processing Microservice
-Handles: OpenCV preprocessing, color detection, shape/line/handwriting detection,
-DXF generation, PDF generation, and GCode conversion via Gemini.
+SheetForge — CV Pipeline  v6.0
+================================
+Receives: image_path, options_json (from node child_process)
+Outputs:  JSON on stdout  { steps, analysis, dwg, dxfContent, pdfAvailable }
+
+Pipeline (lean, focused):
+  1. Load image            (cv2.imread)
+  2. Gaussian Blur         (cv2.GaussianBlur  — noise reduction)
+  3. Canny Edge Detection  (cv2.Canny)
+  4. DXF Export            (ezdxf — edges as LINE entities)
+  5. PDF Export            (reportlab — edge image rendered to PDF page)
 """
 
-import cv2
-import numpy as np
-import ezdxf
-from ezdxf import colors as dxf_colors
-from ezdxf.enums import TextEntityAlignment
-from reportlab.pdfgen import canvas as pdf_canvas
-from reportlab.lib.pagesizes import A4
-from reportlab.lib import colors as rl_colors
-from PIL import Image
-import io
-import base64
-import json
-import math
-import re
-import os
-import uuid
-import requests
-from flask import Flask, request, jsonify, send_file
-from flask_cors import CORS
-from dotenv import load_dotenv
-import cloudinary
-import cloudinary.uploader
-from pymongo import MongoClient
-from datetime import datetime
-import tempfile
+import sys, os, json, time, traceback
+from pathlib import Path
 
-load_dotenv()
+# ── Graceful optional imports ────────────────────────────────────────────────
+def _try(fn):
+    try: return fn()
+    except Exception: return None
 
-app = Flask(__name__)
-CORS(app)
+cv2           = _try(lambda: __import__("cv2"))
+np            = _try(lambda: __import__("numpy"))
+ezdxf         = _try(lambda: __import__("ezdxf"))
+Image         = _try(lambda: __import__("PIL.Image", fromlist=["Image"]))
+reportlab_mod = _try(lambda: __import__("reportlab"))
 
-# ─── Config ───────────────────────────────────────────────────────────────────
-cloudinary.config(
-    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
-    api_key=os.getenv("CLOUDINARY_API_KEY"),
-    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
-)
+HAS_CV  = cv2 is not None and np is not None
+HAS_DXF = ezdxf is not None
+HAS_PIL = Image is not None
+HAS_RL  = reportlab_mod is not None
 
-mongo_client = MongoClient(os.getenv("MONGODB_URI", "mongodb://localhost:27017"))
-db = mongo_client["cnc_sketch_db"]
-scans_collection = db["scans"]
+def now_ms(): return int(time.time() * 1000)
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={GEMINI_API_KEY}"
-
-OUTPUT_DIR = tempfile.mkdtemp()
-
-# ─── Color detection ranges in HSV ───────────────────────────────────────────
-COLOR_RANGES = {
-    "black": {
-        "lower": np.array([0, 0, 0]),
-        "upper": np.array([180, 255, 50]),
-        "rgb": (0, 0, 0),
-        "dxf_color": 7,
-    },
-    "blue": {
-        "lower": np.array([100, 50, 50]),
-        "upper": np.array([130, 255, 255]),
-        "rgb": (0, 0, 255),
-        "dxf_color": 5,
-    },
-    "red_low": {
-        "lower": np.array([0, 100, 100]),
-        "upper": np.array([10, 255, 255]),
-        "rgb": (255, 0, 0),
-        "dxf_color": 1,
-    },
-    "red_high": {
-        "lower": np.array([160, 100, 100]),
-        "upper": np.array([180, 255, 255]),
-        "rgb": (255, 0, 0),
-        "dxf_color": 1,
-    },
-    "green": {
-        "lower": np.array([40, 50, 50]),
-        "upper": np.array([90, 255, 255]),
-        "rgb": (0, 180, 0),
-        "dxf_color": 3,
-    },
-}
+def step_record(name, details, t0):
+    return {"name": name, "status": "done", "duration": now_ms() - t0, "details": details}
 
 
-# ─── Image Preprocessing ─────────────────────────────────────────────────────
-def preprocess_image(img_array):
+# ════════════════════════════════════════════════════════════════════════════════
+# STEP 1 — LOAD IMAGE
+# ════════════════════════════════════════════════════════════════════════════════
+
+def load_image(image_path):
     """
-    Full preprocessing pipeline:
-    - Denoise while preserving color
-    - Adaptive contrast enhancement
-    - Create masks per color channel
+    Load image with cv2.imread.
+    Returns (bgr, gray, dpi, img_w, img_h).
+    DPI is read from EXIF via Pillow if available; defaults to 96.
     """
-    # Denoise
-    denoised = cv2.fastNlMeansDenoisingColored(img_array, None, 10, 10, 7, 21)
+    if not HAS_CV:
+        raise RuntimeError("OpenCV (cv2) is not installed.")
+    if not image_path or not os.path.exists(image_path):
+        raise FileNotFoundError(f"Image not found: {image_path}")
 
-    # CLAHE on L channel only (preserve colors)
-    lab = cv2.cvtColor(denoised, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    l_clahe = clahe.apply(l)
-    lab_clahe = cv2.merge([l_clahe, a, b])
-    enhanced = cv2.cvtColor(lab_clahe, cv2.COLOR_LAB2BGR)
+    bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    if bgr is None or bgr.size == 0:
+        raise ValueError(f"cv2.imread returned None for: {image_path}")
 
-    # Slight sharpening
-    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
-    sharpened = cv2.filter2D(enhanced, -1, kernel)
+    dpi = 96.0
+    if HAS_PIL:
+        try:
+            pil  = Image.open(str(image_path))
+            xdpi = pil.info.get("dpi", (96, 96))
+            dpi  = float(xdpi[0]) if xdpi and xdpi[0] > 1 else 96.0
+        except Exception:
+            pass
 
-    return sharpened
-
-
-# ─── Color Mask Extraction ────────────────────────────────────────────────────
-def extract_color_masks(img):
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    masks = {}
-
-    # Black
-    mask_black = cv2.inRange(hsv, COLOR_RANGES["black"]["lower"], COLOR_RANGES["black"]["upper"])
-    masks["black"] = mask_black
-
-    # Blue
-    mask_blue = cv2.inRange(hsv, COLOR_RANGES["blue"]["lower"], COLOR_RANGES["blue"]["upper"])
-    masks["blue"] = mask_blue
-
-    # Red (wraps around 180)
-    mask_red1 = cv2.inRange(hsv, COLOR_RANGES["red_low"]["lower"], COLOR_RANGES["red_low"]["upper"])
-    mask_red2 = cv2.inRange(hsv, COLOR_RANGES["red_high"]["lower"], COLOR_RANGES["red_high"]["upper"])
-    masks["red"] = cv2.bitwise_or(mask_red1, mask_red2)
-
-    # Green
-    mask_green = cv2.inRange(hsv, COLOR_RANGES["green"]["lower"], COLOR_RANGES["green"]["upper"])
-    masks["green"] = mask_green
-
-    # Clean up masks
-    kernel = np.ones((3, 3), np.uint8)
-    for key in masks:
-        masks[key] = cv2.morphologyEx(masks[key], cv2.MORPH_CLOSE, kernel)
-        masks[key] = cv2.morphologyEx(masks[key], cv2.MORPH_OPEN, kernel)
-
-    return masks
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    img_h, img_w = bgr.shape[:2]
+    return bgr, gray, dpi, img_w, img_h
 
 
-# ─── Shape Detection ──────────────────────────────────────────────────────────
-def detect_shapes(mask, color_name, img_h, img_w):
+# ════════════════════════════════════════════════════════════════════════════════
+# STEP 2 — GAUSSIAN BLUR
+# ════════════════════════════════════════════════════════════════════════════════
+
+def gaussian_blur(gray, ksize=5, sigma=0):
     """
-    Detect lines, circles, rectangles, arcs from a color mask.
-    Returns list of shape dicts.
+    cv2.GaussianBlur — reduces high-frequency noise before edge detection.
+    ksize must be odd and positive (default 5×5).
+    sigma=0 lets OpenCV auto-calculate from ksize.
+    Returns blurred grayscale image.
     """
-    shapes = []
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < 50:
-            continue
-
-        perimeter = cv2.arcLength(cnt, True)
-        if perimeter == 0:
-            continue
-
-        circularity = 4 * math.pi * area / (perimeter * perimeter)
-        approx = cv2.approxPolyDP(cnt, 0.02 * perimeter, True)
-
-        # Circle detection
-        if circularity > 0.75 and len(approx) > 6:
-            (cx, cy), radius = cv2.minEnclosingCircle(cnt)
-            if radius > 5:
-                shapes.append({
-                    "type": "circle",
-                    "color": color_name,
-                    "cx": float(cx),
-                    "cy": float(cy),
-                    "radius": float(radius),
-                    "area": float(area),
-                })
-            continue
-
-        # Rectangle / polygon detection
-        if len(approx) == 4:
-            x, y, w, h = cv2.boundingRect(approx)
-            shapes.append({
-                "type": "rectangle",
-                "color": color_name,
-                "x": float(x),
-                "y": float(y),
-                "width": float(w),
-                "height": float(h),
-                "area": float(area),
-            })
-            continue
-
-        # Line detection using HoughLinesP on the mask
-    lines_raw = cv2.HoughLinesP(
-        mask, 1, np.pi / 180, threshold=50, minLineLength=30, maxLineGap=15
-    )
-    if lines_raw is not None:
-        for line in lines_raw:
-            x1, y1, x2, y2 = line[0]
-            length = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
-            angle = math.degrees(math.atan2(y2 - y1, x2 - x1))
-            shapes.append({
-                "type": "line",
-                "color": color_name,
-                "x1": float(x1),
-                "y1": float(y1),
-                "x2": float(x2),
-                "y2": float(y2),
-                "length": float(length),
-                "angle": float(angle),
-            })
-
-    return shapes
+    if ksize % 2 == 0:
+        ksize += 1          # enforce odd kernel
+    blurred = cv2.GaussianBlur(gray, (ksize, ksize), sigma)
+    return blurred
 
 
-# ─── Dimension Line Detection ─────────────────────────────────────────────────
-def detect_dimension_lines(shapes):
+# ════════════════════════════════════════════════════════════════════════════════
+# STEP 3 — CANNY EDGE DETECTION
+# ════════════════════════════════════════════════════════════════════════════════
+
+def canny_edges(blurred, low_threshold=50, high_threshold=150):
     """
-    Identify dimension lines: typically short arrows or lines with text nearby.
-    Heuristic: short horizontal/vertical lines with angle ~0 or ~90.
+    cv2.Canny — double-threshold hysteresis edge detector.
+    low_threshold  : weak-edge lower bound  (default 50)
+    high_threshold : strong-edge upper bound (default 150)
+    Returns binary edge map (0 = no edge, 255 = edge).
     """
-    dimension_lines = []
-    for shape in shapes:
-        if shape["type"] == "line":
-            angle = abs(shape.get("angle", 45))
-            length = shape.get("length", 0)
-            # Near-horizontal or near-vertical shorter lines are likely dimension lines
-            if (angle < 15 or angle > 165 or (75 < angle < 105)) and length < 200:
-                dim = shape.copy()
-                dim["type"] = "dimension_line"
-                dim["dimension_value"] = round(length, 1)  # px value; user can override
-                dimension_lines.append(dim)
-    return dimension_lines
+    edges = cv2.Canny(blurred, low_threshold, high_threshold)
+    return edges
 
 
-# ─── Handwriting / Text Region Detection ─────────────────────────────────────
-def detect_handwriting_regions(img, mask_black):
+# ════════════════════════════════════════════════════════════════════════════════
+# STEP 4 — DXF EXPORT  (edge pixels → LINE entities)
+# ════════════════════════════════════════════════════════════════════════════════
+
+def px_to_mm(px, dpi):
+    """Convert pixel coordinate to millimetres."""
+    return round(px * 25.4 / dpi, 4)
+
+
+def build_and_save_dxf(edges, dpi, out_path):
     """
-    Use MSER to find text-like regions on the black mask.
-    Returns bounding boxes of text candidates.
+    Convert Canny edge map to a DXF file using ezdxf.
+
+    Strategy:
+      • Run cv2.findContours on the edge map to get connected edge chains.
+      • Each contour is written as a LWPOLYLINE (lightweight polyline) in the
+        DXF OBJECTS layer — one entity per contour, pixel coords → mm.
+      • Falls back to individual LINE entities if ezdxf is unavailable.
+
+    Returns (doc, entity_count, file_size_bytes).
     """
-    text_regions = []
-    mser = cv2.MSER_create()
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # Only look at regions where black ink exists
-    gray_masked = cv2.bitwise_and(gray, gray, mask=mask_black)
-    _, bboxes = mser.detectRegions(gray_masked)
-    for bbox in bboxes:
-        x, y, w, h = bbox
-        aspect = w / max(h, 1)
-        if 0.1 < aspect < 15 and 8 < h < 80 and w > 5:
-            text_regions.append({
-                "type": "text_region",
-                "x": int(x),
-                "y": int(y),
-                "width": int(w),
-                "height": int(h),
-                "color": "black",
-            })
-    # Deduplicate overlapping boxes
-    text_regions = _dedupe_boxes(text_regions)
-    return text_regions
+    if not HAS_DXF:
+        return None, 0, 0
 
-
-def _dedupe_boxes(regions, iou_thresh=0.5):
-    if not regions:
-        return regions
-    boxes = [(r["x"], r["y"], r["x"] + r["width"], r["y"] + r["height"]) for r in regions]
-    keep = []
-    used = set()
-    for i in range(len(boxes)):
-        if i in used:
-            continue
-        keep.append(regions[i])
-        for j in range(i + 1, len(boxes)):
-            if j in used:
-                continue
-            iou = _compute_iou(boxes[i], boxes[j])
-            if iou > iou_thresh:
-                used.add(j)
-    return keep
-
-
-def _compute_iou(a, b):
-    ax1, ay1, ax2, ay2 = a
-    bx1, by1, bx2, by2 = b
-    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
-    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
-    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-    union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter
-    return inter / max(union, 1)
-
-
-# ─── Full Processing Pipeline ─────────────────────────────────────────────────
-def process_sketch(img_array):
-    h, w = img_array.shape[:2]
-    preprocessed = preprocess_image(img_array)
-    masks = extract_color_masks(preprocessed)
-
-    all_shapes = []
-    for color_name, mask in masks.items():
-        detected = detect_shapes(mask, color_name, h, w)
-        all_shapes.extend(detected)
-
-    dimension_lines = detect_dimension_lines(all_shapes)
-    # Replace generic lines that are dimension lines
-    dim_line_keys = set()
-    for dl in dimension_lines:
-        key = (dl.get("x1"), dl.get("y1"), dl.get("x2"), dl.get("y2"))
-        dim_line_keys.add(key)
-
-    filtered_shapes = [
-        s for s in all_shapes
-        if not (s["type"] == "line" and (s.get("x1"), s.get("y1"), s.get("x2"), s.get("y2")) in dim_line_keys)
-    ]
-    filtered_shapes.extend(dimension_lines)
-
-    text_regions = detect_handwriting_regions(preprocessed, masks.get("black", np.zeros((h, w), np.uint8)))
-
-    return {
-        "image_width": w,
-        "image_height": h,
-        "shapes": filtered_shapes,
-        "text_regions": text_regions,
-        "color_summary": {color: int(np.count_nonzero(m)) for color, m in masks.items()},
-    }
-
-
-# ─── DXF Generation ───────────────────────────────────────────────────────────
-def generate_dxf(shapes, image_width, image_height, scale=1.0):
-    doc = ezdxf.new(dxfversion="R2010")
-    doc.header["$INSUNITS"] = 4  # mm
+    doc = ezdxf.new(dxfversion="R2018")
+    doc.header["$INSUNITS"] = 4   # millimetres
     msp = doc.modelspace()
 
-    # Layers
-    for layer_name, color_code in [("BLACK", 7), ("BLUE", 5), ("RED", 1), ("GREEN", 3), ("DIMENSIONS", 2)]:
-        doc.layers.add(name=layer_name, color=color_code)
+    # Extract contours from the edge map for compact polyline representation
+    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
-    def layer_for(color):
-        return color.upper() if color.upper() in ["BLACK", "BLUE", "RED", "GREEN"] else "BLACK"
+    entity_count = 0
+    h = edges.shape[0]   # image height — used to flip Y so DXF origin = bottom-left
 
-    def flip_y(y):
-        return (image_height - y) * scale
+    for cnt in contours:
+        if len(cnt) < 2:
+            continue
+        # Build mm-coordinate list
+        pts = []
+        for pt in cnt:
+            px_x = int(pt[0][0])
+            px_y = int(pt[0][1])
+            mm_x =  px_to_mm(px_x, dpi)
+            mm_y =  px_to_mm(h - px_y, dpi)   # flip Y axis
+            pts.append((mm_x, mm_y))
 
-    for shape in shapes:
-        color = shape.get("color", "black")
-        layer = layer_for(color)
+        if len(pts) >= 2:
+            msp.add_lwpolyline(pts, dxfattribs={"layer": "EDGES", "color": 7})
+            entity_count += 1
 
-        if shape["type"] == "line":
-            x1 = shape["x1"] * scale
-            y1 = flip_y(shape["y1"])
-            x2 = shape["x2"] * scale
-            y2 = flip_y(shape["y2"])
-            msp.add_line((x1, y1), (x2, y2), dxfattribs={"layer": layer})
-
-        elif shape["type"] == "circle":
-            cx = shape["cx"] * scale
-            cy = flip_y(shape["cy"])
-            r = shape["radius"] * scale
-            msp.add_circle((cx, cy), r, dxfattribs={"layer": layer})
-
-        elif shape["type"] == "rectangle":
-            x = shape["x"] * scale
-            y = flip_y(shape["y"])
-            rw = shape["width"] * scale
-            rh = shape["height"] * scale
-            pts = [(x, y), (x + rw, y), (x + rw, y - rh), (x, y - rh), (x, y)]
-            msp.add_lwpolyline(pts, dxfattribs={"layer": layer})
-
-        elif shape["type"] == "dimension_line":
-            x1 = shape["x1"] * scale
-            y1 = flip_y(shape["y1"])
-            x2 = shape["x2"] * scale
-            y2 = flip_y(shape["y2"])
-            dim_val = shape.get("dimension_value", shape.get("length", 0)) * scale
-            msp.add_linear_dim(
-                base=(x1, y1 - 10),
-                p1=(x1, y1),
-                p2=(x2, y2),
-                dxfattribs={"layer": "DIMENSIONS"},
-            ).render()
-
-    filepath = os.path.join(OUTPUT_DIR, f"sketch_{uuid.uuid4().hex}.dxf")
-    doc.saveas(filepath)
-    return filepath
+    doc.saveas(str(out_path))
+    file_size = out_path.stat().st_size
+    return doc, entity_count, file_size
 
 
-# ─── PDF Generation ───────────────────────────────────────────────────────────
-def generate_pdf(shapes, image_width, image_height, original_img_array=None):
-    filepath = os.path.join(OUTPUT_DIR, f"sketch_{uuid.uuid4().hex}.pdf")
-    page_w, page_h = A4  # 595.27 x 841.89 pt
+# ════════════════════════════════════════════════════════════════════════════════
+# STEP 5 — PDF EXPORT  (edge image → PDF page via reportlab)
+# ════════════════════════════════════════════════════════════════════════════════
 
-    scale_x = page_w / image_width
-    scale_y = page_h / image_height
-    scale = min(scale_x, scale_y) * 0.9
+def export_pdf(edges, dpi, out_path, orig_bgr=None):
+    """
+    Render the Canny edge map (and optionally the original image side-by-side)
+    to a PDF page using reportlab.
 
-    c = pdf_canvas.Canvas(filepath, pagesize=A4)
-    c.setTitle("CNC Sketch Drawing")
+    Layout (A4 landscape):
+      Left half  — original image (if available)
+      Right half — Canny edge map
 
-    # Header
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(20, page_h - 30, "CNC SKETCH — GENERATED DRAWING")
-    c.setFont("Helvetica", 9)
-    c.drawString(20, page_h - 45, f"Image size: {image_width}x{image_height}px  |  Scale: {scale:.4f}")
+    Returns True on success, False on failure.
+    """
+    if not HAS_RL:
+        return False
 
-    color_map = {
-        "black": rl_colors.black,
-        "blue": rl_colors.blue,
-        "red": rl_colors.red,
-        "green": rl_colors.green,
-    }
+    import tempfile, os as _os
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.pdfgen import canvas as rl_canvas
+    from reportlab.lib.utils import ImageReader
 
-    def to_pdf_y(y):
-        return page_h - 60 - (y * scale)
+    try:
+        page_w, page_h = landscape(A4)   # 841.89 × 595.28 pt
+        c = rl_canvas.Canvas(str(out_path), pagesize=(page_w, page_h))
 
-    c.saveState()
-    c.translate(20, 0)
+        margin    = 30
+        col_w     = (page_w - margin * 3) / 2    # two columns
+        col_h     = page_h - margin * 2 - 40     # leave room for title bar
+        top_y     = page_h - margin - 30
 
-    for shape in shapes:
-        color = shape.get("color", "black")
-        c.setStrokeColor(color_map.get(color, rl_colors.black))
-        c.setFillColor(color_map.get(color, rl_colors.black))
-        c.setLineWidth(1.2 if shape["type"] == "dimension_line" else 1.5)
+        # ── Title bar ─────────────────────────────────────────────────────────
+        c.setFillColorRGB(0.04, 0.05, 0.06)
+        c.rect(0, page_h - 36, page_w, 36, fill=1, stroke=0)
+        c.setFillColorRGB(0.9, 0.91, 0.93)
+        c.setFont("Helvetica-Bold", 13)
+        c.drawString(margin, page_h - 24, "SheetForge — Edge Detection Preview")
+        c.setFont("Helvetica", 9)
+        c.setFillColorRGB(0.5, 0.55, 0.6)
+        from datetime import datetime
+        c.drawRightString(page_w - margin, page_h - 24,
+                          f"Generated {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC")
 
-        if shape["type"] in ("line", "dimension_line"):
-            x1 = shape["x1"] * scale
-            y1 = to_pdf_y(shape["y1"])
-            x2 = shape["x2"] * scale
-            y2 = to_pdf_y(shape["y2"])
-            c.line(x1, y1, x2, y2)
-            if shape["type"] == "dimension_line":
-                c.setStrokeColor(rl_colors.HexColor("#FF6600"))
-                mid_x = (x1 + x2) / 2
-                mid_y = (y1 + y2) / 2
-                c.setFont("Helvetica", 7)
-                c.setFillColor(rl_colors.HexColor("#FF6600"))
-                dim_val = shape.get("dimension_value", shape.get("length", 0))
-                c.drawString(mid_x, mid_y + 3, f"{dim_val:.1f}")
+        # Helper: save numpy array as temp PNG and return an ImageReader
+        def _arr_to_reader(arr):
+            import tempfile
+            tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+            tmp.close()
+            cv2.imwrite(tmp.name, arr)
+            return ImageReader(tmp.name), tmp.name
 
-        elif shape["type"] == "circle":
-            cx = shape["cx"] * scale
-            cy = to_pdf_y(shape["cy"])
-            r = shape["radius"] * scale
-            c.circle(cx, cy, r, stroke=1, fill=0)
-            c.setFont("Helvetica", 7)
-            c.setFillColor(rl_colors.HexColor("#0066CC"))
-            c.drawString(cx + r + 2, cy, f"⌀{shape['radius'] * 2:.1f}")
+        tmp_files = []
 
-        elif shape["type"] == "rectangle":
-            x = shape["x"] * scale
-            y = to_pdf_y(shape["y"])
-            rw = shape["width"] * scale
-            rh = shape["height"] * scale
-            c.rect(x, y - rh, rw, rh, stroke=1, fill=0)
+        # ── Left panel: original image (if provided) ──────────────────────────
+        left_x = margin
+        if orig_bgr is not None:
+            reader, tname = _arr_to_reader(orig_bgr)
+            tmp_files.append(tname)
+            _draw_panel(c, reader, left_x, margin, col_w, col_h, "Original Image")
+        else:
+            c.setFillColorRGB(0.08, 0.1, 0.13)
+            c.roundRect(left_x, margin, col_w, col_h, 6, fill=1, stroke=0)
+            c.setFillColorRGB(0.35, 0.4, 0.45)
+            c.setFont("Helvetica", 10)
+            c.drawCentredString(left_x + col_w / 2, margin + col_h / 2, "No original image")
 
-    c.restoreState()
+        # ── Right panel: edge map ──────────────────────────────────────────────
+        right_x = margin * 2 + col_w
+        # Convert single-channel edge map to 3-channel for saving as PNG
+        edges_bgr = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
+        reader, tname = _arr_to_reader(edges_bgr)
+        tmp_files.append(tname)
+        _draw_panel(c, reader, right_x, margin, col_w, col_h, "Canny Edge Detection")
 
-    # Legend
-    c.setFont("Helvetica-Bold", 9)
-    c.drawString(20, 50, "Legend:")
-    legend_items = [("Black lines", rl_colors.black), ("Blue lines", rl_colors.blue),
-                    ("Red lines", rl_colors.red), ("Green lines", rl_colors.green)]
-    for i, (label, clr) in enumerate(legend_items):
-        c.setFillColor(clr)
-        c.rect(100 + i * 100, 48, 8, 8, fill=1)
-        c.setFillColor(rl_colors.black)
+        # ── Footer ────────────────────────────────────────────────────────────
+        c.setFillColorRGB(0.3, 0.35, 0.4)
         c.setFont("Helvetica", 8)
-        c.drawString(112 + i * 100, 50, label)
+        c.drawCentredString(page_w / 2, 12,
+                            "SheetForge v6.0  •  OpenCV Canny  •  ezdxf R2018")
 
-    c.save()
-    return filepath
+        c.save()
+
+        # Clean up temp PNGs
+        for f in tmp_files:
+            try: _os.unlink(f)
+            except Exception: pass
+
+        return True
+
+    except Exception as e:
+        sys.stderr.write(f"PDF export error: {e}\n{traceback.format_exc()}\n")
+        return False
 
 
-# ─── GCode via Gemini ─────────────────────────────────────────────────────────
-def generate_gcode_from_dxf(dxf_filepath, material="mild steel", thickness_mm=1.0):
-    with open(dxf_filepath, "r") as f:
-        dxf_content = f.read()[:8000]  # limit tokens
+def _draw_panel(c, img_reader, x, y, w, h, title):
+    """Draw a labelled image panel onto the reportlab canvas."""
+    from reportlab.lib.utils import ImageReader
 
-    prompt = f"""
-You are a CNC GCode expert for sheet metal cutting (laser/plasma).
-Convert the following DXF drawing data into optimized GCode for a CNC sheet metal cutting machine.
-Material: {material}, Thickness: {thickness_mm}mm.
-Include: tool paths, lead-in/lead-out, feed rates, safe Z height, start/end sequences.
-Return ONLY raw GCode, no explanations.
+    title_h = 22
+    img_y   = y + title_h
+    img_h   = h - title_h
 
-DXF DATA:
-{dxf_content}
-"""
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 4096},
+    # Panel background
+    c.setFillColorRGB(0.08, 0.1, 0.13)
+    c.roundRect(x, y, w, h, 6, fill=1, stroke=0)
+
+    # Title strip
+    c.setFillColorRGB(0.12, 0.15, 0.2)
+    c.roundRect(x, y + img_h, w, title_h, 6, fill=1, stroke=0)
+    c.setFillColorRGB(0.55, 0.65, 0.85)
+    c.setFont("Helvetica-Bold", 9)
+    c.drawCentredString(x + w / 2, y + img_h + 7, title)
+
+    # Draw image scaled to fit panel with 8 px padding
+    pad  = 8
+    iw_  = w - pad * 2
+    ih_  = img_h - pad * 2
+    c.drawImage(img_reader, x + pad, img_y + pad,
+                width=iw_, height=ih_, preserveAspectRatio=True, anchor="c",
+                mask="auto")
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# MAIN ENTRY POINT
+# ════════════════════════════════════════════════════════════════════════════════
+
+def main():
+    # ── Parse args ────────────────────────────────────────────────────────────
+    image_path = sys.argv[1] if len(sys.argv) > 1 else None
+    opts       = {}
+    if len(sys.argv) > 2:
+        try: opts = json.loads(sys.argv[2])
+        except Exception: pass
+
+    # Pipeline tuning via opts (all have sensible defaults)
+    blur_ksize      = int(opts.get("blurKsize",      5))
+    canny_low       = int(opts.get("cannyLow",       50))
+    canny_high      = int(opts.get("cannyHigh",     150))
+
+    steps = []
+
+    # ── STEP 1: Load ──────────────────────────────────────────────────────────
+    t0 = now_ms()
+    bgr, gray, dpi, img_w, img_h = load_image(image_path)
+    steps.append(step_record(
+        "CV-1: Load Image (cv2.imread)",
+        f"{img_w}×{img_h}px  DPI={dpi:.0f}",
+        t0
+    ))
+
+    # ── STEP 2: Gaussian Blur ─────────────────────────────────────────────────
+    t0 = now_ms()
+    blurred = gaussian_blur(gray, ksize=blur_ksize)
+    steps.append(step_record(
+        f"CV-2: Gaussian Blur (kernel {blur_ksize}×{blur_ksize})",
+        f"Noise reduced — σ auto from ksize",
+        t0
+    ))
+
+    # ── STEP 3: Canny Edge Detection ──────────────────────────────────────────
+    t0 = now_ms()
+    edges = canny_edges(blurred, canny_low, canny_high)
+    edge_px = int(np.count_nonzero(edges))
+    steps.append(step_record(
+        f"CV-3: Canny Edge Detection (low={canny_low}, high={canny_high})",
+        f"{edge_px} edge pixels detected",
+        t0
+    ))
+
+    # ── Output directories ────────────────────────────────────────────────────
+    server_out_dir = Path(__file__).parent.parent / "uploads" / "output"
+    server_out_dir.mkdir(parents=True, exist_ok=True)
+
+    ts_str   = int(time.time())
+    dxf_name = f"design_{ts_str}.dxf"
+    pdf_name = f"design_{ts_str}.pdf"
+    dxf_path = server_out_dir / dxf_name
+    pdf_path = server_out_dir / pdf_name
+
+    # ── STEP 4: DXF Export ────────────────────────────────────────────────────
+    t0 = now_ms()
+    doc, entity_count, file_size = build_and_save_dxf(edges, dpi, dxf_path)
+    dxf_str = ""
+    if file_size > 0:
+        try:
+            with open(dxf_path) as f: dxf_str = f.read()
+        except Exception: pass
+    steps.append(step_record(
+        "DXF: Export edge contours (ezdxf R2018 LWPOLYLINE)",
+        f"{entity_count} polyline entities  {file_size // 1024 if file_size else 0} KB",
+        t0
+    ))
+
+    # ── STEP 5: PDF Export ────────────────────────────────────────────────────
+    t0 = now_ms()
+    pdf_ok = export_pdf(edges, dpi, pdf_path, orig_bgr=bgr)
+    steps.append(step_record(
+        "PDF: Export edge preview (reportlab A4 landscape)",
+        "OK" if pdf_ok else "FAILED — check reportlab install",
+        t0
+    ))
+
+    # ── Analysis summary ──────────────────────────────────────────────────────
+    scale_px_mm  = dpi / 25.4                          # px per mm
+    width_mm     = round(img_w / scale_px_mm, 2)
+    height_mm    = round(img_h / scale_px_mm, 2)
+
+    analysis = {
+        "width"       : width_mm,
+        "height"      : height_mm,
+        "dpi"         : dpi,
+        "edgePixels"  : edge_px,
+        "blurKsize"   : blur_ksize,
+        "cannyLow"    : canny_low,
+        "cannyHigh"   : canny_high,
+        "imgW"        : img_w,
+        "imgH"        : img_h,
     }
-    resp = requests.post(GEMINI_URL, json=payload, timeout=60)
-    if resp.status_code == 200:
-        result = resp.json()
-        gcode = result["candidates"][0]["content"]["parts"][0]["text"]
-        return gcode
-    else:
-        return f"; GCode generation failed: {resp.text}"
 
-
-# ─── Routes ───────────────────────────────────────────────────────────────────
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok", "service": "sketch-processor"})
-
-
-@app.route("/process", methods=["POST"])
-def process():
-    """Main endpoint: receive image, process, return shapes + upload to Cloudinary."""
-    if "image" not in request.files:
-        return jsonify({"error": "No image provided"}), 400
-
-    file = request.files["image"]
-    img_bytes = file.read()
-    np_arr = np.frombuffer(img_bytes, np.uint8)
-    img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-
-    if img is None:
-        return jsonify({"error": "Could not decode image"}), 400
-
-    # Upload original to Cloudinary
-    cloudinary_result = cloudinary.uploader.upload(
-        img_bytes,
-        folder="cnc_sketches",
-        public_id=f"sketch_{uuid.uuid4().hex}",
-        resource_type="image",
-    )
-    cloudinary_url = cloudinary_result.get("secure_url", "")
-    public_id = cloudinary_result.get("public_id", "")
-
-    # Process
-    result = process_sketch(img)
-
-    # Save to MongoDB
-    doc = {
-        "cloudinary_url": cloudinary_url,
-        "cloudinary_public_id": public_id,
-        "created_at": datetime.utcnow(),
-        "image_width": result["image_width"],
-        "image_height": result["image_height"],
-        "shape_count": len(result["shapes"]),
-        "color_summary": result["color_summary"],
-    }
-    inserted = scans_collection.insert_one(doc)
-
-    return jsonify({
-        "scan_id": str(inserted.inserted_id),
-        "cloudinary_url": cloudinary_url,
-        "shapes": result["shapes"],
-        "text_regions": result["text_regions"],
-        "image_width": result["image_width"],
-        "image_height": result["image_height"],
-        "color_summary": result["color_summary"],
-    })
-
-
-@app.route("/generate-dxf", methods=["POST"])
-def api_generate_dxf():
-    data = request.json
-    shapes = data.get("shapes", [])
-    w = data.get("image_width", 800)
-    h = data.get("image_height", 600)
-    scale = float(data.get("scale", 0.1))  # px to mm
-
-    filepath = generate_dxf(shapes, w, h, scale)
-    return send_file(filepath, as_attachment=True, download_name="drawing.dxf", mimetype="application/dxf")
-
-
-@app.route("/generate-pdf", methods=["POST"])
-def api_generate_pdf():
-    data = request.json
-    shapes = data.get("shapes", [])
-    w = data.get("image_width", 800)
-    h = data.get("image_height", 600)
-
-    filepath = generate_pdf(shapes, w, h)
-    return send_file(filepath, as_attachment=True, download_name="drawing.pdf", mimetype="application/pdf")
-
-
-@app.route("/generate-gcode", methods=["POST"])
-def api_generate_gcode():
-    data = request.json
-    shapes = data.get("shapes", [])
-    w = data.get("image_width", 800)
-    h = data.get("image_height", 600)
-    material = data.get("material", "mild steel")
-    thickness = float(data.get("thickness", 1.0))
-
-    # Generate DXF first, then send to Gemini
-    dxf_path = generate_dxf(shapes, w, h, scale=0.1)
-    gcode = generate_gcode_from_dxf(dxf_path, material, thickness)
-
-    gcode_path = os.path.join(OUTPUT_DIR, f"gcode_{uuid.uuid4().hex}.nc")
-    with open(gcode_path, "w") as f:
-        f.write(gcode)
-
-    return send_file(gcode_path, as_attachment=True, download_name="output.nc", mimetype="text/plain")
-
-
-@app.route("/scans", methods=["GET"])
-def get_scans():
-    scans = list(scans_collection.find({}, {"_id": 0}).sort("created_at", -1).limit(20))
-    return jsonify(scans)
+    # ── Output ────────────────────────────────────────────────────────────────
+    print(json.dumps({
+        "steps"        : steps,
+        "analysis"     : analysis,
+        "dwg": {
+            "entities"   : entity_count,
+            "fileSize"   : file_size,
+            "filename"   : dxf_name if file_size else "",
+            "pdfFilename": pdf_name if pdf_ok else "",
+        },
+        "dxfContent"   : dxf_str[:50000] if dxf_str else "",   # cap at 50 KB for stdout
+        "dxfAvailable" : file_size > 0,
+        "pdfAvailable" : pdf_ok,
+    }, ensure_ascii=False))
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5001, debug=False)
+    try:
+        main()
+    except Exception as e:
+        print(json.dumps({
+            "error"    : str(e),
+            "traceback": traceback.format_exc(),
+            "steps"    : [],
+            "analysis" : {},
+            "dwg"      : {"entities": 0, "fileSize": 0},
+        }))
+        sys.exit(1)
