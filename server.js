@@ -11,14 +11,12 @@
  *   Quotes     POST /api/quotes, GET /api/quotes, GET /api/quotes/:id
  *   Providers  GET /api/providers, GET /api/providers/:id
  *   Orders     POST /api/orders, GET /api/orders, PATCH /api/orders/:id
- *   Progress   WS  /ws?token=<jwt>&designId=<id>  (WebSocket real-time progress stream)
+ *   Progress   GET /api/convert/:id/progress  (SSE real-time progress stream)
  */
 
 require('dotenv').config();
 
 const express       = require('express');
-const http          = require('http');
-const { WebSocketServer, WebSocket } = require('ws');
 const mongoose      = require('mongoose');
 const cors          = require('cors');
 const morgan        = require('morgan');
@@ -31,76 +29,8 @@ const fs            = require('fs');
 const { promisify } = require('util');
 const { spawn, exec } = require('child_process');
 
-const app    = express();
-const server = http.createServer(app);
-const PORT   = process.env.PORT || 5000;
-
-// ================================================================
-// WEBSOCKET SERVER — native ws, no Socket.IO
-// ================================================================
-
-const wss = new WebSocketServer({ server, path: '/ws' });
-
-// Map: designId → Set<WebSocket>
-const wsClients = new Map();
-
-wss.on('connection', (ws, req) => {
-  // Expect: /ws?token=<jwt>&designId=<id>
-  const params   = new URL(req.url, 'http://localhost').searchParams;
-  const token    = params.get('token');
-  const designId = params.get('designId');
-
-  if (!token || !designId) {
-    ws.close(1008, 'Missing token or designId');
-    return;
-  }
-
-  // Verify JWT
-  let userId;
-  try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'sheetforge_jwt_secret_2026');
-    userId = decoded.id;
-  } catch (_) {
-    ws.close(1008, 'Invalid token');
-    return;
-  }
-
-  // Register client for this designId
-  if (!wsClients.has(designId)) wsClients.set(designId, new Set());
-  wsClients.get(designId).add(ws);
-  console.log(`[WS] Client connected — designId=${designId} userId=${userId}`);
-
-  // Send buffered steps for this job if any
-  const job = activeJobs.get(designId);
-  if (job?.steps?.length) {
-    for (const step of job.steps) {
-      try { ws.send(JSON.stringify(step)); } catch (_) {}
-    }
-  }
-
-  // Heartbeat ping every 20 s
-  const heartbeat = setInterval(() => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.ping();
-    }
-  }, 20000);
-
-  ws.on('pong', () => { /* connection alive */ });
-
-  ws.on('close', () => {
-    clearInterval(heartbeat);
-    const set = wsClients.get(designId);
-    if (set) {
-      set.delete(ws);
-      if (set.size === 0) wsClients.delete(designId);
-    }
-    console.log(`[WS] Client disconnected — designId=${designId}`);
-  });
-
-  ws.on('error', (err) => {
-    console.error(`[WS] Error — designId=${designId}:`, err.message);
-  });
-});
+const app  = express();
+const PORT = process.env.PORT || 5000;
 
 // Debug logging for all requests
 app.use((req, res, next) => {
@@ -437,7 +367,7 @@ const protect = async (req, res, next) => {
   if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
     token = req.headers.authorization.split(' ')[1];
   } 
-  // 2. FALLBACK FIX: Check query parameters for WebSocket token passthrough compatibility
+  // 2. FALLBACK FIX: Check query parameters for EventSource (SSE) compatibility
   else if (req.query && req.query.token) {
     token = req.query.token;
   }
@@ -592,30 +522,65 @@ function execProcessPy(imagePath, opts = {}) {
 }
 
 // ================================================================
-// WS PROGRESS — in-memory store for active conversion jobs
+// SSE PROGRESS — in-memory store for active conversion jobs
 // ================================================================
 
-const activeJobs = new Map(); // designId → { steps: Array }
+// ================================================================
+// SSE PROGRESS STREAM — MATCHING FRONTEND DEMAND
+// ================================================================
+app.get('/api/convert/:id/progress', async (req, res) => {
+  const designId = req.params.id;
 
-/**
- * Broadcast a progress message to all WebSocket clients watching designId.
- * Also buffers the step so late-connecting clients can catch up.
- */
-function pushProgress(designId, event, data) {
-  const id = designId.toString();
-  if (!activeJobs.has(id)) activeJobs.set(id, { steps: [] });
-  const job = activeJobs.get(id);
-
-  const payload = JSON.stringify({ event, ...data, ts: Date.now() });
-  job.steps.push(JSON.parse(payload));
-
-  const clients = wsClients.get(id);
-  if (!clients) return;
-  for (const ws of clients) {
-    if (ws.readyState === WebSocket.OPEN) {
-      try { ws.send(payload); } catch (_) {}
-    }
+  // Establish SSE Header configs
+  const sseOrigin = req.headers.origin;
+  const sseHeaders = {
+    'Content-Type':  'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection':    'keep-alive',
+  };
+  if (sseOrigin && ALLOWED_ORIGINS.includes(sseOrigin)) {
+    sseHeaders['Access-Control-Allow-Origin']      = sseOrigin;
+    sseHeaders['Access-Control-Allow-Credentials'] = 'true';
   }
+  res.writeHead(200, sseHeaders);
+  res.write('\n');
+
+  // Register this response handle into your global progress registry
+  if (!global.progressClients) {
+    global.progressClients = {};
+  }
+  if (!global.progressClients[designId]) {
+    global.progressClients[designId] = [];
+  }
+  
+  global.progressClients[designId].push(res);
+  console.log(`[SSE Connected] Progress listener attached for design: ${designId}`);
+
+  // Keep connection alive with a periodic heartbeat ping
+  const heartbeat = setInterval(() => {
+    res.write(':\n\n');
+  }, 15000);
+
+  // Clean up if user closes page or disconnects browser tab
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    if (global.progressClients[designId]) {
+      global.progressClients[designId] = global.progressClients[designId].filter(client => client !== res);
+    }
+    console.log(`[SSE Disconnected] Progress listener removed for design: ${designId}`);
+  });
+});
+
+const activeJobs = new Map(); // designId → { clients: Set<res>, steps: Array }
+
+function pushProgress(designId, event, data) {
+  const job = activeJobs.get(designId);
+  if (!job) return;
+  const payload = `data: ${JSON.stringify({ event, ...data })}\n\n`;
+  for (const client of job.clients) {
+    try { client.write(payload); } catch (_) {}
+  }
+  job.steps.push({ event, ...data, ts: Date.now() });
 }
 
 
@@ -793,6 +758,63 @@ app.delete('/api/designs/:id', protect, async (req, res) => {
 });
 
 // ================================================================
+// ROUTES — SSE PROGRESS STREAM
+// ================================================================
+
+/**
+ * GET /api/convert/:id/progress
+ * Server-Sent Events stream for real-time conversion progress.
+ * The frontend EventSource connects here before calling POST /api/convert/:id.
+ */
+app.get('/api/convert/:id/progress', protect, (req, res) => {
+  const designId = req.params.id;
+
+  res.setHeader('Content-Type',  'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection',    'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');  // disable nginx buffering
+  res.flushHeaders();
+
+  // Register client
+  if (!activeJobs.has(designId)) {
+    activeJobs.set(designId, { clients: new Set(), steps: [] });
+  }
+  const job = activeJobs.get(designId);
+  job.clients.add(res);
+
+  // Send any buffered steps already recorded
+  for (const step of job.steps) {
+    res.write(`data: ${JSON.stringify(step)}\n\n`);
+  }
+
+  // Heartbeat every 15s so the connection stays alive through firewalls
+  const heartbeat = setInterval(() => {
+    try { res.write(': heartbeat\n\n'); } catch (_) {}
+  }, 15000);
+
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    job.clients.delete(res);
+    if (job.clients.size === 0) {
+      // Keep steps buffer for late pollers but remove after 5 min
+      setTimeout(() => activeJobs.delete(designId), 5 * 60 * 1000);
+    }
+  });
+});
+
+// ================================================================
+// ROUTES — AI CONVERSION (orchestrates process.py)
+// ================================================================
+
+/**
+ * POST /api/convert/:id
+ * Full pipeline:
+ *   1. Mark design as analyzing
+ *   2. Call process.py via child_process.spawn (streams progress via SSE)
+ *   3. Parse JSON output — analysis, DXF path, G-code
+ *   4. Save results to MongoDB
+ */
+// ================================================================
 // ROUTES — AI CONVERSION (orchestrates process.py)
 // ================================================================
 app.post('/api/convert/:id', protect, async (req, res) => {
@@ -836,7 +858,7 @@ app.post('/api/convert/:id', protect, async (req, res) => {
       },
     };
 
-    // Step 2: Call process.py via spawn — stream steps to WS clients
+    // Step 2: Call process.py via spawn — stream steps to SSE clients
     // FIXED: Using the fully resolved absolute 'filePath' here safely
     const pyResult = await runProcessPy(filePath, opts, (event, message) => {
       pushProgress(design._id.toString(), event, { message });
@@ -981,7 +1003,7 @@ app.get('/api/convert/:id/status', protect, async (req, res) => {
   try {
     const design = await Design.findOne({ _id: req.params.id, owner: req.user._id }).lean();
     if (!design) return res.status(404).json({ error: 'Not found' });
-    // Also return buffered WS steps if still in activeJobs
+    // Also return buffered SSE steps if still in activeJobs
     const job   = activeJobs.get(req.params.id);
     const steps = job ? job.steps : [];
     res.json({ status: design.status, aiAnalysis: design.aiAnalysis, dwg: design.dwg, steps });
@@ -1032,6 +1054,46 @@ app.get('/api/designs/:id/preview', protect, async (req, res) => {
     if (!design?.dwg?.path) return res.status(404).json({ error: 'Preview not available' });
     if (!fs.existsSync(design.dwg.path)) return res.status(404).json({ error: 'Preview file missing' });
     res.sendFile(design.dwg.path);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ----------------------------------------------------------------
+// Preview inline — returns SVG/PNG as base64 data-URI + metadata
+// so the frontend can display it directly in dwg-main-viewer
+// without CORS / cookie issues.
+// ----------------------------------------------------------------
+app.get('/api/designs/:id/preview-inline', protect, async (req, res) => {
+  try {
+    const design = await Design.findOne({ _id: req.params.id, owner: req.user._id });
+    if (!design) return res.status(404).json({ error: 'Design not found' });
+
+    // Prefer SVG preview, fall back to DXF path (raw text)
+    const previewPath = design.dwg?.path || design.dwg?.dxfPath;
+    if (!previewPath || !fs.existsSync(previewPath)) {
+      return res.status(404).json({ error: 'Preview file not yet generated' });
+    }
+
+    const ext      = path.extname(previewPath).toLowerCase();
+    const rawBytes = fs.readFileSync(previewPath);
+    const b64      = rawBytes.toString('base64');
+
+    let mimeType;
+    if      (ext === '.svg') mimeType = 'image/svg+xml';
+    else if (ext === '.png') mimeType = 'image/png';
+    else if (ext === '.jpg' || ext === '.jpeg') mimeType = 'image/jpeg';
+    else                     mimeType = 'application/octet-stream';
+
+    res.json({
+      dataUri   : `data:${mimeType};base64,${b64}`,
+      mimeType,
+      ext       : ext.slice(1),
+      filename  : path.basename(previewPath),
+      analysis  : design.aiAnalysis  || {},
+      dwg       : design.dwg         || {},
+      partName  : design.partName,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1296,9 +1358,8 @@ app.use((req, res) => res.status(404).json({ error: 'Route not found' }));
 // ================================================================
 // START
 // ================================================================
-server.listen(PORT, () => {
+app.listen(PORT, () => {
   console.log(`\n🚀  SheetForge server running at http://localhost:${PORT}`);
-  console.log(`🔌  WebSocket endpoint: ws://localhost:${PORT}/ws?token=<jwt>&designId=<id>`);
   console.log(`📁  Static files served from: ${__dirname}`);
   console.log(`🔑  JWT Secret: ${process.env.JWT_SECRET ? 'Set via env' : 'Using default (set JWT_SECRET in .env for production)'}`);
   console.log(`🤖  GEMINI_API_KEY: ${process.env.GEMINI_API_KEY ? 'Set ✓' : 'NOT SET — set GEMINI_API_KEY in .env'}`);
