@@ -1,8 +1,9 @@
-# SheetForge v6 — Python Dependencies
-# Focused pipeline: load → Gaussian blur → Canny edges → DXF + PDF
+# SheetForge v7 — Python Dependencies
+# Pipeline: medianBlur → adaptiveThreshold → MORPH_OPEN → Canny → approxPolyDP → DXF + PDF
 
 # Core Computer Vision
-opencv-python==4.11.0.86
+# Use headless variant for server/Render deployment (no GUI/display dependencies)
+opencv-contrib-python-headless==4.11.0.86
 numpy>=2.4.4
 
 # DXF Export
@@ -11,5 +12,5 @@ ezdxf==1.4.4
 # PDF Export
 reportlab>=4.2.0
 
-# Optional: DPI / EXIF reading from uploaded images
+# EXIF/DPI reading from uploaded images
 Pillow==12.2.0
