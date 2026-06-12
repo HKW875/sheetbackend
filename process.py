@@ -572,11 +572,12 @@ def main():
             "entities"        : entity_count,
             "fileSize"        : file_size,
             "filename"        : dxf_name if file_size else "",
+            "localPath"       : str(dxf_path) if file_size else "",   # absolute path for server-side download
             "pdfFilename"     : pdf_name if pdf_ok else "",
             "edgePngFilename" : png_name if png_ok else "",
             "edgePngPath"     : str(png_path) if png_ok else "",
         },
-        "dxfContent"   : dxf_str[:50000] if dxf_str else "",   # cap at 50 KB
+        "dxfContent"   : dxf_str if dxf_str else "",   # full DXF text for client-side download
         "dxfAvailable" : file_size > 0,
         "pdfAvailable" : pdf_ok,
         "pngAvailable" : png_ok,
