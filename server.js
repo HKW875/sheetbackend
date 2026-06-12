@@ -953,6 +953,8 @@ app.post('/api/convert/:id', protect, async (req, res) => {
       // so loadConvertedDesignIntoViewer can populate APP.currentDwgData correctly
       extractedData : extractedData,
       edgePixels  : analysis.edgePixels || 0,
+      // Pass full DXF text for client-side download (avoids Render ephemeral disk issues)
+      dxfContent  : pyResult.dxfContent || '',
       message     : 'DXF + preview conversion complete via OpenCV pipeline',
       dxfReady    : dxfExists,
       previewReady: !!previewPath,
