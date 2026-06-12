@@ -847,7 +847,7 @@ def main():
         f"{len(simplified_contours)} contours  |  {total_pts} vertices", t0))
 
     # ── Output dir ────────────────────────────────────────────────────────────
-    server_out_dir = Path(__file__).parent.parent / "uploads" / "output"
+    server_out_dir = Path(__file__).parent / "uploads" / "output"
     server_out_dir.mkdir(parents=True, exist_ok=True)
 
     ts_str    = int(time.time())
@@ -953,6 +953,7 @@ def main():
             "entities"        : entity_count,
             "fileSize"        : merged_size,
             "filename"        : merged_dxf_name if merged_size else "",
+            "dxfAbsPath"      : str(merged_dxf_path) if merged_size else "",
             "rawDxfFilename"  : raw_dxf_name if raw_size else "",
             "pdfFilename"     : pdf_name if pdf_ok else "",
             "edgePngFilename" : png_name if png_ok else "",
