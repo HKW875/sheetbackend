@@ -887,12 +887,21 @@ app.post('/api/convert/:id', protect, async (req, res) => {
       (dwgInfo.edgePngFilename ? path.join(outputDir, dwgInfo.edgePngFilename) : '');
     const previewPath = edgePngPath && fs.existsSync(edgePngPath) ? edgePngPath : '';
 
-    // Write G-code if process.py returned it as a string
+    // v8: process.py writes one .nc per machine type.
+    // dwgInfo.gcodeFilePaths = { laser: '/abs/path/x.nc', ... }
+    // dwgInfo.gcodeFiles     = { laser: 'filename.nc', ... }
+    const gcodeFilePaths = dwgInfo.gcodeFilePaths || {};
+    const gcodeFilenames = dwgInfo.gcodeFiles     || {};
+
+    // Backward-compat: also support old single gcodeFile string
     let gcodeFilePath = '';
     if (gcodeStr) {
-      const gcFname    = `${design.partName.replace(/\s+/g,'_')}_${Date.now()}.nc`;
-      gcodeFilePath    = path.join(outputDir, gcFname);
+      const gcFname = `${design.partName.replace(/\s+/g,'_')}_${Date.now()}.nc`;
+      gcodeFilePath = path.join(outputDir, gcFname);
       fs.writeFileSync(gcodeFilePath, gcodeStr, 'utf8');
+    } else if (Object.keys(gcodeFilePaths).length > 0) {
+      // Pick laser as primary, fall back to first available
+      gcodeFilePath = gcodeFilePaths.laser || Object.values(gcodeFilePaths)[0] || '';
     } else if (dwgInfo.gcodeFilename) {
       gcodeFilePath = path.join(outputDir, dwgInfo.gcodeFilename);
     }
@@ -928,10 +937,14 @@ app.post('/api/convert/:id', protect, async (req, res) => {
 
     design.dwg = {
       filename    : dwgInfo.filename   || '',
-      // FIX BUG 2: path now correctly points to the PNG preview file
       path        : previewPath,
       dxfPath     : dxfExists ? dxfPath : '',
+      // Primary gcode file (laser, or first available)
       gcodeFile   : gcodeFilePath,
+      // Per-machine gcode file paths (absolute) — keyed by machine type
+      gcodeFiles  : gcodeFilePaths,
+      // Per-machine gcode filenames — keyed by machine type (for download route)
+      gcodeFilenames: gcodeFilenames,
       entities    : dwgInfo.entities   || 0,
       fileSize    : dwgInfo.fileSize   || 0,
       generatedAt : new Date(),
@@ -948,18 +961,17 @@ app.post('/api/convert/:id', protect, async (req, res) => {
 
     res.json({
       design,
-      analysis    : design.aiAnalysis,
-      // FIX BUG 3: pass extracted_data and raw analysis through to frontend
-      // so loadConvertedDesignIntoViewer can populate APP.currentDwgData correctly
+      analysis      : design.aiAnalysis,
       extractedData : extractedData,
-      edgePixels  : analysis.edgePixels || 0,
-      // Pass full DXF text for client-side download (avoids Render ephemeral disk issues)
-      dxfContent  : pyResult.dxfContent || '',
-      message     : 'DXF + preview conversion complete via OpenCV pipeline',
-      dxfReady    : dxfExists,
-      previewReady: !!previewPath,
-      gcodeReady  : !!gcodeFilePath,
-      steps       : pyResult.steps || [],
+      edgePixels    : analysis.edgePixels || 0,
+      message       : 'DXF + preview conversion complete via OpenCV pipeline',
+      dxfReady      : dxfExists,
+      previewReady  : !!previewPath,
+      gcodeReady    : !!gcodeFilePath,
+      // v8: per-machine gcode filenames for the frontend download buttons
+      gcodeFiles    : gcodeFilenames,
+      gcodeAvailable: Object.keys(gcodeFilePaths).length > 0,
+      steps         : pyResult.steps || [],
     });
 
   } catch (err) {
@@ -1045,15 +1057,71 @@ app.get('/api/designs/:id/dxf', protect, async (req, res) => {
 });
 
 // ----------------------------------------------------------------
-// Download G-Code
+// Download G-Code — list available machine files
+// GET /api/designs/:id/gcode  → JSON map of machine → filename
 // ----------------------------------------------------------------
 app.get('/api/designs/:id/gcode', protect, async (req, res) => {
   try {
     const design = await Design.findOne({ _id: req.params.id, owner: req.user._id });
-    if (!design?.dwg?.gcodeFile) return res.status(404).json({ error: 'G-Code not generated yet. Run conversion first.' });
-    const gcPath = design.dwg.gcodeFile;
-    if (!fs.existsSync(gcPath)) return res.status(404).json({ error: 'G-Code file missing on disk' });
-    const fname = `${design.partName.replace(/\s+/g,'_')}.nc`;
+    if (!design) return res.status(404).json({ error: 'Design not found' });
+
+    const gcodeFilePaths = design.dwg?.gcodeFiles  || {};
+    const gcodeFilenames = design.dwg?.gcodeFilenames || {};
+
+    // Legacy single file
+    if (!Object.keys(gcodeFilePaths).length && design.dwg?.gcodeFile) {
+      gcodeFilePaths['laser'] = design.dwg.gcodeFile;
+    }
+
+    if (!Object.keys(gcodeFilePaths).length)
+      return res.status(404).json({ error: 'G-Code not generated yet. Run conversion first.' });
+
+    // Return availability map
+    const available = {};
+    for (const [machine, fpath] of Object.entries(gcodeFilePaths)) {
+      available[machine] = {
+        filename : gcodeFilenames[machine] || path.basename(fpath),
+        exists   : fs.existsSync(fpath),
+        sizeKb   : fs.existsSync(fpath) ? Math.ceil(fs.statSync(fpath).size / 1024) : 0,
+      };
+    }
+    res.json({ available });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ----------------------------------------------------------------
+// Download G-Code — per machine type
+// GET /api/designs/:id/gcode/:machine
+// :machine = laser | plasma | waterjet | oxyfuel | mill | router
+// ----------------------------------------------------------------
+app.get('/api/designs/:id/gcode/:machine', protect, async (req, res) => {
+  try {
+    const { machine } = req.params;
+    const VALID_MACHINES = ['laser','plasma','waterjet','oxyfuel','mill','router'];
+    if (!VALID_MACHINES.includes(machine))
+      return res.status(400).json({ error: `Unknown machine type: ${machine}` });
+
+    const design = await Design.findOne({ _id: req.params.id, owner: req.user._id });
+    if (!design) return res.status(404).json({ error: 'Design not found' });
+
+    const gcodeFilePaths = design.dwg?.gcodeFiles || {};
+    const gcodeFilenames = design.dwg?.gcodeFilenames || {};
+
+    // Resolve path: prefer per-machine map, fall back to legacy single file for laser
+    let gcPath = gcodeFilePaths[machine] || '';
+    if (!gcPath && machine === 'laser' && design.dwg?.gcodeFile)
+      gcPath = design.dwg.gcodeFile;
+
+    if (!gcPath)
+      return res.status(404).json({ error: `G-Code for ${machine} not generated yet.` });
+    if (!fs.existsSync(gcPath))
+      return res.status(404).json({ error: `G-Code file missing on disk: ${path.basename(gcPath)}` });
+
+    const partSlug = design.partName.replace(/\s+/g,'_');
+    const fname    = gcodeFilenames[machine] || `${partSlug}_${machine}.nc`;
+
     res.setHeader('Content-Type', 'text/plain');
     res.setHeader('Content-Disposition', `attachment; filename="${fname}"`);
     res.sendFile(path.resolve(gcPath));
