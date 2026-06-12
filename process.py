@@ -332,11 +332,13 @@ def main():
     server_out_dir = Path(__file__).parent.parent / "uploads" / "output"
     server_out_dir.mkdir(parents=True, exist_ok=True)
 
-    ts_str   = int(time.time())
-    dxf_name = f"design_{ts_str}.dxf"
-    pdf_name = f"design_{ts_str}.pdf"
-    dxf_path = server_out_dir / dxf_name
-    pdf_path = server_out_dir / pdf_name
+    ts_str    = int(time.time())
+    dxf_name  = f"design_{ts_str}.dxf"
+    pdf_name  = f"design_{ts_str}.pdf"
+    png_name  = f"preview_{ts_str}.png"
+    dxf_path  = server_out_dir / dxf_name
+    pdf_path  = server_out_dir / pdf_name
+    png_path  = server_out_dir / png_name
 
     # ── STEP 4: DXF Export ────────────────────────────────────────────────────
     t0 = now_ms()
@@ -361,6 +363,31 @@ def main():
         t0
     ))
 
+    # ── STEP 6: PNG Preview Export ────────────────────────────────────────────
+    # Save the Canny edge map as a PNG so the frontend can display it directly
+    # in #dwg-main-viewer via the /preview-inline endpoint.
+    # We write white edges on a dark (#0a0c0f) background to match the UI theme.
+    t0 = now_ms()
+    png_ok   = False
+    png_size = 0
+    try:
+        # Create a dark-background RGB canvas and paint edges white on it
+        preview_canvas = np.zeros((img_h, img_w, 3), dtype=np.uint8)
+        preview_canvas[:] = (15, 12, 10)          # BGR equivalent of #0a0c0f
+        edge_mask = edges > 0
+        preview_canvas[edge_mask] = (255, 255, 255)  # white edges
+        cv2.imwrite(str(png_path), preview_canvas)
+        if png_path.exists():
+            png_ok   = True
+            png_size = png_path.stat().st_size
+    except Exception as png_err:
+        sys.stderr.write(f"PNG preview export error: {png_err}\n")
+    steps.append(step_record(
+        "PNG: Save Canny edge preview for viewer",
+        f"OK — {png_size // 1024 if png_size else 0} KB" if png_ok else "FAILED",
+        t0
+    ))
+
     # ── Analysis summary ──────────────────────────────────────────────────────
     scale_px_mm  = dpi / 25.4                          # px per mm
     width_mm     = round(img_w / scale_px_mm, 2)
@@ -371,6 +398,7 @@ def main():
         "height"      : height_mm,
         "dpi"         : dpi,
         "edgePixels"  : edge_px,
+        "edges"       : entity_count,   # matches server.js analysis.edges field
         "blurKsize"   : blur_ksize,
         "cannyLow"    : canny_low,
         "cannyHigh"   : canny_high,
@@ -383,14 +411,17 @@ def main():
         "steps"        : steps,
         "analysis"     : analysis,
         "dwg": {
-            "entities"   : entity_count,
-            "fileSize"   : file_size,
-            "filename"   : dxf_name if file_size else "",
-            "pdfFilename": pdf_name if pdf_ok else "",
+            "entities"      : entity_count,
+            "fileSize"      : file_size,
+            "filename"      : dxf_name if file_size else "",
+            "pdfFilename"   : pdf_name if pdf_ok else "",
+            "edgePngFilename": png_name if png_ok else "",
+            "edgePngPath"   : str(png_path) if png_ok else "",
         },
         "dxfContent"   : dxf_str[:50000] if dxf_str else "",   # cap at 50 KB for stdout
         "dxfAvailable" : file_size > 0,
         "pdfAvailable" : pdf_ok,
+        "pngAvailable" : png_ok,
     }, ensure_ascii=False))
 
 
