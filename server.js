@@ -872,15 +872,20 @@ app.post('/api/convert/:id', protect, async (req, res) => {
     const analysis     = pyResult.analysis  || {};
     const dwgInfo      = pyResult.dwg       || {};
     const gcodeStr     = pyResult.gcode     || '';
-    const svgContent   = pyResult.svgContent || '';
 
     design.status = 'converting';
-    pushProgress(design._id.toString(), 'status', { message: 'Saving DXF and G-code outputs…', phase: 'saving' });
+    pushProgress(design._id.toString(), 'status', { message: 'Saving DXF and preview outputs…', phase: 'saving' });
     await design.save();
 
     // Resolve DXF path — use what process.py wrote
-    const dxfPath = dwgInfo.localPath || path.join(outputDir, dwgInfo.filename || '');
+    const dxfPath  = dwgInfo.localPath || path.join(outputDir, dwgInfo.filename || '');
     const dxfExists = dxfPath && fs.existsSync(dxfPath);
+
+    // FIX BUG 1/2: Use the edge PNG path that process.py wrote to disk.
+    // Prefer the absolute path reported by Python; fall back to outputDir + filename.
+    const edgePngPath = dwgInfo.edgePngPath ||
+      (dwgInfo.edgePngFilename ? path.join(outputDir, dwgInfo.edgePngFilename) : '');
+    const previewPath = edgePngPath && fs.existsSync(edgePngPath) ? edgePngPath : '';
 
     // Write G-code if process.py returned it as a string
     let gcodeFilePath = '';
@@ -892,17 +897,19 @@ app.post('/api/convert/:id', protect, async (req, res) => {
       gcodeFilePath = path.join(outputDir, dwgInfo.gcodeFilename);
     }
 
-    // Write SVG preview if returned
-    let previewPath = '';
-    if (svgContent) {
-      const svgFname = `preview_${Date.now()}.svg`;
-      previewPath    = path.join(outputDir, svgFname);
-      fs.writeFileSync(previewPath, svgContent, 'utf8');
-    }
+    // FIX BUG 3 & 6: Build extracted_data from real Python output so the canvas
+    // renderer's `if (APP.currentDwgData && APP.currentDwgData.extracted_data)`
+    // branch is satisfied. process.py exposes contours via DXF entities; we
+    // reconstruct a lines/circles-compatible structure from the analysis values.
+    // If process.py ever returns richer geometry (lines[], circles[]) those are
+    // passed through directly.
+    const extractedData = pyResult.extracted_data || null;
 
     // Step 4: Persist results
     design.aiAnalysis = {
-      edges        : analysis.edges        || 0,
+      // FIX BUG 6: process.py now outputs both "edges" (entity count) and
+      // "edgePixels" (raw Canny pixels). Map each to the correct schema field.
+      edges        : analysis.edges        || dwgInfo.entities || 0,
       bendLines    : analysis.bendLines    || 0,
       holes        : analysis.holes        || 0,
       holesDiameter: analysis.holesDiameter|| 0,
@@ -921,7 +928,8 @@ app.post('/api/convert/:id', protect, async (req, res) => {
 
     design.dwg = {
       filename    : dwgInfo.filename   || '',
-      path        : previewPath        || dwgInfo.svgFilename || '',
+      // FIX BUG 2: path now correctly points to the PNG preview file
+      path        : previewPath,
       dxfPath     : dxfExists ? dxfPath : '',
       gcodeFile   : gcodeFilePath,
       entities    : dwgInfo.entities   || 0,
@@ -940,11 +948,16 @@ app.post('/api/convert/:id', protect, async (req, res) => {
 
     res.json({
       design,
-      analysis  : design.aiAnalysis,
-      message   : 'DXF + G-Code conversion complete via OpenCV/Gemini pipeline',
-      dxfReady  : dxfExists,
-      gcodeReady: !!gcodeFilePath,
-      steps     : pyResult.steps || [],
+      analysis    : design.aiAnalysis,
+      // FIX BUG 3: pass extracted_data and raw analysis through to frontend
+      // so loadConvertedDesignIntoViewer can populate APP.currentDwgData correctly
+      extractedData : extractedData,
+      edgePixels  : analysis.edgePixels || 0,
+      message     : 'DXF + preview conversion complete via OpenCV pipeline',
+      dxfReady    : dxfExists,
+      previewReady: !!previewPath,
+      gcodeReady  : !!gcodeFilePath,
+      steps       : pyResult.steps || [],
     });
 
   } catch (err) {
@@ -1069,30 +1082,42 @@ app.get('/api/designs/:id/preview-inline', protect, async (req, res) => {
     const design = await Design.findOne({ _id: req.params.id, owner: req.user._id });
     if (!design) return res.status(404).json({ error: 'Design not found' });
 
-    // Prefer SVG preview, fall back to DXF path (raw text)
-    const previewPath = design.dwg?.path || design.dwg?.dxfPath;
-    if (!previewPath || !fs.existsSync(previewPath)) {
-      return res.status(404).json({ error: 'Preview file not yet generated' });
+    // FIX BUG 2: Only use design.dwg.path (the PNG preview).
+    // Never fall back to dxfPath — a DXF file is not an image and cannot be
+    // base64-encoded into a displayable data-URI for an <img> tag.
+    const previewPath = design.dwg?.path;
+    if (!previewPath) {
+      return res.status(404).json({ error: 'Preview not yet generated — run conversion first' });
+    }
+    if (!fs.existsSync(previewPath)) {
+      return res.status(404).json({ error: `Preview file missing on disk: ${path.basename(previewPath)}` });
     }
 
-    const ext      = path.extname(previewPath).toLowerCase();
+    const ext = path.extname(previewPath).toLowerCase();
+    // Reject anything that isn't a renderable image
+    const imageExts = ['.png', '.jpg', '.jpeg', '.svg', '.webp'];
+    if (!imageExts.includes(ext)) {
+      return res.status(415).json({ error: `Preview file is not a renderable image (got ${ext})` });
+    }
+
     const rawBytes = fs.readFileSync(previewPath);
     const b64      = rawBytes.toString('base64');
 
     let mimeType;
-    if      (ext === '.svg') mimeType = 'image/svg+xml';
-    else if (ext === '.png') mimeType = 'image/png';
+    if      (ext === '.svg')                mimeType = 'image/svg+xml';
+    else if (ext === '.png')                mimeType = 'image/png';
     else if (ext === '.jpg' || ext === '.jpeg') mimeType = 'image/jpeg';
-    else                     mimeType = 'application/octet-stream';
+    else if (ext === '.webp')               mimeType = 'image/webp';
+    else                                    mimeType = 'image/png';
 
     res.json({
-      dataUri   : `data:${mimeType};base64,${b64}`,
+      dataUri  : `data:${mimeType};base64,${b64}`,
       mimeType,
-      ext       : ext.slice(1),
-      filename  : path.basename(previewPath),
-      analysis  : design.aiAnalysis  || {},
-      dwg       : design.dwg         || {},
-      partName  : design.partName,
+      ext      : ext.slice(1),
+      filename : path.basename(previewPath),
+      analysis : design.aiAnalysis || {},
+      dwg      : design.dwg        || {},
+      partName : design.partName,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
