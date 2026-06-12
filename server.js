@@ -1134,18 +1134,26 @@ app.post('/api/cloud/save/:id', protect, async (req, res) => {
     if (design.status !== 'approved')
       return res.status(400).json({ error: 'Design must be approved before saving to cloud' });
 
-    // Use DXF path or SVG preview — process.py handles both
-    const assetPath = design.dwg?.dxfPath || design.dwg?.path;
-    if (!assetPath || !fs.existsSync(assetPath))
-      return res.status(400).json({ error: 'Processed design file not found' });
+    // Prefer the PNG edge preview for Cloudinary (image resource_type).
+    // Fall back to DXF (raw resource_type) if PNG is unavailable.
+    const pngPath = design.dwg?.path;
+    const dxfPath = design.dwg?.dxfPath;
+    const assetPath = (pngPath && fs.existsSync(pngPath)) ? pngPath
+                    : (dxfPath && fs.existsSync(dxfPath)) ? dxfPath
+                    : null;
+    if (!assetPath)
+      return res.status(400).json({ error: 'Processed design file not found (no PNG preview or DXF on disk)' });
+
+    const isPng = assetPath.endsWith('.png') || assetPath.endsWith('.jpg') || assetPath.endsWith('.jpeg');
 
     const { assetName, folder, tags } = req.body;
     const publicId = `${folder || 'sheetforge/designs'}/${assetName || design.partName.replace(/\s+/g, '_')}_${Date.now()}`;
 
     const result = await cloudinary.uploader.upload(assetPath, {
       public_id      : publicId,
-      resource_type  : 'raw',   // DXF/SVG are raw assets
-      tags           : tags ? tags.split(',').map(t => t.trim()) : ['sheetforge', 'cad', 'dxf'],
+      resource_type  : isPng ? 'image' : 'raw',   // PNG → image; DXF → raw
+      format         : isPng ? 'png' : undefined,  // enforce PNG format for images
+      tags           : tags ? tags.split(',').map(t => t.trim()) : ['sheetforge', 'cad', 'edges'],
       context        : `part=${design.partName}|material=${design.material || ''}|owner=${req.user.email}`,
     });
 
