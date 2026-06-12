@@ -434,7 +434,7 @@ function runProcessPy(imagePath, opts = {}, onStep = null) {
     const args    = [scriptPath, imagePath, JSON.stringify(opts)];
     // Use python3 explicitly — 'python' may map to Python 2 on some systems.
     // Replace the spawn part with this more robust version:
-    const py = spawn('python', args, {
+    const py = spawn('python3', args, {
       env: {
         ...process.env,
         GEMINI_API_KEY: process.env.GEMINI_API_KEY || '',
@@ -877,8 +877,9 @@ app.post('/api/convert/:id', protect, async (req, res) => {
     pushProgress(design._id.toString(), 'status', { message: 'Saving DXF and preview outputs…', phase: 'saving' });
     await design.save();
 
-    // Resolve DXF path — use what process.py wrote
-    const dxfPath  = dwgInfo.localPath || path.join(outputDir, dwgInfo.filename || '');
+    // Resolve DXF path — prefer absolute path emitted by process.py,
+    // fall back to constructing it from outputDir + filename.
+    const dxfPath  = dwgInfo.dxfAbsPath || (dwgInfo.filename ? path.join(outputDir, dwgInfo.filename) : '');
     const dxfExists = dxfPath && fs.existsSync(dxfPath);
 
     // FIX BUG 1/2: Use the edge PNG path that process.py wrote to disk.
