@@ -92,7 +92,7 @@ def gaussian_blur(gray, ksize=5, sigma=0):
 # STEP 3 — CANNY EDGE DETECTION
 # ════════════════════════════════════════════════════════════════════════════════
 
-def canny_edges(blurred, low_threshold=50, high_threshold=250):
+def canny_edges(blurred, low_threshold=50, high_threshold=150):
     """
     cv2.Canny — double-threshold hysteresis edge detector.
     low_threshold  : weak-edge lower bound  (default 50)
