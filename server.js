@@ -214,8 +214,12 @@ const designSchema = new mongoose.Schema({
   },
   dwg         : {
     filename   : String,
-    path       : String,       // preview PNG/SVG path
+    path       : String,       // refined drawing PNG path (View Drawing)
     dxfPath    : String,       // real .DXF file path
+    refinedPngPath : String,   // explicit refined-shape PNG path
+    refinedShapes  : Number,
+    refinedCircles : Number,
+    refinedRects   : Number,
     gcodeFile  : String,       // G-code path from process.py
     gcodeFiles : {             // map of machine type → .nc file path
       laser    : String,
@@ -842,10 +846,16 @@ app.post('/api/convert/:id', protect, async (req, res) => {
     const mat   = design.material  || 'Mild Steel';
     const thick = design.thickness || 2;
 
+    // Accept shape-filter params from the conversion request body
+    const minShapeSize     = parseFloat(req.body?.minShapeSize     || 0);
+    const filterDescription = (req.body?.filterDescription || '').trim();
+
     const opts = {
       material  : mat,
       thickness : thick,
       dpi       : 96,
+      minShapeSize,
+      filterDescription,
       gcodeOptions: {
         feedRate    : 1000,
         plungeRate  : 300,
@@ -940,6 +950,7 @@ app.post('/api/convert/:id', protect, async (req, res) => {
       filename    : dwgInfo.filename   || '',
       path        : previewPath,
       dxfPath     : dxfExists ? dxfPath : '',
+      refinedPngPath : (dwgInfo.edgePngPath && fs.existsSync(dwgInfo.edgePngPath)) ? dwgInfo.edgePngPath : previewPath,
       // Primary gcode file (laser, or first available)
       gcodeFile   : gcodeFilePath,
       // Per-machine gcode file paths (absolute) — keyed by machine type
@@ -948,6 +959,9 @@ app.post('/api/convert/:id', protect, async (req, res) => {
       gcodeFilenames: gcodeFilenames,
       entities    : dwgInfo.entities   || 0,
       fileSize    : dwgInfo.fileSize   || 0,
+      refinedShapes  : dwgInfo.refinedShapes  || 0,
+      refinedCircles : dwgInfo.refinedCircles || 0,
+      refinedRects   : dwgInfo.refinedRects   || 0,
       generatedAt : new Date(),
     };
 
@@ -1195,9 +1209,50 @@ app.get('/api/designs/:id/preview-inline', protect, async (req, res) => {
   }
 });
 
-// ================================================================
-// ROUTES — CLOUDINARY SAVE
-// ================================================================
+// ----------------------------------------------------------------
+// Refined drawing PNG — base64 data-URI for "View Drawing" button
+// Returns the refined shape PNG (circles + rects) from Step 9.
+// Falls back to the Canny edge PNG if the refined PNG is unavailable.
+// ----------------------------------------------------------------
+app.get('/api/designs/:id/drawing-png', protect, async (req, res) => {
+  try {
+    const design = await Design.findOne({ _id: req.params.id, owner: req.user._id });
+    if (!design) return res.status(404).json({ error: 'Design not found' });
+
+    // Prefer the refined PNG stored in dwg.path; fall back to edgePngPath
+    const candidates = [
+      design.dwg?.refinedPngPath,
+      design.dwg?.path,
+    ].filter(Boolean);
+
+    let pngPath = '';
+    for (const p of candidates) {
+      if (fs.existsSync(p)) { pngPath = p; break; }
+    }
+
+    if (!pngPath) {
+      return res.status(404).json({ error: 'Drawing PNG not generated yet — run conversion first' });
+    }
+
+    const rawBytes = fs.readFileSync(pngPath);
+    const b64      = rawBytes.toString('base64');
+    res.json({
+      dataUri  : `data:image/png;base64,${b64}`,
+      mimeType : 'image/png',
+      filename : path.basename(pngPath),
+      analysis : design.aiAnalysis || {},
+      dwg      : design.dwg        || {},
+      partName : design.partName,
+      refinedShapes  : design.dwg?.refinedShapes  || 0,
+      refinedCircles : design.dwg?.refinedCircles || 0,
+      refinedRects   : design.dwg?.refinedRects   || 0,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
 app.post('/api/cloud/save/:id', protect, async (req, res) => {
   try {
     const design = await Design.findOne({ _id: req.params.id, owner: req.user._id });
