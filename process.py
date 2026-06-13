@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SheetForge — CV Pipeline  v9.0
+SheetForge — CV Pipeline  v8.0
 ================================
 Receives: image_path, options_json (from node child_process)
 Outputs:  JSON on stdout  { steps, analysis, dwg, dxfContent, pdfAvailable }
@@ -11,19 +11,13 @@ Pipeline (precision contour → CAD → CNC):
   3. Adaptive Threshold      (cv2.adaptiveThreshold — binarisation, lines=WHITE)
   4. Morph Clean             (cv2.morphologyEx MORPH_OPEN — speckle removal)
   5. Canny Edge Detection    (cv2.Canny — thin precise edges)
-  6. Skeleton Centerline     (NEW — rasterise DXF LWPOLYLINEs → 1-px skeleton;
-                              eliminates double-traced contour bands so that
-                              findContours returns a single centerline per edge)
-     6a. Close 1-px gaps     (cv2.dilate 3×3 → bridge sub-pixel breaks)
-     6b. Zhang-Suen thin     (cv2.ximgproc.thinning — single-pixel skeleton)
-     6c. findContours        (on skeleton → RETR_LIST / CHAIN_APPROX_TC89_L1)
-     6d. Douglas-Peucker     (cv2.approxPolyDP ε=2 px — simplify vertices)
-     6e. Noise / open filter (drop fragments < MIN_SKEL_PTS; discard open chains)
-  7. DXF Export — RAW        (ezdxf — one LWPOLYLINE per closed centerline contour)
-  8. DXF Merge + Heal        (chain-stitch fragmented segments → closed LWPOLYLINE)
-  9. G-Code Generation       (one .nc file per CNC machine type, from merged DXF)
+  6. Contour Extraction      (cv2.findContours → cv2.approxPolyDP simplification)
+  7. DXF Export — RAW        (ezdxf — raw contours, one LWPOLYLINE per contour)
+  8. DXF Merge + Heal        (NEW — chain-stitch fragmented segments into closed
+                              LWPOLYLINE contours; output is the download DXF)
+  9. G-Code Generation       (NEW — one .nc file per CNC machine type, from merged DXF)
  10. PDF Export              (reportlab — edge image rendered to PDF page)
- 11. PNG Preview             (dark-bg canvas with white skeleton — saved as .png)
+ 11. PNG Preview             (dark-bg canvas with white edges — saved as .png)
 """
 
 import sys, os, json, time, traceback, math
@@ -121,117 +115,24 @@ def canny_edges(cleaned, low_threshold=30, high_threshold=100):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# STEP 6 — SKELETON CENTERLINE  (replaces old approxPolyDP-only step)
-#
-# Problem: Canny + findContours on raw Canny output returns two parallel
-# contours (inner + outer edge of each 2-3 px Canny band). The result is a
-# doubled DXF where every physical edge is drawn twice.
-#
-# Fix (per-pixel approach, no DXF round-trip needed):
-#   6a. Close 1-px gaps  — dilate Canny output with a 3×3 kernel so hairline
-#       breaks in the edge image are bridged before thinning.
-#   6b. Zhang-Suen thin  — cv2.ximgproc.thinning() reduces every band to a
-#       single-pixel-wide skeleton (medial axis). Falls back to iterative
-#       morphological thinning when ximgproc is unavailable.
-#   6c. findContours     — run on the 1-px skeleton; RETR_LIST returns one
-#       chain per connected component with no inner/outer duplication.
-#   6d. Douglas-Peucker  — approxPolyDP with ε=2 px compresses vertices while
-#       preserving corner geometry.
-#   6e. Noise/open filter — fragments shorter than MIN_SKEL_PTS are noise;
-#       open chains (start ≠ end) are dropped so only closed loops survive
-#       into the DXF.  The closed flag uses CLOSE_GAP_PX tolerance so a
-#       nearly-closed chain is snapped shut automatically.
+# STEP 6 — CONTOUR EXTRACTION + approxPolyDP
 # ════════════════════════════════════════════════════════════════════════════════
 
-# Tuning constants
-DP_EPSILON_PX  = 2.0   # Douglas-Peucker simplification (drawing units = px)
-MIN_SKEL_PTS   = 4     # minimum vertices after DP; shorter chains = noise
-CLOSE_GAP_PX   = 4.0   # if chain start-end ≤ this, auto-close the polyline
-
-
-def _zhang_suen_thin(binary):
-    """
-    Reduce a binary image to a 1-px skeleton.
-    Uses cv2.ximgproc.thinning() (Zhang-Suen, available in opencv-contrib).
-    Falls back to repeated cv2.morphologyEx(MORPH_ERODE) thinning if contrib
-    is not present (slower but functionally equivalent for our use-case).
-    """
-    # ximgproc.thinning expects uint8 with 0/255 values
-    src = binary.copy()
-    src[src > 0] = 255
-
-    try:
-        thin = cv2.ximgproc.thinning(src, thinningType=cv2.ximgproc.THINNING_ZHANGSUEN)
-        return thin
-    except AttributeError:
-        pass  # ximgproc not available; use fallback
-
-    # Morphological thinning fallback
-    k    = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
-    prev = src.copy()
-    for _ in range(40):           # max 40 erosion passes
-        eroded = cv2.erode(prev, k)
-        delta  = cv2.subtract(prev, eroded)
-        skel   = cv2.bitwise_or(delta, prev)
-        prev   = eroded
-        if cv2.countNonZero(eroded) == 0:
-            break
-    return skel
-
-
-def skeletonize_edges(edges):
-    """
-    Step 6a-6b: close 1-px gaps then thin Canny output to a 1-px skeleton.
-    Returns the skeleton image (uint8, same shape as edges).
-    """
-    # 6a — close hairline gaps with a single 3×3 dilation pass
-    k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    closed  = cv2.dilate(edges, k_close, iterations=1)
-
-    # 6b — Zhang-Suen / morphological thinning
-    skeleton = _zhang_suen_thin(closed)
-    return skeleton
-
-
-def extract_centerline_contours(skeleton, img_h):
-    """
-    Steps 6c-6e: findContours on 1-px skeleton → Douglas-Peucker ε=2 px →
-    discard noise and open chains → return list of (approx_array, is_closed).
-
-    Only CLOSED contours (or nearly-closed within CLOSE_GAP_PX) are kept;
-    open fragments are treated as noise and discarded.
-    """
-    # 6c — find contours on the skeleton
+def extract_simplified_contours(edges, epsilon_factor=0.5):
     contours, _ = cv2.findContours(
-        skeleton, cv2.RETR_LIST, cv2.CHAIN_APPROX_TC89_L1,
+        edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE,
     )
-
-    results = []
+    simplified = []
     for cnt in contours:
         if len(cnt) < 2:
             continue
-
-        # 6d — Douglas-Peucker with fixed ε=2 px
-        approx = cv2.approxPolyDP(cnt, DP_EPSILON_PX, closed=True)
-
-        if len(approx) < MIN_SKEL_PTS:
-            continue   # 6e — noise fragment: too few vertices
-
-        # 6e — determine closure: compare start and end in image coords
-        p0 = approx[0][0]
-        p1 = approx[-1][0]
-        gap = math.hypot(float(p0[0]) - float(p1[0]),
-                         float(p0[1]) - float(p1[1]))
-
-        is_closed = (gap <= CLOSE_GAP_PX)
-
-        # Discard open chains — they are either edge fragments or noise
-        if not is_closed:
-            continue
-
-        results.append(approx)
-
-    return results
+        arc     = cv2.arcLength(cnt, closed=False)
+        epsilon = epsilon_factor * arc / max(len(cnt), 1)
+        epsilon = max(epsilon, 0.3)
+        approx  = cv2.approxPolyDP(cnt, epsilon, closed=False)
+        if len(approx) >= 2:
+            simplified.append(approx)
+    return simplified
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -269,20 +170,15 @@ def build_and_save_dxf(simplified_contours, img_w, img_h, out_path):
             cx, cy = px_to_cad(px_x, px_y, img_h)
             pts.append((cx, cy))
 
-        if len(pts) < 3:          # closed polyline needs ≥3 pts
+        if len(pts) < 2:
             continue
 
-        # Deduplicate consecutive near-identical points
-        deduped = [pts[0]]
-        for p in pts[1:]:
-            if math.hypot(p[0] - deduped[-1][0], p[1] - deduped[-1][1]) > 0.1:
-                deduped.append(p)
-        if len(deduped) < 3:
-            continue
-
-        poly = msp.add_lwpolyline(deduped, format="xy",
-                                  dxfattribs={"layer": "EDGES", "color": 256})
-        poly.close(True)          # all centerline contours are closed loops
+        if len(pts) == 2:
+            msp.add_line(start=pts[0], end=pts[1],
+                         dxfattribs={"layer": "EDGES", "color": 256})
+        else:
+            msp.add_lwpolyline(pts, format="xy",
+                               dxfattribs={"layer": "EDGES", "color": 256})
         entity_count += 1
 
     doc.saveas(str(out_path))
@@ -909,6 +805,7 @@ def main():
     blur_ksize      = int(opts.get("blurKsize",    5))
     canny_low       = int(opts.get("cannyLow",    30))
     canny_high      = int(opts.get("cannyHigh",  100))
+    epsilon_factor  = float(opts.get("epsilonFactor", 0.5))
     gcode_opts      = opts.get("gcodeOptions", {})
 
     steps = []
@@ -941,23 +838,13 @@ def main():
     edge_px = int(np.count_nonzero(edges))
     steps.append(step_record(f"CV-5: Canny (lo={canny_low}, hi={canny_high})", f"{edge_px} edge px", t0))
 
-    # ── STEP 6: Skeleton centerline ──────────────────────────────────────────
-    # 6a+6b — close 1-px gaps then Zhang-Suen thin to single-pixel skeleton
+    # ── STEP 6: Contour extraction ───────────────────────────────────────────
     t0 = now_ms()
-    skeleton    = skeletonize_edges(edges)
-    skel_px     = int(np.count_nonzero(skeleton))
-    band_ratio  = round(edge_px / max(skel_px, 1), 2)
-    steps.append(step_record(
-        "CV-6a-6b: Skeleton (close gaps + Zhang-Suen thin)",
-        f"{skel_px} skeleton px  |  band→skeleton ratio {band_ratio}×", t0))
-
-    # 6c-6e — findContours on skeleton → D-P ε=2px → closed loops only
-    t0 = now_ms()
-    simplified_contours = extract_centerline_contours(skeleton, img_h)
+    simplified_contours = extract_simplified_contours(edges, epsilon_factor)
     total_pts = sum(len(c) for c in simplified_contours)
     steps.append(step_record(
-        f"CV-6c-6e: findContours on skeleton + D-P (ε={DP_EPSILON_PX}px) + close filter",
-        f"{len(simplified_contours)} closed centerline contours  |  {total_pts} vertices", t0))
+        f"CV-6: findContours + approxPolyDP (ε={epsilon_factor})",
+        f"{len(simplified_contours)} contours  |  {total_pts} vertices", t0))
 
     # ── Output dir ────────────────────────────────────────────────────────────
     server_out_dir = Path(__file__).parent / "uploads" / "output"
@@ -1027,16 +914,13 @@ def main():
     try:
         canvas_ = np.zeros((img_h, img_w, 3), dtype=np.uint8)
         canvas_[:] = (15, 12, 10)
-        # Show skeleton (single-pixel centerlines) in bright white,
-        # and original Canny bands underneath in dim grey for reference
-        canvas_[edges > 0]    = (60, 60, 60)     # Canny band — dim grey
-        canvas_[skeleton > 0] = (255, 255, 255)  # skeleton centerline — white
+        canvas_[edges > 0] = (255, 255, 255)
         if cv2.imwrite(str(png_path), canvas_) and png_path.exists():
             png_ok   = True
             png_size = png_path.stat().st_size
     except Exception as e:
         sys.stderr.write(f"PNG error: {e}\n")
-    steps.append(step_record("PNG-11: Save skeleton preview", f"{png_size // 1024 if png_size else 0} KB" if png_ok else "FAILED", t0))
+    steps.append(step_record("PNG-11: Save Canny preview", f"{png_size // 1024 if png_size else 0} KB" if png_ok else "FAILED", t0))
 
     # ── Analysis summary ──────────────────────────────────────────────────────
     analysis = {
@@ -1044,8 +928,6 @@ def main():
         "height"         : float(img_h),
         "dpi"            : dpi,
         "edgePixels"     : edge_px,
-        "skeletonPixels" : skel_px,
-        "bandToSkelRatio": band_ratio,
         "edges"          : entity_count,
         "contours"       : len(simplified_contours),
         "mergedContours" : n_contours,
@@ -1054,7 +936,7 @@ def main():
         "blurKsize"      : blur_ksize,
         "cannyLow"       : canny_low,
         "cannyHigh"      : canny_high,
-        "dpEpsilonPx"    : DP_EPSILON_PX,
+        "epsilonFactor"  : epsilon_factor,
         "imgW"           : img_w,
         "imgH"           : img_h,
         "scaleMmPerDu"   : round(25.4 / dpi, 4),
