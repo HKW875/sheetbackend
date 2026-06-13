@@ -397,7 +397,446 @@ def merge_and_heal_dxf(raw_dxf_path, merged_dxf_path, img_w, img_h):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# STEP 9 — G-CODE GENERATION
+# STEP 9 — DXF SHAPE REFINEMENT PIPELINE
+# ════════════════════════════════════════════════════════════════════════════════
+#
+# Input : merged DXF from Step 8 (LWPOLYLINE + LINE fragments)
+# Output: refined DXF with native CIRCLE and closed LWPOLYLINE entities,
+#         centred on the outer boundary, plus a rendered PNG preview.
+#
+# Sub-steps:
+#   9a. Parse all polyline vertices from the merged DXF
+#   9b. Algebraic Least Squares + Kasa circle fitting per polyline
+#       Solve  x² + y² = Ax + By + C  →  linear system for (cx,cy,r)
+#       Accept as circle when RMS residual < CIRCLE_RMS_THRESH
+#   9c. Classify remainder as rectangle / open path
+#   9d. Deduplicate: group by centre proximity and size similarity,
+#       keep one representative per group
+#   9e. Size filter: discard shapes whose bounding box is smaller than
+#       min_shape_size (user-supplied drawing units, 0 = off)
+#   9f. Gemini AI text filter (optional): user describes shapes to eliminate
+#       in plain English; Gemini inspects each shape's properties and returns
+#       a keep/discard verdict
+#   9g. Centre alignment: shift every shape so the group is centred on the
+#       X-midpoint of the outer boundary rectangle
+#   9h. Write refined DXF: native CIRCLE entities for circles,
+#       closed LWPOLYLINE for rectangles / closed paths
+#   9i. Render PNG: white shapes on dark background
+# ════════════════════════════════════════════════════════════════════════════════
+
+CIRCLE_RMS_THRESH  = 2.5   # drawing units — lower = stricter circle test
+DEDUP_CENTER_TOL   = 8.0   # centres closer than this → same shape group
+DEDUP_SIZE_REL     = 0.12  # relative size diff ≤ this → same group
+
+
+# ── 9a-b: Kasa algebraic circle fit ─────────────────────────────────────────
+
+def _kasa_fit(pts):
+    """
+    Algebraic Least Squares (Kasa method):
+        x² + y² = Ax + By + C
+    Solve for A,B,C then recover  cx = A/2,  cy = B/2,  r = sqrt(C + cx²+cy²).
+    Returns (cx, cy, r, rms) or None if system is singular.
+    """
+    n = len(pts)
+    if n < 5:
+        return None
+    xs = np.array([p[0] for p in pts], dtype=np.float64)
+    ys = np.array([p[1] for p in pts], dtype=np.float64)
+    # Build matrix A and vector b
+    A_mat = np.column_stack([xs, ys, np.ones(n)])
+    b_vec = xs**2 + ys**2
+    try:
+        result = np.linalg.lstsq(A_mat, b_vec, rcond=None)
+        coeffs = result[0]
+    except Exception:
+        return None
+    A_c, B_c, C_c = coeffs
+    cx = A_c / 2.0
+    cy = B_c / 2.0
+    r2 = C_c + cx**2 + cy**2
+    if r2 <= 0:
+        return None
+    r = math.sqrt(r2)
+    # RMS residual
+    dists = np.sqrt((xs - cx)**2 + (ys - cy)**2)
+    rms = float(np.sqrt(np.mean((dists - r)**2)))
+    return cx, cy, r, rms
+
+
+def _classify_shapes(chains):
+    """
+    For each (pts, is_closed) chain from the merged DXF, attempt Kasa fit.
+    Returns list of shape dicts:
+        type     : 'circle' | 'rect' | 'path'
+        cx, cy   : centre (circles and rects)
+        r        : radius (circles only)
+        pts      : vertex list (rects / paths)
+        bbox_w, bbox_h : bounding box
+        is_closed: bool
+    """
+    shapes = []
+    for pts, is_closed in chains:
+        if len(pts) < 2:
+            continue
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        bw = max(xs) - min(xs)
+        bh = max(ys) - min(ys)
+
+        base = {
+            "pts"     : pts,
+            "is_closed": is_closed,
+            "bbox_w"  : bw,
+            "bbox_h"  : bh,
+            "cx"      : (min(xs) + max(xs)) / 2.0,
+            "cy"      : (min(ys) + max(ys)) / 2.0,
+        }
+
+        # Try circle fit on closed polylines with enough points
+        if is_closed and len(pts) >= 8:
+            fit = _kasa_fit(pts)
+            if fit is not None:
+                cx_f, cy_f, r_f, rms = fit
+                # Accept as circle if RMS is small and aspect ratio is near 1
+                aspect = max(bw, bh) / (min(bw, bh) + 1e-9)
+                if rms < CIRCLE_RMS_THRESH and aspect < 1.5 and r_f > 0:
+                    shapes.append({**base, "type": "circle",
+                                   "cx": cx_f, "cy": cy_f, "r": r_f, "rms": rms})
+                    continue
+
+        # Classify as rectangle if closed and roughly 4 vertices (after approx)
+        if is_closed:
+            shapes.append({**base, "type": "rect"})
+        else:
+            shapes.append({**base, "type": "path"})
+
+    return shapes
+
+
+# ── 9c: read chains from merged DXF ─────────────────────────────────────────
+
+def _read_chains_from_dxf(dxf_path):
+    """Return list of (pts, is_closed) from a DXF file."""
+    if not HAS_DXF:
+        return []
+    try:
+        doc = ezdxf.readfile(str(dxf_path))
+    except Exception:
+        return []
+    chains = []
+    for ent in doc.modelspace():
+        etype = ent.dxftype()
+        if etype == "LWPOLYLINE":
+            pts = [(p[0], p[1]) for p in ent.get_points()]
+            if len(pts) >= 2:
+                chains.append((pts, ent.closed))
+        elif etype == "LINE":
+            s, e = ent.dxf.start, ent.dxf.end
+            chains.append([(s.x, s.y), (e.x, e.y)], False)
+        elif etype == "CIRCLE":
+            c = ent.dxf.center
+            r = ent.dxf.radius
+            # Re-approximate circle for classification
+            n = max(32, int(2 * math.pi * r))
+            pts = [(c.x + r * math.cos(2*math.pi*i/n),
+                    c.y + r * math.sin(2*math.pi*i/n)) for i in range(n)]
+            chains.append((pts, True))
+    return chains
+
+
+# ── 9d: deduplication ───────────────────────────────────────────────────────
+
+def _dedup_shapes(shapes):
+    """
+    Group shapes by centre proximity and size similarity.
+    Within each group keep the one with the largest bounding box (outermost).
+    """
+    used   = [False] * len(shapes)
+    kept   = []
+
+    def size_of(s):
+        return s.get("r", 0) * 2 if s["type"] == "circle" else max(s["bbox_w"], s["bbox_h"])
+
+    for i, s in enumerate(shapes):
+        if used[i]:
+            continue
+        group = [i]
+        sz_i  = size_of(s)
+        for j in range(i + 1, len(shapes)):
+            if used[j]:
+                continue
+            t = shapes[j]
+            dc = math.hypot(s["cx"] - t["cx"], s["cy"] - t["cy"])
+            sz_j = size_of(t)
+            sz_max = max(sz_i, sz_j, 1e-9)
+            if dc < DEDUP_CENTER_TOL and abs(sz_i - sz_j) / sz_max < DEDUP_SIZE_REL:
+                group.append(j)
+        # Keep the shape with the largest size in the group
+        best = max(group, key=lambda idx: size_of(shapes[idx]))
+        for idx in group:
+            used[idx] = True
+        kept.append(shapes[best])
+
+    return kept
+
+
+# ── 9e: numeric size filter ──────────────────────────────────────────────────
+
+def _size_filter(shapes, min_size):
+    """Discard shapes whose max bounding dimension is below min_size."""
+    if min_size <= 0:
+        return shapes
+    def dim(s):
+        return s.get("r", 0) * 2 if s["type"] == "circle" else max(s["bbox_w"], s["bbox_h"])
+    return [s for s in shapes if dim(s) >= min_size]
+
+
+# ── 9f: Gemini AI text filter ────────────────────────────────────────────────
+
+def _gemini_text_filter(shapes, filter_description, gemini_api_key):
+    """
+    Ask Gemini to identify which shapes to discard based on a plain-English
+    description from the user. Returns filtered list.
+
+    Sends a JSON array of shape summaries; expects a JSON array of 0-based
+    indices to KEEP.
+    """
+    if not filter_description or not gemini_api_key:
+        return shapes
+
+    import urllib.request, urllib.error
+
+    summaries = []
+    for i, s in enumerate(shapes):
+        if s["type"] == "circle":
+            summaries.append({"idx": i, "type": "circle",
+                               "cx": round(s["cx"],1), "cy": round(s["cy"],1),
+                               "diameter": round(s.get("r",0)*2, 1)})
+        else:
+            summaries.append({"idx": i, "type": s["type"],
+                               "cx": round(s["cx"],1), "cy": round(s["cy"],1),
+                               "width": round(s["bbox_w"],1), "height": round(s["bbox_h"],1)})
+
+    prompt = (
+        "You are a CAD drawing assistant. Here is a JSON list of shapes in a DXF drawing:\n"
+        f"{json.dumps(summaries, indent=2)}\n\n"
+        f"The user wants to REMOVE shapes matching this description: \"{filter_description}\"\n\n"
+        "Return ONLY a JSON array of the integer indices (the 'idx' field) of shapes that should be KEPT "
+        "(i.e. NOT matching the description). No markdown, no explanation, just the JSON array."
+    )
+
+    payload = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0, "maxOutputTokens": 512}
+    }).encode("utf-8")
+
+    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+           f"gemini-1.5-flash:generateContent?key={gemini_api_key}")
+
+    try:
+        req = urllib.request.Request(url, data=payload,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            body = json.loads(resp.read().decode())
+        text = body["candidates"][0]["content"]["parts"][0]["text"].strip()
+        # Strip markdown fences if present
+        text = text.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+        keep_indices = set(json.loads(text))
+        return [s for s in shapes if s in [shapes[i] for i in keep_indices if i < len(shapes)]]
+    except Exception as e:
+        sys.stderr.write(f"Gemini filter error (non-fatal): {e}\n")
+        return shapes
+
+
+# ── 9g: centre alignment ─────────────────────────────────────────────────────
+
+def _centre_align(shapes, img_w):
+    """
+    Compute the outer bounding box of all shapes, find its X centre,
+    then shift every shape so it is centred on img_w / 2.
+    """
+    if not shapes:
+        return shapes
+
+    all_cx = [s["cx"] for s in shapes]
+    all_cy = [s["cy"] for s in shapes]
+
+    # Find outermost shape (largest bounding box = outer boundary)
+    def bbox_area(s):
+        return s["bbox_w"] * s["bbox_h"]
+    outer = max(shapes, key=bbox_area)
+
+    # X midpoint of the outer boundary
+    outer_cx = outer["cx"]
+    target_cx = img_w / 2.0
+    dx = target_cx - outer_cx
+
+    shifted = []
+    for s in shapes:
+        ns = dict(s)
+        ns["cx"] = s["cx"] + dx
+        ns["cy"] = s["cy"]
+        if "pts" in s:
+            ns["pts"] = [(p[0] + dx, p[1]) for p in s["pts"]]
+        shifted.append(ns)
+    return shifted
+
+
+# ── 9h: write refined DXF ────────────────────────────────────────────────────
+
+def write_refined_dxf(shapes, img_w, img_h, out_path):
+    """
+    Write a DXF R2018 with:
+      - native CIRCLE entities for circle shapes
+      - closed LWPOLYLINE for rect / closed-path shapes
+      - open  LWPOLYLINE for open-path shapes
+    Returns (doc, n_circles, n_rects, file_size).
+    """
+    if not HAS_DXF:
+        return None, 0, 0, 0
+
+    doc = ezdxf.new(dxfversion="R2018")
+    doc.header["$INSUNITS"] = 0
+    doc.header["$EXTMIN"]   = (0.0, 0.0, 0.0)
+    doc.header["$EXTMAX"]   = (float(img_w), float(img_h), 0.0)
+    doc.header["$LIMMIN"]   = (0.0, 0.0)
+    doc.header["$LIMMAX"]   = (float(img_w), float(img_h))
+
+    msp = doc.modelspace()
+
+    # Layers
+    for lname, col in [("CIRCLES", 5), ("RECTS", 3), ("PATHS", 1)]:
+        doc.layers.new(lname, dxfattribs={"color": col, "linetype": "CONTINUOUS"})
+
+    n_circles = n_rects = 0
+
+    for s in shapes:
+        if s["type"] == "circle":
+            msp.add_circle(
+                center=(s["cx"], s["cy"]),
+                radius=s["r"],
+                dxfattribs={"layer": "CIRCLES", "color": 256},
+            )
+            n_circles += 1
+
+        elif s["type"] in ("rect", "path"):
+            pts = s.get("pts", [])
+            if len(pts) < 2:
+                continue
+            # Deduplicate consecutive near-identical points
+            deduped = [pts[0]]
+            for p in pts[1:]:
+                if math.hypot(p[0]-deduped[-1][0], p[1]-deduped[-1][1]) > 0.1:
+                    deduped.append(p)
+            if len(deduped) < 2:
+                continue
+            layer  = "RECTS" if s["type"] == "rect" else "PATHS"
+            closed = s.get("is_closed", s["type"] == "rect")
+            poly   = msp.add_lwpolyline(
+                deduped,
+                format="xy",
+                dxfattribs={"layer": layer, "color": 256},
+            )
+            poly.close(closed)
+            n_rects += 1
+
+    doc.saveas(str(out_path))
+    return doc, n_circles, n_rects, out_path.stat().st_size
+
+
+# ── 9i: render final PNG ─────────────────────────────────────────────────────
+
+def render_refined_png(shapes, img_w, img_h, out_path):
+    """
+    Draw white shapes on a dark background using OpenCV.
+    Circles → cv2.circle; rects/paths → cv2.polylines.
+    Returns True on success.
+    """
+    if not HAS_CV:
+        return False
+    try:
+        canvas = np.zeros((img_h, img_w, 3), dtype=np.uint8)
+        canvas[:] = (12, 10, 15)   # very dark purple-black background
+
+        for s in shapes:
+            if s["type"] == "circle":
+                cx = int(round(s["cx"]))
+                # DXF Y is up; convert back to pixel Y
+                cy = int(round((img_h - 1) - s["cy"]))
+                r  = int(round(s["r"]))
+                if r > 0:
+                    cv2.circle(canvas, (cx, cy), r, (255, 255, 255), 1, cv2.LINE_AA)
+
+            else:
+                pts = s.get("pts", [])
+                if len(pts) < 2:
+                    continue
+                # Convert DXF coords back to pixel coords
+                px_pts = np.array(
+                    [[[int(round(p[0])), int(round((img_h - 1) - p[1]))]]
+                     for p in pts],
+                    dtype=np.int32
+                )
+                closed = s.get("is_closed", s["type"] == "rect")
+                cv2.polylines(canvas, [px_pts], isClosed=closed,
+                              color=(255, 255, 255), thickness=1,
+                              lineType=cv2.LINE_AA)
+
+        result = cv2.imwrite(str(out_path), canvas)
+        return result and out_path.exists()
+    except Exception as e:
+        sys.stderr.write(f"PNG render error: {e}\n")
+        return False
+
+
+# ── Master Step-9 orchestrator ───────────────────────────────────────────────
+
+def refine_dxf_pipeline(merged_dxf_path, refined_dxf_path, refined_png_path,
+                         img_w, img_h, min_shape_size, filter_description,
+                         gemini_api_key):
+    """
+    Run the full shape-refinement pipeline on the merged DXF.
+    Returns dict with counts and file sizes.
+    """
+    # 9a-c: read + classify
+    chains = _read_chains_from_dxf(merged_dxf_path)
+    shapes = _classify_shapes(chains)
+
+    # 9d: deduplicate
+    shapes = _dedup_shapes(shapes)
+
+    # 9e: numeric size filter
+    shapes = _size_filter(shapes, min_shape_size)
+
+    # 9f: Gemini text filter (optional)
+    if filter_description and gemini_api_key:
+        shapes = _gemini_text_filter(shapes, filter_description, gemini_api_key)
+
+    # 9g: centre alignment
+    shapes = _centre_align(shapes, img_w)
+
+    # 9h: write refined DXF
+    _, n_circles, n_rects, dxf_size = write_refined_dxf(
+        shapes, img_w, img_h, refined_dxf_path)
+
+    # 9i: render PNG
+    png_ok = render_refined_png(shapes, img_w, img_h, refined_png_path)
+
+    n_circles_found = sum(1 for s in shapes if s["type"] == "circle")
+    n_rects_found   = sum(1 for s in shapes if s["type"] in ("rect", "path"))
+
+    return {
+        "total"    : len(shapes),
+        "circles"  : n_circles_found,
+        "rects"    : n_rects_found,
+        "dxf_size" : dxf_size,
+        "png_ok"   : png_ok,
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# STEP 10 — G-CODE GENERATION
 # ════════════════════════════════════════════════════════════════════════════════
 #
 # Reads the merged DXF (closed LWPOLYLINE contours) and generates standard
@@ -802,11 +1241,14 @@ def main():
         try: opts = json.loads(sys.argv[2])
         except Exception: pass
 
-    blur_ksize      = int(opts.get("blurKsize",    5))
-    canny_low       = int(opts.get("cannyLow",    30))
-    canny_high      = int(opts.get("cannyHigh",  100))
-    epsilon_factor  = float(opts.get("epsilonFactor", 0.5))
-    gcode_opts      = opts.get("gcodeOptions", {})
+    blur_ksize         = int(opts.get("blurKsize",      5))
+    canny_low          = int(opts.get("cannyLow",      30))
+    canny_high         = int(opts.get("cannyHigh",    100))
+    epsilon_factor     = float(opts.get("epsilonFactor", 0.5))
+    min_shape_size     = float(opts.get("minShapeSize",   0.0))   # drawing units; 0 = off
+    filter_description = str(opts.get("filterDescription", "")).strip()
+    gemini_api_key     = os.environ.get("GEMINI_API_KEY", "")
+    gcode_opts         = opts.get("gcodeOptions", {})
 
     steps = []
 
@@ -851,15 +1293,19 @@ def main():
     server_out_dir.mkdir(parents=True, exist_ok=True)
 
     ts_str    = int(time.time())
-    raw_dxf_name    = f"design_{ts_str}_raw.dxf"
-    merged_dxf_name = f"design_{ts_str}.dxf"
-    pdf_name        = f"design_{ts_str}.pdf"
-    png_name        = f"preview_{ts_str}.png"
+    raw_dxf_name      = f"design_{ts_str}_raw.dxf"
+    merged_dxf_name   = f"design_{ts_str}_merged.dxf"
+    refined_dxf_name  = f"design_{ts_str}.dxf"
+    pdf_name          = f"design_{ts_str}.pdf"
+    canny_png_name    = f"canny_{ts_str}.png"
+    refined_png_name  = f"preview_{ts_str}.png"
 
-    raw_dxf_path    = server_out_dir / raw_dxf_name
-    merged_dxf_path = server_out_dir / merged_dxf_name
-    pdf_path        = server_out_dir / pdf_name
-    png_path        = server_out_dir / png_name
+    raw_dxf_path      = server_out_dir / raw_dxf_name
+    merged_dxf_path   = server_out_dir / merged_dxf_name
+    refined_dxf_path  = server_out_dir / refined_dxf_name
+    pdf_path          = server_out_dir / pdf_name
+    canny_png_path    = server_out_dir / canny_png_name
+    refined_png_path  = server_out_dir / refined_png_name
 
     # ── STEP 7: Raw DXF export ────────────────────────────────────────────────
     t0 = now_ms()
@@ -889,84 +1335,148 @@ def main():
          f"  {(n_contours - n_closed)} open  |  {merged_size // 1024 if merged_size else 0} KB"),
         t0))
 
-    # ── STEP 9: G-Code generation ─────────────────────────────────────────────
+    # ── STEP 9: Shape Refinement Pipeline ────────────────────────────────────
+    t0 = now_ms()
+    refine_result = {"total": 0, "circles": 0, "rects": 0,
+                     "dxf_size": 0, "png_ok": False}
+    if merged_size > 0:
+        try:
+            refine_result = refine_dxf_pipeline(
+                merged_dxf_path, refined_dxf_path, refined_png_path,
+                img_w, img_h,
+                min_shape_size, filter_description, gemini_api_key,
+            )
+        except Exception as e:
+            sys.stderr.write(f"Step 9 refine error: {e}\n{traceback.format_exc()}\n")
+
+    refined_size   = refine_result.get("dxf_size", 0)
+    refined_png_ok = refine_result.get("png_ok", False)
+
+    # Read refined DXF content for frontend (download)
+    refined_dxf_str = ""
+    if refined_size > 0:
+        try:
+            with open(refined_dxf_path, encoding="utf-8") as f:
+                refined_dxf_str = f.read()
+        except Exception:
+            pass
+
+    gemini_used = bool(filter_description and gemini_api_key)
+    steps.append(step_record(
+        "DXF-9: Shape Refinement (Kasa fit → dedup → filter → centre → native entities)",
+        (f"{refine_result.get('total',0)} shapes  |  "
+         f"{refine_result.get('circles',0)} circles  |  "
+         f"{refine_result.get('rects',0)} rects/paths  |  "
+         f"{'Gemini filter applied' if gemini_used else 'no AI filter'}  |  "
+         f"{refined_size // 1024 if refined_size else 0} KB"),
+        t0))
+
+    # ── STEP 10: G-Code generation ────────────────────────────────────────────
+    # G-code is generated from the REFINED DXF (native circles + closed polys)
     t0 = now_ms()
     gcode_files = {}
-    if merged_size > 0:
-        gcode_files = generate_all_gcode(
-            merged_dxf_path, gcode_opts, dpi, ts_str, server_out_dir)
+    gcode_src = refined_dxf_path if refined_size > 0 else merged_dxf_path
+    if refined_size > 0 or merged_size > 0:
+        try:
+            gcode_files = generate_all_gcode(
+                gcode_src, gcode_opts, dpi, ts_str, server_out_dir)
+        except Exception as e:
+            sys.stderr.write(f"G-code generation error: {e}\n")
 
     machine_summary = ", ".join(
         f"{k}({v['size']//1024}KB)" for k, v in gcode_files.items()) or "none"
     steps.append(step_record(
-        "NC-9: G-Code generation (laser/plasma/waterjet/oxyfuel/mill/router)",
+        "NC-10: G-Code generation (laser/plasma/waterjet/oxyfuel/mill/router)",
         f"{len(gcode_files)} files — {machine_summary}", t0))
 
-    # ── STEP 10: PDF export ───────────────────────────────────────────────────
+    # ── STEP 11: PDF export ───────────────────────────────────────────────────
     t0 = now_ms()
     pdf_ok = export_pdf(edges, pdf_path, orig_bgr=bgr)
-    steps.append(step_record("PDF-10: Export edge preview", "OK" if pdf_ok else "FAILED", t0))
+    steps.append(step_record("PDF-11: Export edge preview", "OK" if pdf_ok else "FAILED", t0))
 
-    # ── STEP 11: PNG preview ──────────────────────────────────────────────────
+    # ── STEP 12: Canny PNG (intermediate reference) ───────────────────────────
     t0 = now_ms()
-    png_ok   = False
-    png_size = 0
+    canny_png_ok   = False
+    canny_png_size = 0
     try:
         canvas_ = np.zeros((img_h, img_w, 3), dtype=np.uint8)
         canvas_[:] = (15, 12, 10)
         canvas_[edges > 0] = (255, 255, 255)
-        if cv2.imwrite(str(png_path), canvas_) and png_path.exists():
-            png_ok   = True
-            png_size = png_path.stat().st_size
+        if cv2.imwrite(str(canny_png_path), canvas_) and canny_png_path.exists():
+            canny_png_ok   = True
+            canny_png_size = canny_png_path.stat().st_size
     except Exception as e:
-        sys.stderr.write(f"PNG error: {e}\n")
-    steps.append(step_record("PNG-11: Save Canny preview", f"{png_size // 1024 if png_size else 0} KB" if png_ok else "FAILED", t0))
+        sys.stderr.write(f"Canny PNG error: {e}\n")
+    steps.append(step_record(
+        "PNG-12: Canny edge reference",
+        f"{canny_png_size // 1024 if canny_png_size else 0} KB" if canny_png_ok else "FAILED",
+        t0))
 
     # ── Analysis summary ──────────────────────────────────────────────────────
     analysis = {
-        "width"          : float(img_w),
-        "height"         : float(img_h),
-        "dpi"            : dpi,
-        "edgePixels"     : edge_px,
-        "edges"          : entity_count,
-        "contours"       : len(simplified_contours),
-        "mergedContours" : n_contours,
-        "closedContours" : n_closed,
-        "totalVertices"  : total_pts,
-        "blurKsize"      : blur_ksize,
-        "cannyLow"       : canny_low,
-        "cannyHigh"      : canny_high,
-        "epsilonFactor"  : epsilon_factor,
-        "imgW"           : img_w,
-        "imgH"           : img_h,
-        "scaleMmPerDu"   : round(25.4 / dpi, 4),
-        "coordSystem"    : "origin=bottom-left, 1px=1du, Y-up (CAD convention)",
+        "width"           : float(img_w),
+        "height"          : float(img_h),
+        "dpi"             : dpi,
+        "edgePixels"      : edge_px,
+        "edges"           : entity_count,
+        "contours"        : len(simplified_contours),
+        "mergedContours"  : n_contours,
+        "closedContours"  : n_closed,
+        "refinedShapes"   : refine_result.get("total", 0),
+        "refinedCircles"  : refine_result.get("circles", 0),
+        "refinedRects"    : refine_result.get("rects", 0),
+        "totalVertices"   : total_pts,
+        "blurKsize"       : blur_ksize,
+        "cannyLow"        : canny_low,
+        "cannyHigh"       : canny_high,
+        "epsilonFactor"   : epsilon_factor,
+        "minShapeSize"    : min_shape_size,
+        "filterDescription": filter_description,
+        "imgW"            : img_w,
+        "imgH"            : img_h,
+        "scaleMmPerDu"    : round(25.4 / dpi, 4),
+        "coordSystem"     : "origin=bottom-left, 1px=1du, Y-up (CAD convention)",
     }
 
     # Build gcodeFiles map (machine → filename) for schema
     gcode_files_map = {k: v["filename"] for k, v in gcode_files.items()}
 
+    # The refined DXF is the download target; refined PNG is the View Drawing target
+    out_dxf_name = refined_dxf_name if refined_size > 0 else merged_dxf_name
+    out_dxf_path = str(refined_dxf_path) if refined_size > 0 else str(merged_dxf_path)
+    out_dxf_size = refined_size if refined_size > 0 else merged_size
+    out_dxf_str  = refined_dxf_str if refined_dxf_str else ""
+
     print(json.dumps({
         "steps"        : steps,
         "analysis"     : analysis,
         "dwg": {
-            "entities"        : entity_count,
-            "fileSize"        : merged_size,
-            "filename"        : merged_dxf_name if merged_size else "",
-            "dxfAbsPath"      : str(merged_dxf_path) if merged_size else "",
-            "rawDxfFilename"  : raw_dxf_name if raw_size else "",
-            "pdfFilename"     : pdf_name if pdf_ok else "",
-            "edgePngFilename" : png_name if png_ok else "",
-            "edgePngPath"     : str(png_path) if png_ok else "",
-            "gcodeFiles"      : gcode_files_map,
-            "gcodeFilePaths"  : {k: v["path"] for k, v in gcode_files.items()},
+            "entities"         : entity_count,
+            "fileSize"         : out_dxf_size,
+            "filename"         : out_dxf_name if out_dxf_size else "",
+            "dxfAbsPath"       : out_dxf_path if out_dxf_size else "",
+            "rawDxfFilename"   : raw_dxf_name if raw_size else "",
+            "pdfFilename"      : pdf_name if pdf_ok else "",
+            # refined PNG = the "View Drawing" image
+            "edgePngFilename"  : refined_png_name if refined_png_ok else (canny_png_name if canny_png_ok else ""),
+            "edgePngPath"      : str(refined_png_path) if refined_png_ok else (str(canny_png_path) if canny_png_ok else ""),
+            "cannyPngFilename" : canny_png_name if canny_png_ok else "",
+            "cannyPngPath"     : str(canny_png_path) if canny_png_ok else "",
+            "gcodeFiles"       : gcode_files_map,
+            "gcodeFilePaths"   : {k: v["path"] for k, v in gcode_files.items()},
+            "refinedShapes"    : refine_result.get("total", 0),
+            "refinedCircles"   : refine_result.get("circles", 0),
+            "refinedRects"     : refine_result.get("rects", 0),
         },
-        "dxfContent"   : merged_dxf_str[:50000] if merged_dxf_str else "",
-        "dxfAvailable" : merged_size > 0,
+        "dxfContent"   : out_dxf_str[:50000] if out_dxf_str else "",
+        "dxfAvailable" : out_dxf_size > 0,
         "pdfAvailable" : pdf_ok,
-        "pngAvailable" : png_ok,
+        "pngAvailable" : refined_png_ok or canny_png_ok,
+        "refinedPngAvailable" : refined_png_ok,
         "gcodeAvailable": len(gcode_files) > 0,
     }, ensure_ascii=False))
+
+
 
 
 if __name__ == "__main__":
