@@ -449,9 +449,80 @@ def _dedup_residual(shapes, kind):
     return result
 
 
+def _circles_overlap(a, b):
+    """
+    True if circle `a` and circle `b` substantially overlap — i.e. one
+    circle's centre lies inside the other's disk. This catches the case
+    where a single wobbly hand-drawn ring produces an outer-edge contour
+    and an inner-edge ("hole") contour whose CENTRES differ by more than
+    `_shapes_similar_for_pairing`'s tight hierarchy-pairing tolerance (so
+    they were never paired/averaged) and also differ enough in radius that
+    `_dedup_residual`'s tolerance didn't merge them either — leaving two
+    near-duplicate circles of the SAME physical hole, one slightly smaller
+    and offset from the other (the "smallest diameter circle" symptom).
+    """
+    dc = math.hypot(a['cx'] - b['cx'], a['cy'] - b['cy'])
+    return dc < max(a['r'], b['r'])
+
+def _dedup_overlapping_circles(circles):
+    """
+    Cluster circles whose disks overlap (per `_circles_overlap`) and keep
+    only ONE representative per cluster — the one with the lowest algebraic
+    fit error (`err`), tie-broken by the larger radius (the outer edge is
+    the more representative boundary of a stroke). All other members of the
+    cluster are dropped as duplicates of the same physical hole.
+    """
+    n = len(circles)
+    used = [False] * n
+    result = []
+    # Process largest-first so a big "true" circle absorbs smaller
+    # overlapping duplicates rather than the reverse.
+    order = sorted(range(n), key=lambda i: circles[i]['r'], reverse=True)
+    for i in order:
+        if used[i]:
+            continue
+        cluster = [i]
+        used[i] = True
+        for j in order:
+            if used[j]:
+                continue
+            if _circles_overlap(circles[i], circles[j]):
+                cluster.append(j)
+                used[j] = True
+        best = min(cluster, key=lambda k: (circles[k].get('err', 0.0), -circles[k]['r']))
+        result.append(circles[best])
+    return result
+
+def _circle_overlaps_any_rect(c, rects, center_inside_frac=0.5):
+    """
+    True if circle `c`'s centre lies inside (or within `center_inside_frac`
+    of its radius from) any rect's bounding box.
+
+    In sheet-layout sketches a real bore/hole is drawn in open material, not
+    stacked on top of a separate cut-out rectangle. When a rectangle's
+    "hole" contour has rounded/eroded corners (common after MORPH_OPEN on a
+    hand-drawn line of uneven thickness), its aspect ratio can exceed the
+    circle-fit threshold and the Kasa fit happily returns a "circle" sitting
+    on top of that rectangle — the "circle at lower-bottom-left" symptom.
+    Such circles are rejected here.
+    """
+    for r in rects:
+        x0 = r['cx'] - r['w'] / 2.0
+        x1 = r['cx'] + r['w'] / 2.0
+        y0 = r['cy'] - r['h'] / 2.0
+        y1 = r['cy'] + r['h'] / 2.0
+        dx = max(x0 - c['cx'], 0.0, c['cx'] - x1)
+        dy = max(y0 - c['cy'], 0.0, c['cy'] - y1)
+        dist = math.hypot(dx, dy)
+        if dist < c['r'] * center_inside_frac:
+            return True
+    return False
+
+
 def build_clean_shapes(simplified_contours, parents, children, img_w, img_h,
                        min_shape_area=None, rect_aspect_min=0.15,
-                       rect_rel_area_min=0.01, circle_rel_radius_min=0.4):
+                       rect_rel_area_min=0.01, circle_rel_radius_min=0.4,
+                       circle_rect_overlap_frac=0.5):
     """
     Full v10 pipeline:
       a. Classify every contour as circle or rect.
@@ -470,11 +541,18 @@ def build_clean_shapes(simplified_contours, parents, children, img_w, img_h,
              `rect_rel_area_min` of the LARGEST rect found (the outer
              sheet/board boundary). Annotation text blocks (e.g. "900mm")
              are small relative to the board; real cut-outs are not.
-           - Circle relative-radius filter: drops circles whose radius is
-             below `circle_rel_radius_min` of the largest circle found.
-             Text characters ("0" in "900mm") fit small spurious circles;
-             real holes/bores are comparable in size to each other.
-      f. NO re-centering. Every shape keeps its measured (cx, cy) — output
+      f. Spurious-circle filters (run BEFORE the relative-radius filter,
+         since these artefacts can be similar in size to the real circle):
+           - Circle-circle overlap dedup: collapses near-duplicate circles
+             whose disks overlap (offset inner/outer edges of one wobbly
+             stroke) down to a single best-fit circle.
+           - Circle-rect overlap rejection: drops any circle centred inside
+             a detected rectangle's bounding box (a rectangle "hole"
+             contour misclassified as round).
+      g. Circle relative-radius filter: drops circles whose radius is below
+         `circle_rel_radius_min` of the largest remaining circle (text
+         glyph circles like the "0" in "900mm").
+      h. NO re-centering. Every shape keeps its measured (cx, cy) — output
          geometry matches the Canny image pixel-for-pixel.
     Returns final_shapes, circles_final, rects_final.
     """
@@ -514,7 +592,23 @@ def build_clean_shapes(simplified_contours, parents, children, img_w, img_h,
         max_rect_area = max(r['w'] * r['h'] for r in rects)
         rects = [r for r in rects if (r['w'] * r['h']) >= rect_rel_area_min * max_rect_area]
 
-    # Step 4c: circle relative-radius filter (drop text-character circles,
+    # Step 4c: circle-circle overlap dedup (collapse offset-duplicate rings)
+    circles = _dedup_overlapping_circles(circles)
+
+    # Step 4d: circle-rect overlap rejection (drop rect-corner misfits).
+    # The largest rect is treated as the outer board/boundary — real holes
+    # are legitimately drawn INSIDE it, so it's excluded from this check.
+    # Only the smaller "cut-out" rects are considered: a circle centred on
+    # top of one of those is almost certainly that rect's hole-contour
+    # misclassified as round, not a separate real hole.
+    if len(rects) > 1:
+        rects_sorted_desc = sorted(rects, key=lambda r: r['w'] * r['h'], reverse=True)
+        cutout_rects = rects_sorted_desc[1:]
+    else:
+        cutout_rects = []
+    circles = [c for c in circles if not _circle_overlaps_any_rect(c, cutout_rects, circle_rect_overlap_frac)]
+
+    # Step 4e: circle relative-radius filter (drop text-character circles,
     # measured against the largest surviving circle)
     if circles:
         max_r = max(c['r'] for c in circles)
@@ -742,6 +836,7 @@ def main():
     rect_aspect_min       = float(opts.get("rectAspectMin", 0.15))     # drop thin dimension lines
     rect_rel_area_min     = float(opts.get("rectRelAreaMin", 0.01))    # drop annotation text blocks
     circle_rel_radius_min = float(opts.get("circleRelRadiusMin", 0.4)) # drop text-glyph circles
+    circle_rect_overlap_frac = float(opts.get("circleRectOverlapFrac", 0.5))  # drop circles sitting on rects
 
     steps = []
 
@@ -796,7 +891,8 @@ def main():
         simplified_contours, parents, children, img_w, img_h, min_shape_area,
         rect_aspect_min=rect_aspect_min,
         rect_rel_area_min=rect_rel_area_min,
-        circle_rel_radius_min=circle_rel_radius_min)
+        circle_rel_radius_min=circle_rel_radius_min,
+        circle_rect_overlap_frac=circle_rect_overlap_frac)
     n_circles = len(circles_f)
     n_rects   = len(rects_f)
     steps.append(step_record(
