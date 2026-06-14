@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SheetForge — CV Pipeline  v9.0  (Algebraic Least-Squares Shape Fitting)
+SheetForge — CV Pipeline  v9.1  (Algebraic Least-Squares Shape Fitting)
 ========================================================================
 Receives: image_path, options_json (from node child_process)
 Outputs:  JSON on stdout  { steps, analysis, dwg, dxfContent, pdfAvailable }
@@ -13,7 +13,9 @@ Pipeline (algebraic shape fitting → true closed shapes → CAD):
   5.  Canny Edge Detection    (cv2.Canny — thin precise edges)
   6.  Contour Extraction      (cv2.findContours → cv2.approxPolyDP simplification)
   7.  Shape Classification    (algebraic least-squares: Kasa circle fit + rect fit)
-  8.  Deduplication & Filter  (group by proximity, eliminate offsetting/small shapes)
+  8.  Deduplication & Filter  (group by proximity, resolve "offset" double-edge
+                                pairs by discarding the larger of each pair,
+                                eliminate shapes smaller than the two largest circles)
   9.  DXF Export — CLEAN      (one CIRCLE or closed LWPOLYLINE per true shape)
   10. PNG Preview             (side-by-side comparison: original Canny vs clean shapes)
   11. PDF Export              (reportlab — edge image rendered to PDF page)
@@ -226,13 +228,66 @@ def _dedup_rects(rects, center_tol=20.0, dim_tol=20.0):
         result.append(best)
     return result
 
+def _resolve_offset_duplicates(shapes, kind):
+    """
+    Detect pairs of same-type shapes that share (almost) the same centre but
+    differ slightly in size — concentric "offset" duplicates produced when
+    Canny traces both the inner and outer edge of a single drawn line.
+
+    For every such pair, the LARGER shape is discarded and the SMALLER
+    (inner) shape is kept, leaving exactly one entity per true edge.
+
+    kind: 'circle' or 'rect'
+    """
+    n    = len(shapes)
+    keep = [True] * n
+
+    for i in range(n):
+        if not keep[i]:
+            continue
+        for j in range(i + 1, n):
+            if not keep[j]:
+                continue
+
+            a, b = shapes[i], shapes[j]
+            dc = math.hypot(a['cx'] - b['cx'], a['cy'] - b['cy'])
+
+            if kind == 'circle':
+                ra, rb = a['r'], b['r']
+                center_tol = max(10.0, 0.05 * max(ra, rb))
+                size_rel   = abs(ra - rb) / max(ra, rb, 1e-9)
+                larger_is_a = ra >= rb
+            else:  # rect
+                size_a = max(a['w'], a['h'])
+                size_b = max(b['w'], b['h'])
+                center_tol = max(15.0, 0.04 * max(size_a, size_b))
+                w_rel = abs(a['w'] - b['w']) / max(a['w'], b['w'], 1e-9)
+                h_rel = abs(a['h'] - b['h']) / max(a['h'], b['h'], 1e-9)
+                size_rel = max(w_rel, h_rel)
+                larger_is_a = (a['w'] * a['h']) >= (b['w'] * b['h'])
+
+            # Same centre + similar size  ⇒  offset duplicate of one edge
+            if dc <= center_tol and size_rel <= 0.20:
+                if larger_is_a:
+                    keep[i] = False
+                else:
+                    keep[j] = False
+                    # 'a' (i) stays — re-check it against subsequent shapes
+                if not keep[i]:
+                    break  # i was removed; move to next i
+
+    return [s for k, s in zip(keep, shapes) if k]
+
+
 def build_clean_shapes(simplified_contours, img_w, img_h):
     """
     Full algebraic LS pipeline:
       a. Classify every contour as circle or rect.
-      b. Deduplicate overlapping/offset copies.
-      c. Filter shapes smaller than the two largest circles.
-      d. Center all shapes on the master CX of the largest rect.
+      b. Deduplicate overlapping/offset copies (near-identical groups).
+      c. Resolve remaining "offset" pairs — same centre, slightly different
+         size — by discarding the larger of each pair.
+      d. Filter shapes smaller than the two largest circles.
+      e. Center all shapes on the master CX of the largest rect.
     Returns list of shape dicts {'type', 'cx', 'cy', 'r'|'w'+'h'}.
     """
     # Scale factor: contours are in pixel space; we work in pixel units
@@ -251,9 +306,16 @@ def build_clean_shapes(simplified_contours, img_w, img_h):
         else:
             raw_rects.append(shape)
 
-    # Deduplicate
+    # Step 1: group near-identical duplicates (tight tolerance)
     circles_dedup = _dedup_circles(raw_circles)
     rects_dedup   = _dedup_rects(raw_rects)
+
+    # Step 2: resolve remaining concentric "offset" pairs — for every pair
+    # of same-type shapes sharing a centre but differing slightly in size
+    # (Canny double-edge artifacts), discard the LARGER of the pair so only
+    # one entity per true edge survives.
+    circles_dedup = _resolve_offset_duplicates(circles_dedup, 'circle')
+    rects_dedup   = _resolve_offset_duplicates(rects_dedup, 'rect')
 
     # Sort circles by radius descending
     circles_sorted = sorted(circles_dedup, key=lambda c: c['r'], reverse=True)
@@ -273,6 +335,12 @@ def build_clean_shapes(simplified_contours, img_w, img_h):
 
     # Filter: keep rects whose area >= half the minimum-circle area
     rects_final = [r for r in rects_dedup if r['w'] * r['h'] >= min_area_thresh]
+
+    # Final safety pass: resolve any remaining offset pairs across the
+    # filtered sets (in case the size filter let a near-duplicate through
+    # that wasn't caught above due to ordering).
+    circles_final = _resolve_offset_duplicates(circles_final, 'circle')
+    rects_final   = _resolve_offset_duplicates(rects_final, 'rect')
 
     # Determine master centre X (from the largest rect if available)
     if rects_final:
@@ -570,7 +638,7 @@ def main():
     n_circ_final = sum(1 for s in final_shapes if s['type'] == 'circle')
     n_rect_final = sum(1 for s in final_shapes if s['type'] == 'rect')
     steps.append(step_record(
-        "LS-8: Deduplication, filtering & centering",
+        "LS-8: Dedup, offset-pair resolution, filtering & centering",
         f"{n_final} final shapes  |  {n_rect_final} rect(s)  |  {n_circ_final} circle(s)  |  master CX={master_cx:.1f}",
         t0))
 
@@ -642,7 +710,7 @@ def main():
         "masterCx"       : round(master_cx, 2),
         "shapeSummary"   : (
             f"{n_rect_final} rectangle(s), {n_circ_final} circle(s)"
-            f" — algebraic LS fitted, deduplicated, centred"
+            f" — algebraic LS fitted, offset-pairs resolved, deduplicated, centred"
         ),
     }
 
