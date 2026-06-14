@@ -110,7 +110,7 @@ def morph_clean(binary):
 def canny_edges(cleaned, low_threshold=30, high_threshold=100):
     return cv2.Canny(cleaned, low_threshold, high_threshold)
 
-def extract_simplified_contours(edges, epsilon_factor=0.5, min_perimeter=9.0):
+def extract_simplified_contours(edges, epsilon_factor=0.5, min_perimeter=18.0):
     """
     Extract and simplify contours from a Canny edge map.
 
@@ -133,7 +133,7 @@ def extract_simplified_contours(edges, epsilon_factor=0.5, min_perimeter=9.0):
     return simplified
 
 
-def build_clean_edge_mask(edges, min_perimeter=9.0):
+def build_clean_edge_mask(edges, min_perimeter=18.0):
     """
     Produce a denoised version of the Canny edge map with all small
     speckle/dot contours removed and the background fully black.
