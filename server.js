@@ -211,15 +211,19 @@ const designSchema = new mongoose.Schema({
     confidence   : Number,
     notes        : String,
     completedAt  : Date,
+    // Algebraic least-squares shape-fitting summary (v9 pipeline)
+    circlesDetected: Number,
+    rectsDetected   : Number,
+    masterCx        : Number,
+    shapeSummary    : String,
   },
   dwg         : {
     filename   : String,
-    path       : String,       // refined drawing PNG path (View Drawing)
+    path       : String,       // preview PNG/SVG path
     dxfPath    : String,       // real .DXF file path
-    refinedPngPath : String,   // explicit refined-shape PNG path
-    refinedShapes  : Number,
-    refinedCircles : Number,
-    refinedRects   : Number,
+    // Full DXF text content — cached so downloads work even if Render's
+    // ephemeral disk has wiped the file on disk (client-side blob download).
+    dxfContent : String,
     gcodeFile  : String,       // G-code path from process.py
     gcodeFiles : {             // map of machine type → .nc file path
       laser    : String,
@@ -846,16 +850,10 @@ app.post('/api/convert/:id', protect, async (req, res) => {
     const mat   = design.material  || 'Mild Steel';
     const thick = design.thickness || 2;
 
-    // Accept shape-filter params from the conversion request body
-    const minShapeSize     = parseFloat(req.body?.minShapeSize     || 0);
-    const filterDescription = (req.body?.filterDescription || '').trim();
-
     const opts = {
       material  : mat,
       thickness : thick,
       dpi       : 96,
-      minShapeSize,
-      filterDescription,
       gcodeOptions: {
         feedRate    : 1000,
         plungeRate  : 300,
@@ -879,9 +877,13 @@ app.post('/api/convert/:id', protect, async (req, res) => {
     }
 
     // Step 3: Parse process.py output
-    const analysis     = pyResult.analysis  || {};
-    const dwgInfo      = pyResult.dwg       || {};
-    const gcodeStr     = pyResult.gcode     || '';
+    const analysis     = pyResult.analysis   || {};
+    const dwgInfo      = pyResult.dwg        || {};
+    const gcodeStr     = pyResult.gcode      || '';
+    // v9: full DXF text content emitted directly by process.py — this is the
+    // source of truth for client-side blob downloads (works even if Render's
+    // ephemeral disk wipes the on-disk .dxf file between requests).
+    const dxfContentStr = pyResult.dxfContent || '';
 
     design.status = 'converting';
     pushProgress(design._id.toString(), 'status', { message: 'Saving DXF and preview outputs…', phase: 'saving' });
@@ -898,9 +900,9 @@ app.post('/api/convert/:id', protect, async (req, res) => {
       (dwgInfo.edgePngFilename ? path.join(outputDir, dwgInfo.edgePngFilename) : '');
     const previewPath = edgePngPath && fs.existsSync(edgePngPath) ? edgePngPath : '';
 
-    // v8: process.py writes one .nc per machine type.
-    // dwgInfo.gcodeFilePaths = { laser: '/abs/path/x.nc', ... }
-    // dwgInfo.gcodeFiles     = { laser: 'filename.nc', ... }
+    // v9: gcode generation removed from the algebraic LS pipeline — these maps
+    // will normally be empty, but the per-machine plumbing is kept intact for
+    // backward compatibility if a future pipeline version re-enables it.
     const gcodeFilePaths = dwgInfo.gcodeFilePaths || {};
     const gcodeFilenames = dwgInfo.gcodeFiles     || {};
 
@@ -944,13 +946,20 @@ app.post('/api/convert/:id', protect, async (req, res) => {
       rawText      : analysis.rawText      || '',
       notes        : analysis.notes        || '',
       completedAt  : new Date(),
+      // v9: algebraic least-squares shape-fitting summary
+      circlesDetected: analysis.circlesDetected || 0,
+      rectsDetected   : analysis.rectsDetected   || 0,
+      masterCx        : analysis.masterCx        || 0,
+      shapeSummary    : analysis.shapeSummary    || '',
     };
 
     design.dwg = {
       filename    : dwgInfo.filename   || '',
       path        : previewPath,
       dxfPath     : dxfExists ? dxfPath : '',
-      refinedPngPath : (dwgInfo.edgePngPath && fs.existsSync(dwgInfo.edgePngPath)) ? dwgInfo.edgePngPath : previewPath,
+      // v9: cache full DXF text so /dxf-content and downloadDXF() work even
+      // if the on-disk file is gone (Render ephemeral disk).
+      dxfContent  : dxfContentStr,
       // Primary gcode file (laser, or first available)
       gcodeFile   : gcodeFilePath,
       // Per-machine gcode file paths (absolute) — keyed by machine type
@@ -959,9 +968,6 @@ app.post('/api/convert/:id', protect, async (req, res) => {
       gcodeFilenames: gcodeFilenames,
       entities    : dwgInfo.entities   || 0,
       fileSize    : dwgInfo.fileSize   || 0,
-      refinedShapes  : dwgInfo.refinedShapes  || 0,
-      refinedCircles : dwgInfo.refinedCircles || 0,
-      refinedRects   : dwgInfo.refinedRects   || 0,
       generatedAt : new Date(),
     };
 
@@ -970,7 +976,7 @@ app.post('/api/convert/:id', protect, async (req, res) => {
 
     pushProgress(design._id.toString(), 'complete', {
       message    : 'Conversion complete',
-      dxfReady   : dxfExists,
+      dxfReady   : dxfExists || !!dxfContentStr,
       gcodeReady : !!gcodeFilePath,
     });
 
@@ -979,8 +985,9 @@ app.post('/api/convert/:id', protect, async (req, res) => {
       analysis      : design.aiAnalysis,
       extractedData : extractedData,
       edgePixels    : analysis.edgePixels || 0,
-      message       : 'DXF + preview conversion complete via OpenCV pipeline',
-      dxfReady      : dxfExists,
+      message       : 'DXF + preview conversion complete via Algebraic Least-Squares shape fitting',
+      dxfReady      : dxfExists || !!dxfContentStr,
+      dxfContent    : dxfContentStr,
       previewReady  : !!previewPath,
       gcodeReady    : !!gcodeFilePath,
       // v8: per-machine gcode filenames for the frontend download buttons
@@ -1056,16 +1063,57 @@ app.get('/api/convert/:id/status', protect, async (req, res) => {
 
 // ----------------------------------------------------------------
 // Download .DXF file
+// Falls back to the cached dxfContent text (stored in MongoDB) if the
+// on-disk file is missing — e.g. after a Render restart wipes /uploads.
 // ----------------------------------------------------------------
 app.get('/api/designs/:id/dxf', protect, async (req, res) => {
   try {
     const design = await Design.findOne({ _id: req.params.id, owner: req.user._id });
-    if (!design?.dwg?.dxfPath) return res.status(404).json({ error: 'DXF not generated yet' });
-    if (!fs.existsSync(design.dwg.dxfPath)) return res.status(404).json({ error: 'DXF file missing on disk' });
+    if (!design?.dwg) return res.status(404).json({ error: 'DXF not generated yet' });
+
     const filename = design.dwg.filename || 'part.dxf';
-    res.setHeader('Content-Type', 'application/dxf');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    res.sendFile(path.resolve(design.dwg.dxfPath));
+    const dxfPath  = design.dwg.dxfPath;
+
+    if (dxfPath && fs.existsSync(dxfPath)) {
+      res.setHeader('Content-Type', 'application/dxf');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      return res.sendFile(path.resolve(dxfPath));
+    }
+
+    if (design.dwg.dxfContent) {
+      res.setHeader('Content-Type', 'application/dxf');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      return res.send(design.dwg.dxfContent);
+    }
+
+    return res.status(404).json({ error: 'DXF not available (no file on disk and no cached content)' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ----------------------------------------------------------------
+// Get cached DXF text content as JSON — used by the frontend's
+// client-side blob download (APP.dxfContent), avoiding any dependency
+// on Render's ephemeral disk.
+// GET /api/designs/:id/dxf-content
+// ----------------------------------------------------------------
+app.get('/api/designs/:id/dxf-content', protect, async (req, res) => {
+  try {
+    const design = await Design.findOne({ _id: req.params.id, owner: req.user._id });
+    if (!design?.dwg) return res.status(404).json({ error: 'Design not found' });
+
+    let content = design.dwg.dxfContent || '';
+    if (!content && design.dwg.dxfPath && fs.existsSync(design.dwg.dxfPath)) {
+      content = fs.readFileSync(design.dwg.dxfPath, 'utf8');
+    }
+    if (!content) return res.status(404).json({ error: 'DXF content not available — run conversion first' });
+
+    res.json({
+      dxfContent: content,
+      filename  : design.dwg.filename || 'part.dxf',
+      entities  : design.dwg.entities || 0,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1209,50 +1257,9 @@ app.get('/api/designs/:id/preview-inline', protect, async (req, res) => {
   }
 });
 
-// ----------------------------------------------------------------
-// Refined drawing PNG — base64 data-URI for "View Drawing" button
-// Returns the refined shape PNG (circles + rects) from Step 9.
-// Falls back to the Canny edge PNG if the refined PNG is unavailable.
-// ----------------------------------------------------------------
-app.get('/api/designs/:id/drawing-png', protect, async (req, res) => {
-  try {
-    const design = await Design.findOne({ _id: req.params.id, owner: req.user._id });
-    if (!design) return res.status(404).json({ error: 'Design not found' });
-
-    // Prefer the refined PNG stored in dwg.path; fall back to edgePngPath
-    const candidates = [
-      design.dwg?.refinedPngPath,
-      design.dwg?.path,
-    ].filter(Boolean);
-
-    let pngPath = '';
-    for (const p of candidates) {
-      if (fs.existsSync(p)) { pngPath = p; break; }
-    }
-
-    if (!pngPath) {
-      return res.status(404).json({ error: 'Drawing PNG not generated yet — run conversion first' });
-    }
-
-    const rawBytes = fs.readFileSync(pngPath);
-    const b64      = rawBytes.toString('base64');
-    res.json({
-      dataUri  : `data:image/png;base64,${b64}`,
-      mimeType : 'image/png',
-      filename : path.basename(pngPath),
-      analysis : design.aiAnalysis || {},
-      dwg      : design.dwg        || {},
-      partName : design.partName,
-      refinedShapes  : design.dwg?.refinedShapes  || 0,
-      refinedCircles : design.dwg?.refinedCircles || 0,
-      refinedRects   : design.dwg?.refinedRects   || 0,
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-
+// ================================================================
+// ROUTES — CLOUDINARY SAVE
+// ================================================================
 app.post('/api/cloud/save/:id', protect, async (req, res) => {
   try {
     const design = await Design.findOne({ _id: req.params.id, owner: req.user._id });
