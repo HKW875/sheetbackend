@@ -1,5 +1,7 @@
-# SheetForge v7 — Python Dependencies
-# Pipeline: medianBlur → adaptiveThreshold → MORPH_OPEN → Canny → approxPolyDP → DXF + PDF
+# SheetForge v9 — Python Dependencies
+# Pipeline: medianBlur → adaptiveThreshold → MORPH_OPEN → Canny → approxPolyDP
+#           → Algebraic Least-Squares Shape Fitting (Kasa circle + rect fit)
+#           → dedup/filter/center → DXF (CIRCLE + closed LWPOLYLINE) + PNG + PDF
 
 # Core Computer Vision
 # Use headless variant for server/Render deployment (no GUI/display dependencies)
