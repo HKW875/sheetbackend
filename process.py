@@ -132,22 +132,23 @@ def adaptive_threshold_binarize(blurred):
     )
 
 def morph_clean(binary):
-    kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
-    return cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
-
-def remove_small_blobs(binary, min_area):
     """
-    Remove EVERY 8-connected white blob whose pixel area is below
-    `min_area`. Unlike MORPH_OPEN (which only erodes-then-dilates and can
-    miss speckles or merge them into nearby strokes), this is exact and
-    deterministic: connectedComponentsWithStats labels every blob, and any
-    blob below the threshold is dropped completely, wherever it sits.
-
-    This is what guarantees the cleaned mask used for contour extraction
-    is 100% free of the 1px "salt" dots seen in oven_top_grayscale.png —
-    the same property door_lock_grayscale.png already had "for free"
-    because its source scan simply had no speckle to begin with.
+    Two-stage morphological cleanup:
+      1. MORPH_OPEN (3x3 cross) — erodes away thin spurs/single-pixel
+         protrusions attached to real strokes.
+      2. MORPH_CLOSE (3x3 ellipse) — fills tiny 1px gaps/holes inside real
+         strokes (helps keep a stroke as ONE connected component so it
+         survives connected-component filtering as a single blob, and
+         gives findContours cleaner ring hierarchies for offset-pair
+         averaging).
     """
+    open_kernel  = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  open_kernel,  iterations=1)
+    closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+    return closed
+
+def _remove_small_blobs_once(binary, min_area):
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
     cleaned = np.zeros_like(binary)
     removed_px = 0
@@ -159,6 +160,40 @@ def remove_small_blobs(binary, min_area):
         else:
             removed_px += area
             removed_blobs += 1
+    return cleaned, removed_blobs, removed_px
+
+def remove_small_blobs(binary, min_area, aggressive=True):
+    """
+    Remove EVERY 8-connected white blob whose pixel area is below
+    `min_area`. Unlike MORPH_OPEN (which only erodes-then-dilates and can
+    miss speckles or merge them into nearby strokes), this is exact and
+    deterministic: connectedComponentsWithStats labels every blob, and any
+    blob below the threshold is dropped completely, wherever it sits.
+
+    This is what guarantees the cleaned mask used for contour extraction
+    is 100% free of the 1px "salt" dots seen in oven_top_grayscale.png —
+    the same property door_lock_grayscale.png already had "for free"
+    because its source scan simply had no speckle to begin with.
+
+    When `aggressive=True` (default), a second pass is run: after the
+    first pass, a light MORPH_OPEN (3x3 ellipse) erodes away any thin
+    remnants left clinging to surviving blobs (e.g. a speckle that was
+    8-connected to a real stroke and barely pushed it over `min_area`),
+    and a second connected-component pass removes anything that erosion
+    now drops below `min_area`. This compounds cleanup beyond a single
+    pass while a stable mask (no further small blobs) exits early.
+    """
+    cleaned, removed_blobs, removed_px = _remove_small_blobs_once(binary, min_area)
+
+    if aggressive:
+        erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        eroded = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, erode_kernel, iterations=1)
+        cleaned2, rb2, rp2 = _remove_small_blobs_once(eroded, min_area)
+        if rb2 > 0:
+            cleaned = cleaned2
+            removed_blobs += rb2
+            removed_px += rp2
+
     return cleaned, removed_blobs, removed_px
 
 def canny_edges(cleaned, low_threshold=20, high_threshold=80):
@@ -324,13 +359,23 @@ def _shapes_similar_for_pairing(a, b):
     dc = math.hypot(a['cx'] - b['cx'], a['cy'] - b['cy'])
     if a['type'] == 'circle':
         size_a, size_b = a['r'], b['r']
+        if size_a <= 0 or size_b <= 0:
+            return False
+        size_rel   = abs(size_a - size_b) / max(size_a, size_b)
+        center_tol = max(6.0, 0.08 * max(size_a, size_b))
+        return dc <= center_tol and size_rel <= 0.30
     else:
-        size_a, size_b = max(a['w'], a['h']), max(b['w'], b['h'])
-    if size_a <= 0 or size_b <= 0:
-        return False
-    size_rel   = abs(size_a - size_b) / max(size_a, size_b)
-    center_tol = max(6.0, 0.08 * max(size_a, size_b))
-    return dc <= center_tol and size_rel <= 0.30
+        # For rects, BOTH width and height must independently be similar —
+        # comparing only max(w,h) would (incorrectly) match a thin vertical
+        # strip against a wide rectangle of similar height, as happens when
+        # a stroke fragments into a main outline plus a stray parallel edge.
+        if a['w'] <= 0 or a['h'] <= 0 or b['w'] <= 0 or b['h'] <= 0:
+            return False
+        w_rel = abs(a['w'] - b['w']) / max(a['w'], b['w'])
+        h_rel = abs(a['h'] - b['h']) / max(a['h'], b['h'])
+        size_rel   = max(w_rel, h_rel)
+        center_tol = max(6.0, 0.08 * max(a['w'], a['h'], b['w'], b['h']))
+        return dc <= center_tol and size_rel <= 0.30
 
 def _average_shapes(a, b):
     """
@@ -422,11 +467,20 @@ def _dedup_residual(shapes, kind):
             dc = math.hypot(s['cx'] - s2['cx'], s['cy'] - s2['cy'])
             if kind == 'circle':
                 size_a, size_b = s['r'], s2['r']
+                size_rel   = abs(size_a - size_b) / max(size_a, size_b, 1e-9)
+                center_tol = max(8.0, 0.10 * max(size_a, size_b))
+                similar = dc <= center_tol and size_rel <= 0.30
             else:
-                size_a, size_b = max(s['w'], s['h']), max(s2['w'], s2['h'])
-            size_rel   = abs(size_a - size_b) / max(size_a, size_b, 1e-9)
-            center_tol = max(8.0, 0.10 * max(size_a, size_b))
-            if dc <= center_tol and size_rel <= 0.30:
+                # Require BOTH width and height to match independently —
+                # otherwise a thin stray strip with a similar height (but
+                # very different width) to the real rect would get averaged
+                # into it and corrupt its dimensions.
+                w_rel = abs(s['w'] - s2['w']) / max(s['w'], s2['w'], 1e-9)
+                h_rel = abs(s['h'] - s2['h']) / max(s['h'], s2['h'], 1e-9)
+                size_rel   = max(w_rel, h_rel)
+                center_tol = max(8.0, 0.10 * max(s['w'], s['h'], s2['w'], s2['h']))
+                similar = dc <= center_tol and size_rel <= 0.30
+            if similar:
                 grp.append(s2)
                 used[j] = True
 
@@ -581,9 +635,15 @@ def build_clean_shapes(simplified_contours, parents, children, img_w, img_h,
     circles = _dedup_residual(circles, 'circle')
     rects   = _dedup_residual(rects,   'rect')
 
-    # Step 3: absolute-area noise filter
+    # Step 3: absolute-area noise filter.
+    # With minBlobArea lowered to 20px (to satisfy a <20px speckle-removal
+    # requirement at the mask stage), more small fragments can now reach the
+    # contour stage. Compensate with a higher soft floor here — still far
+    # below any real shape (smallest real shape seen so far: ~8,100px² for
+    # door_lock circles, ~136,000px² for oven_top rects) but well above the
+    # 20-80px speckle fragments this allows through MORPH/CC filtering.
     if min_shape_area is None:
-        min_shape_area = max(HARD_MIN_SHAPE_AREA_PX, 0.00003 * img_w * img_h)
+        min_shape_area = max(HARD_MIN_SHAPE_AREA_PX * 5.0, 0.00008 * img_w * img_h)
 
     circles = [c for c in circles if (math.pi * c['r'] * c['r']) >= min_shape_area]
     rects   = [r for r in rects   if (r['w'] * r['h'])           >= min_shape_area]
@@ -766,9 +826,9 @@ def export_pdf(edges, out_path, orig_bgr=None):
         c.drawString(margin, page_h - 24, "SheetForge — Hierarchy-Aware Shape Fitting Preview")
         c.setFont("Helvetica", 9)
         c.setFillColorRGB(0.5, 0.55, 0.6)
-        from datetime import datetime
+        from datetime import datetime, timezone
         c.drawRightString(page_w - margin, page_h - 24,
-                          f"Generated {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC")
+                          f"Generated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC")
 
         def _arr_to_reader(arr):
             tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
@@ -838,11 +898,11 @@ def main():
         try: opts = json.loads(sys.argv[2])
         except Exception: pass
 
-    blur_ksize     = int(opts.get("blurKsize",    5))
+    blur_ksize     = int(opts.get("blurKsize",    7))    # ← increased from 5: stronger pre-clean
     canny_low      = int(opts.get("cannyLow",    20))
     canny_high     = int(opts.get("cannyHigh",   80))
     epsilon_factor = float(opts.get("epsilonFactor", 0.5))
-    min_blob_area  = int(opts.get("minBlobArea", 50))    # px-area: kills isolated dots/specks
+    min_blob_area  = int(opts.get("minBlobArea", 20))    # ← changed from 50; user-requested <20px
     min_shape_area = opts.get("minShapeArea", None)       # px-area: absolute noise filter
     if min_shape_area is not None:
         min_shape_area = float(min_shape_area)
@@ -869,17 +929,18 @@ def main():
     white_px = int(np.count_nonzero(binary))
     steps.append(step_record("CV-3: Adaptive Threshold", f"{white_px} white px", t0))
 
-    # ── STEP 4: Morph Open ───────────────────────────────────────────────
+    # ── STEP 4: Morph Open + Close ───────────────────────────────────────
     t0 = now_ms()
     opened    = morph_clean(binary)
     opened_px = int(np.count_nonzero(opened))
-    steps.append(step_record("CV-4: MORPH_OPEN", f"{white_px - opened_px} spur px removed", t0))
+    steps.append(step_record("CV-4: MORPH_OPEN (3x3 cross) + MORPH_CLOSE (3x3 ellipse)",
+                              f"{white_px - opened_px} net px change (spurs removed / 1px gaps filled)", t0))
 
-    # ── STEP 5: Connected-Component Speckle Removal ──────────────────────
+    # ── STEP 5: Connected-Component Speckle Removal (two-pass aggressive) ─
     t0 = now_ms()
-    cleaned, removed_blobs, removed_px = remove_small_blobs(opened, min_blob_area)
+    cleaned, removed_blobs, removed_px = remove_small_blobs(opened, min_blob_area, aggressive=True)
     steps.append(step_record(
-        f"CV-5: Connected-Component Filter (minBlobArea={min_blob_area}px)",
+        f"CV-5: Two-pass Connected-Component Filter (minBlobArea={min_blob_area}px)",
         f"{removed_blobs} speckle blob(s) removed ({removed_px}px) — 100% dot-free mask", t0))
 
     # ── STEP 6: Canny (visualisation only) ────────────────────────────────
