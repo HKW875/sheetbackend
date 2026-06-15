@@ -449,6 +449,13 @@ def _dedup_residual(shapes, kind):
     return result
 
 
+# Hard floor: regardless of any other (configurable) area threshold, NO
+# shape with a surface area below this is ever allowed through to the DXF
+# exporter. This is intentionally a constant, not an option — it's the
+# final backstop against degenerate/microscopic contours reaching the DXF.
+HARD_MIN_SHAPE_AREA_PX = 20.0
+
+
 def _circles_overlap(a, b):
     """
     True if circle `a` and circle `b` substantially overlap — i.e. one
@@ -576,7 +583,7 @@ def build_clean_shapes(simplified_contours, parents, children, img_w, img_h,
 
     # Step 3: absolute-area noise filter
     if min_shape_area is None:
-        min_shape_area = max(16.0, 0.00003 * img_w * img_h)
+        min_shape_area = max(HARD_MIN_SHAPE_AREA_PX, 0.00003 * img_w * img_h)
 
     circles = [c for c in circles if (math.pi * c['r'] * c['r']) >= min_shape_area]
     rects   = [r for r in rects   if (r['w'] * r['h'])           >= min_shape_area]
@@ -613,6 +620,12 @@ def build_clean_shapes(simplified_contours, parents, children, img_w, img_h,
     if circles:
         max_r = max(c['r'] for c in circles)
         circles = [c for c in circles if c['r'] >= circle_rel_radius_min * max_r]
+
+    # Step 5: HARD final floor — no shape under HARD_MIN_SHAPE_AREA_PX
+    # (20px²) is ever passed to the DXF exporter, no matter what the
+    # configurable min_shape_area / relative filters above allowed through.
+    circles = [c for c in circles if (math.pi * c['r'] * c['r']) >= HARD_MIN_SHAPE_AREA_PX]
+    rects   = [r for r in rects   if (r['w'] * r['h'])           >= HARD_MIN_SHAPE_AREA_PX]
 
     circles_final = circles
     rects_final   = rects
@@ -898,7 +911,7 @@ def main():
     steps.append(step_record(
         "LS-8/9/10: LS classification + hierarchy offset-pair averaging + residual dedup + area filter",
         f"{len(simplified_contours)} raw contours → {n_rects} rect(s) + {n_circles} circle(s)  "
-        f"(true measured positions, no re-centering)",
+        f"(true measured positions, no re-centering, hard floor={HARD_MIN_SHAPE_AREA_PX:.0f}px²)",
         t0))
 
     # ── Output dir ────────────────────────────────────────────────────────
@@ -961,7 +974,7 @@ def main():
         "cannyHigh"      : canny_high,
         "epsilonFactor"  : epsilon_factor,
         "minBlobArea"    : min_blob_area,
-        "speckleBlobsRemoved": removed_blobs,
+        "hardMinShapeAreaPx": HARD_MIN_SHAPE_AREA_PX,        "speckleBlobsRemoved": removed_blobs,
         "imgW"           : img_w,
         "imgH"           : img_h,
         "scaleMmPerDu"   : round(25.4 / dpi, 4),
