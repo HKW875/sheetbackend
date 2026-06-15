@@ -1,52 +1,9 @@
 #!/usr/bin/env python3
 """
-SheetForge — CV Pipeline  v11  (Hierarchy-Aware Shape Fitting + Real-MM Export)
-================================================================================
+SheetForge — CV Pipeline  v10  (Hierarchy-Aware Shape Fitting)
+================================================================
 Receives: image_path, options_json (from node child_process)
-Outputs:  JSON on stdout  { steps, analysis, dwg, dxfContent, mmDxfContent, pdfAvailable }
-
-WHAT'S NEW IN v11 (on top of v10)
------------------------------------
-v10 already produces a clean, true-position px-space DXF via hierarchy-aware
-offset-pair averaging + algebraic LS shape fitting (rects/circles). v11 ADDS
-a second, independent export path that many CAM workflows want directly:
-
-  1. PROPER THINNING (Zhang-Suen, STEP 5b)
-     The cleaned speckle-free mask is reduced to a true 1px topological
-     skeleton. Unlike a quick erode/dilate loop, Zhang-Suen guarantees a
-     single-pixel centreline without breaking connectivity or shortening
-     strokes — needed so Hough circle radii reflect the stroke centreline,
-     not its outer edge.
-
-  2. MAIN EXTERNAL CONTOUR + VERY TIGHT approxPolyDP (STEP 11b)
-     cv2.findContours(cleaned, RETR_EXTERNAL) finds the part's outer
-     boundary; cv2.approxPolyDP with epsilon ≈ 0.15% of perimeter removes
-     only staircase/anti-aliasing jitter while keeping every real corner.
-
-  3. HOUGH-CIRCLE HOLES FROM THE SKELETON (STEP 11b)
-     cv2.HoughCircles runs on the 1px skeleton so detected hole radii are
-     true centreline radii, exported as real CIRCLE entities.
-
-  4. PIXEL -> MILLIMETRE WITH Y-FLIP (STEP 11b)
-     scale = 25.4 / dpi; every coordinate's Y is flipped
-     (mm_y = (img_h - px_y) * scale) to convert from the image convention
-     (origin top-left, Y-down) to the standard CAD convention (origin
-     bottom-left, Y-up).
-
-  5. SECOND DXF, REAL-WORLD UNITS (STEP 11b)
-     A standalone DXF (`design_mm_<ts>.dxf`) with $INSUNITS=4 (millimeters),
-     $MEASUREMENT=1, layer "OUTLINE" (closed LWPOLYLINE) and layer "HOLES"
-     (CIRCLE per detected hole) — ready to open directly at true scale in
-     any CAD/CAM package.
-
-This is purely ADDITIVE: the original v10 px-space DXF (`design_<ts>.dxf`,
-hierarchy-paired rect/circle shapes) is still produced unchanged; the new
-mm-scale outline+holes DXF is exported alongside it as `mmDxfFilename` /
-`mmDxfAbsPath` in the JSON `dwg` block.
-
-================================================================================
-v10 NOTES (unchanged) — Hierarchy-Aware Shape Fitting
-================================================================================
+Outputs:  JSON on stdout  { steps, analysis, dwg, dxfContent, pdfAvailable }
 
 WHAT CHANGED FROM v9.1 AND WHY
 -------------------------------
@@ -63,6 +20,22 @@ on noisier images (oven_top) for three root causes:
      FIX: cv2.connectedComponentsWithStats() removes EVERY connected
      blob below an area threshold, by construction — not "mostly",
      100% — regardless of where it sits on the page.
+
+  1b. FRAGMENTED STROKES / DOUBLE-STROKE RINGS VS. SPECKLES  (v10.1)
+     A plain area threshold on a fragmented mask is a double-edged
+     sword: if Canny/threshold breaks a REAL stroke — or a hole's
+     concentric double-stroke ring — into several pieces each smaller
+     than minBlobArea, every piece gets deleted too, even though the
+     same shape drawn without gaps would easily clear the threshold.
+     FIX: remove_small_blobs_adaptive() dilates the mask just enough
+     to bridge those small gaps (kernel size self-calibrated per image
+     from its own median stroke width via distance transform), labels
+     + filters on the DILATED mask so the keep/drop decision is made
+     per MERGED feature, then applies that decision back onto the
+     ORIGINAL undilated pixels — so output stroke thickness/position
+     is unchanged, but real fragmented strokes and rings survive while
+     genuinely isolated speckles (of any size, on any image
+     resolution/DPI) are still removed 100%.
 
   2. DOUBLE-EDGE "OFFSET" DUPLICATES
      Running findContours on the *Canny* output means every drawn
@@ -95,7 +68,10 @@ Pipeline:
   2.  Median Blur                (salt-and-pepper pre-clean)
   3.  Adaptive Threshold         (binarise, strokes = WHITE)
   4.  Morph Open                 (remove small attached spurs)
-  5.  Connected-Component Filter (remove EVERY blob < minBlobArea — 100% dot removal)
+  5.  Connected-Component Filter (adaptive, gap-bridging — remove EVERY
+                                   blob < minBlobArea — 100% dot removal,
+                                   without deleting real strokes/rings
+                                   that Canny happened to fragment)
   6.  Canny Edge Detection       (visualisation / PDF preview only)
   7.  Contour + Hierarchy        (cv2.findContours RETR_TREE on the CLEANED MASK)
   8.  Shape Classification       (algebraic LS: Kasa circle fit w/ outlier trim + rect bbox)
@@ -204,6 +180,99 @@ def remove_small_blobs(binary, min_area):
             removed_blobs += 1
     return cleaned, removed_blobs, removed_px
 
+
+def estimate_stroke_width(binary):
+    """
+    Estimate the drawing's typical stroke width (in px) from the binary
+    mask itself via a distance transform: for every foreground pixel,
+    distanceTransform gives its distance to the nearest background pixel,
+    so the median over all foreground pixels approximates the stroke
+    half-width. Doubling it gives a robust full-width estimate that scales
+    naturally with image resolution/DPI -- a high-res scan with thick
+    strokes yields a larger estimate than a small low-res sketch, with no
+    per-image tuning required.
+    """
+    if not np.any(binary):
+        return 1.0
+    dist = cv2.distanceTransform(binary, cv2.DIST_L2, 3)
+    nz = dist[binary > 0]
+    if nz.size == 0:
+        return 1.0
+    return max(1.0, float(np.median(nz)) * 2.0)
+
+
+def remove_small_blobs_adaptive(binary, min_area, dilate_ksize=None):
+    """
+    Resolution-adaptive, gap-safe version of `remove_small_blobs`.
+
+    PROBLEM WITH A PLAIN AREA THRESHOLD ON A FRAGMENTED MASK
+    ----------------------------------------------------------
+    Canny/adaptive-threshold output is rarely one clean, fully-connected
+    blob per real feature. A single drawn stroke can be broken by noise
+    into several small pieces, and a hole drawn as two concentric
+    (double-stroke) circles produces multiple separate ring fragments.
+    If `remove_small_blobs(binary, min_area)` is applied directly to that
+    fragmented mask, every piece is judged ALONE against `min_area` --
+    so a real stroke or a real circle's ring can get fully deleted simply
+    because Canny happened to chop it into pieces each individually
+    smaller than the threshold, even though the same shape drawn without
+    gaps would easily clear it.
+
+    FIX: DILATE -> LABEL -> FILTER -> MASK BACK
+    ----------------------------------------------------------
+    1. Dilate the mask just enough to bridge those small gaps, so
+       fragments of the same real stroke/ring merge into ONE blob.
+    2. Run connected-component labeling + area filtering on the DILATED
+       mask -- decisions are now made per MERGED feature, not per
+       fragment.
+    3. Apply the keep/drop decision back onto the ORIGINAL, undilated
+       pixels (`cv2.bitwise_and`), so stroke thickness/position in the
+       output is completely unchanged -- dilation is only used to make
+       the keep/drop DECISION, never to thicken the actual output.
+
+    RESOLUTION-ADAPTIVE KERNEL
+    ----------------------------------------------------------
+    If `dilate_ksize` isn't given explicitly, it's derived from
+    `estimate_stroke_width(binary)` (median stroke width via distance
+    transform), clamped to an odd value in [3, 9]. This means the same
+    call self-calibrates for a small low-DPI sketch (thin strokes -> 3x3
+    kernel) vs. a large high-DPI scan (thicker strokes -> up to 9x9),
+    without any image-specific tuning.
+
+    `min_area` keeps the exact same meaning as before (the `minBlobArea`
+    option / safety floor) -- it now just operates on correctly-merged
+    blobs instead of arbitrary Canny/threshold fragments.
+
+    Returns (cleaned, removed_blobs, removed_px, dilate_ksize_used).
+    """
+    if not np.any(binary):
+        return binary.copy(), 0, 0, 0
+
+    if dilate_ksize is None:
+        stroke_w = estimate_stroke_width(binary)
+        dilate_ksize = int(np.clip(round(stroke_w), 3, 9))
+        if dilate_ksize % 2 == 0:
+            dilate_ksize += 1
+
+    kernel  = np.ones((dilate_ksize, dilate_ksize), np.uint8)
+    dilated = cv2.dilate(binary, kernel, iterations=1)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(dilated, connectivity=8)
+    keep_mask = np.zeros(labels.shape, dtype=np.uint8)
+    for lbl in range(1, num_labels):  # 0 = background
+        if stats[lbl, cv2.CC_STAT_AREA] >= min_area:
+            keep_mask[labels == lbl] = 255
+
+    cleaned = cv2.bitwise_and(binary, keep_mask)
+
+    removed_px = int(np.count_nonzero(binary)) - int(np.count_nonzero(cleaned))
+
+    num_orig, _, _, _  = cv2.connectedComponentsWithStats(binary,  connectivity=8)
+    num_clean, _, _, _ = cv2.connectedComponentsWithStats(cleaned, connectivity=8)
+    removed_blobs = max(0, (num_orig - 1) - (num_clean - 1))
+
+    return cleaned, removed_blobs, removed_px, dilate_ksize
+
 def canny_edges(cleaned, low_threshold=20, high_threshold=80):
     return cv2.Canny(cleaned, low_threshold, high_threshold)
 
@@ -216,219 +285,13 @@ def clean_edge_preview(edges, min_blob_area=3):
     extraction, which runs on `cleaned`, not `edges` — so they cannot
     affect the DXF). Removing them here makes the preview match the
     "no dots" look of door_lock_grayscale.png for ANY input image.
+
+    Uses the same adaptive gap-bridging filter as Step 5 so that thin,
+    fragmented Canny edge lines (which this preview is full of) don't get
+    accidentally chopped up by the speckle removal itself.
     """
-    edges_clean, removed_blobs, removed_px = remove_small_blobs(edges, min_blob_area)
+    edges_clean, removed_blobs, removed_px, _ = remove_small_blobs_adaptive(edges, min_blob_area)
     return edges_clean, removed_blobs, removed_px
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# STEP 5b — ZHANG-SUEN THINNING (proper 1px skeletonisation)
-# ════════════════════════════════════════════════════════════════════════════
-
-def zhang_suen_thinning(binary, max_iter=60):
-    """
-    Proper Zhang-Suen thinning of a {0,255} binary mask down to a true 1px
-    skeleton.
-
-    WHY THIS REPLACES "ERODE THEN DILATE" THINNING
-    -----------------------------------------------
-    A naive `while True: erode -> dilate -> subtract -> OR-into-skeleton`
-    loop (as in quick one-off scripts) does NOT reliably converge to a
-    single-pixel-wide centreline: depending on the kernel and stroke
-    geometry it can leave 2px-wide residue on diagonal strokes, create
-    small gaps at junctions, or erode away short spurs/corners entirely.
-
-    Zhang-Suen instead repeatedly removes only "boundary" pixels that are
-    provably safe to delete without breaking 8-connectivity or shortening
-    the skeleton (the B/A neighbour-count + zero-pattern conditions below),
-    alternating two sub-iterations until no pixel qualifies for removal.
-    The result is a topologically faithful 1px centreline for every stroke
-    — exactly what HoughCircles needs to report a hole's TRUE radius
-    (the centreline radius), not the outer-edge radius of a thick stroke.
-
-    `max_iter` caps the number of full (sub-iteration A + B) passes as a
-    safety net for pathological inputs; in practice convergence on
-    sketch-sized strokes (a handful of px wide) takes well under 20 passes.
-    """
-    img = (binary > 0).astype(np.uint8)
-
-    for _ in range(max_iter):
-        changed = False
-        for step in (0, 1):
-            p2 = np.roll(img,  1, axis=0)
-            p3 = np.roll(np.roll(img,  1, axis=0), -1, axis=1)
-            p4 = np.roll(img, -1, axis=1)
-            p5 = np.roll(np.roll(img, -1, axis=0), -1, axis=1)
-            p6 = np.roll(img, -1, axis=0)
-            p7 = np.roll(np.roll(img, -1, axis=0),  1, axis=1)
-            p8 = np.roll(img,  1, axis=1)
-            p9 = np.roll(np.roll(img,  1, axis=0),  1, axis=1)
-
-            neigh = [p2, p3, p4, p5, p6, p7, p8, p9]
-            B = sum(neigh)
-
-            # A = number of 0->1 transitions walking p2..p9 then back to p2
-            seq = neigh + [p2]
-            A = np.zeros_like(img, dtype=np.uint8)
-            for k in range(8):
-                A += ((seq[k] == 0) & (seq[k + 1] == 1)).astype(np.uint8)
-
-            base = (img == 1) & (B >= 2) & (B <= 6) & (A == 1)
-            if step == 0:
-                cond = base & (p2 * p4 * p6 == 0) & (p4 * p6 * p8 == 0)
-            else:
-                cond = base & (p2 * p4 * p8 == 0) & (p2 * p6 * p8 == 0)
-
-            if cond.any():
-                img[cond] = 0
-                changed = True
-
-        if not changed:
-            break
-
-    return (img * 255).astype(np.uint8)
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# STEP 11b — MAIN-OUTLINE + HOUGH-CIRCLE HOLES, IN REAL MILLIMETRES
-# ════════════════════════════════════════════════════════════════════════════
-
-def extract_main_outline_and_holes(cleaned, skeleton, dpi, img_h,
-                                    epsilon_factor_tight=0.0015,
-                                    hough_min_radius_px=8,
-                                    hough_max_radius_px=400,
-                                    coverage_threshold=0.7):
-    """
-    A second, simpler export path that produces real-world millimetre
-    geometry from just two OpenCV operations:
-
-      1. MAIN EXTERNAL CONTOUR
-         cv2.findContours(cleaned, RETR_EXTERNAL, CHAIN_APPROX_NONE) on the
-         speckle-free stroke mask (NOT the 1px skeleton — a skeleton's own
-         outer boundary is itself, which would collapse a drawn outline to
-         a zero-width contour). The largest-area external contour is the
-         part's outer boundary.
-
-      2. VERY TIGHT approxPolyDP
-         epsilon = epsilon_factor_tight * perimeter (default 0.15%). This
-         removes only staircase/anti-aliasing jitter while preserving every
-         genuine corner — far tighter than the v10 shape-classification
-         epsilon, which is intentionally loose because it feeds an
-         algebraic rect/circle fit rather than an exact polyline.
-
-      3. HOUGH CIRCLES ON THE THINNED SKELETON, COVERAGE-VERIFIED
-         cv2.HoughCircles runs on `skeleton` (the Zhang-Suen 1px
-         centreline), not on `cleaned`. A thick stroke's HoughCircles
-         radius is biased toward the OUTER edge of the ring; the skeleton's
-         radius is the stroke centreline — the dimension a CAM operator
-         actually wants for a bore/hole.
-
-         HoughCircles on a sparse 1px skeleton readily proposes spurious
-         circles that fit a rectangle's corner/edge segments (their centre
-         and radius satisfy the Hough accumulator locally without the
-         circle actually being drawn). Each candidate is therefore
-         VERIFIED by sampling 72 points around its circumference and
-         measuring what fraction land on a 2px-dilated skeleton pixel —
-         a real drawn circle scores ~0.95+, a corner/edge false-positive
-         typically scores well under 0.3. Only candidates scoring at or
-         above `coverage_threshold` are kept as real holes.
-
-      4. PIXEL -> MILLIMETRE, WITH Y-FLIP
-         scale = 25.4 / dpi. Every point's Y is flipped via
-         `mm_y = (img_h - px_y) * scale` so the output uses the standard
-         CAD convention (origin bottom-left, Y increasing upward) instead
-         of the image convention (origin top-left, Y increasing downward).
-
-    Returns:
-      outline_mm : [(x_mm, y_mm), ...] closed outer-boundary polygon
-      holes_mm   : [(cx_mm, cy_mm, r_mm), ...] one tuple per detected hole
-      scale      : the px -> mm factor that was applied
-    """
-    scale = 25.4 / float(dpi) if dpi and dpi > 1 else 25.4 / 96.0
-
-    contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    if not contours:
-        return [], [], scale
-
-    main_contour = max(contours, key=cv2.contourArea)
-    perim   = cv2.arcLength(main_contour, closed=True)
-    epsilon = max(epsilon_factor_tight * perim, 0.5)
-    approx  = cv2.approxPolyDP(main_contour, epsilon, closed=True)
-
-    outline_mm = []
-    for p in approx:
-        px, py = float(p[0][0]), float(p[0][1])
-        outline_mm.append((px * scale, (img_h - py) * scale))
-
-    holes_mm = []
-    circles = cv2.HoughCircles(
-        skeleton, cv2.HOUGH_GRADIENT, dp=1,
-        minDist=max(20, hough_min_radius_px * 2),
-        param1=50, param2=25,
-        minRadius=hough_min_radius_px, maxRadius=hough_max_radius_px,
-    )
-    if circles is not None:
-        dil = cv2.dilate(skeleton, np.ones((5, 5), np.uint8), iterations=1)
-        h_img, w_img = dil.shape[:2]
-        n_samples = 72
-        angles = np.linspace(0, 2 * np.pi, n_samples, endpoint=False)
-
-        for x, y, r in np.round(circles[0, :]).astype(float):
-            xs = np.round(x + r * np.cos(angles)).astype(int)
-            ys = np.round(y + r * np.sin(angles)).astype(int)
-            valid = (xs >= 0) & (xs < w_img) & (ys >= 0) & (ys < h_img)
-            hits = 0
-            if valid.any():
-                hits = int(dil[ys[valid], xs[valid]].astype(bool).sum())
-            coverage = hits / float(n_samples)
-            if coverage >= coverage_threshold:
-                holes_mm.append((x * scale, (img_h - y) * scale, r * scale))
-
-    return outline_mm, holes_mm, scale
-
-
-def build_mm_dxf(outline_mm, holes_mm, out_path):
-    """
-    Writes a standalone, real-world-scale DXF:
-      - $INSUNITS = 4 (millimeters) + $MEASUREMENT = 1 (metric) in the
-        header, so CAD/CAM software imports the part at true physical size.
-      - Layer "OUTLINE": one closed LWPOLYLINE for the main external contour.
-      - Layer "HOLES":   one CIRCLE entity per Hough-detected hole.
-    All coordinates are already millimetres with a bottom-left, Y-up CAD
-    origin (see extract_main_outline_and_holes).
-    """
-    if not HAS_DXF or not outline_mm:
-        return None, 0, 0
-
-    doc = ezdxf.new(dxfversion="R2018")
-    doc.header["$INSUNITS"]    = 4   # 4 = Millimeters
-    doc.header["$MEASUREMENT"] = 1   # 1 = Metric
-
-    xs = [p[0] for p in outline_mm]
-    ys = [p[1] for p in outline_mm]
-    doc.header["$EXTMIN"] = (min(xs), min(ys), 0.0)
-    doc.header["$EXTMAX"] = (max(xs), max(ys), 0.0)
-    doc.header["$LIMMIN"] = (min(xs), min(ys))
-    doc.header["$LIMMAX"] = (max(xs), max(ys))
-
-    msp = doc.modelspace()
-    doc.layers.new("OUTLINE", dxfattribs={"color": 7, "linetype": "CONTINUOUS"})
-    doc.layers.new("HOLES",   dxfattribs={"color": 1, "linetype": "CONTINUOUS"})
-
-    poly = msp.add_lwpolyline(
-        outline_mm, format="xy",
-        dxfattribs={"layer": "OUTLINE", "color": 256},
-    )
-    poly.close(True)
-    entity_count = 1
-
-    for cx, cy, r in holes_mm:
-        msp.add_circle((cx, cy, 0.0), r, dxfattribs={"layer": "HOLES", "color": 256})
-        entity_count += 1
-
-    doc.saveas(str(out_path))
-    file_size = out_path.stat().st_size
-    return doc, entity_count, file_size
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1115,20 +978,15 @@ def main():
     opened_px = int(np.count_nonzero(opened))
     steps.append(step_record("CV-4: MORPH_OPEN", f"{white_px - opened_px} spur px removed", t0))
 
-    # ── STEP 5: Connected-Component Speckle Removal ──────────────────────
+    # ── STEP 5: Connected-Component Speckle Removal (adaptive) ───────────
     t0 = now_ms()
-    cleaned, removed_blobs, removed_px = remove_small_blobs(opened, min_blob_area)
+    cleaned, removed_blobs, removed_px, dilate_ksize = remove_small_blobs_adaptive(
+        opened, min_blob_area)
     steps.append(step_record(
-        f"CV-5: Connected-Component Filter (minBlobArea={min_blob_area}px)",
-        f"{removed_blobs} speckle blob(s) removed ({removed_px}px) — 100% dot-free mask", t0))
-
-    # ── STEP 5b: Zhang-Suen Thinning (1px skeleton, for Hough hole-circles)
-    t0 = now_ms()
-    skeleton    = zhang_suen_thinning(cleaned)
-    skeleton_px = int(np.count_nonzero(skeleton))
-    steps.append(step_record(
-        "CV-5b: Zhang-Suen Thinning",
-        f"{skeleton_px}px 1-pixel-wide skeleton (centreline) extracted", t0))
+        f"CV-5: Adaptive Connected-Component Filter (minBlobArea={min_blob_area}px, "
+        f"gap-bridge kernel={dilate_ksize}x{dilate_ksize} auto)",
+        f"{removed_blobs} speckle blob(s) removed ({removed_px}px) — 100% dot-free mask, "
+        f"real fragmented strokes/rings preserved", t0))
 
     # ── STEP 6: Canny (visualisation only) ────────────────────────────────
     t0 = now_ms()
@@ -1191,29 +1049,6 @@ def main():
         "DXF-11: Clean export (CIRCLE + closed LWPOLYLINE, one entity per shape, true position)",
         f"{entity_count} entities  |  {dxf_size // 1024 if dxf_size else 0} KB", t0))
 
-    # ── STEP 11b: Real-millimetre outline + Hough-circle holes DXF ────────
-    t0 = now_ms()
-    mm_dxf_name = f"design_mm_{ts_str}.dxf"
-    mm_dxf_path = server_out_dir / mm_dxf_name
-
-    outline_mm, holes_mm, mm_scale = extract_main_outline_and_holes(
-        cleaned, skeleton, dpi, img_h)
-    _, mm_entity_count, mm_dxf_size = build_mm_dxf(outline_mm, holes_mm, mm_dxf_path)
-
-    mm_dxf_content_str = ""
-    if mm_dxf_size and mm_dxf_size > 0:
-        try:
-            with open(mm_dxf_path, encoding="utf-8", errors="replace") as f:
-                mm_dxf_content_str = f.read(200_000)
-        except Exception:
-            pass
-
-    steps.append(step_record(
-        "DXF-11b: Real-mm export (main external contour, tight approxPolyDP, "
-        "Hough-circle holes from skeleton, $INSUNITS=mm)",
-        f"{len(outline_mm)}-pt outline + {len(holes_mm)} hole(s)  |  "
-        f"{mm_dxf_size // 1024 if mm_dxf_size else 0} KB  |  scale={mm_scale:.4f} mm/px", t0))
-
     # ── STEP 12: PNG comparison preview ───────────────────────────────────
     t0 = now_ms()
     png_ok   = build_comparison_png(edges, final_shapes, img_w, img_h, png_path)
@@ -1245,6 +1080,7 @@ def main():
         "cannyHigh"      : canny_high,
         "epsilonFactor"  : epsilon_factor,
         "minBlobArea"    : min_blob_area,
+        "dilateKsize"    : dilate_ksize,
         "speckleBlobsRemoved": removed_blobs,
         "imgW"           : img_w,
         "imgH"           : img_h,
@@ -1257,11 +1093,6 @@ def main():
             f" — speckle-free mask, hierarchy offset-pairs averaged to centreline,"
             f" true measured positions"
         ),
-        "skeletonPixels" : skeleton_px,
-        "mmScale"        : round(mm_scale, 6),
-        "mmOutlinePoints": len(outline_mm),
-        "mmHolesDetected": len(holes_mm),
-        "mmCoordSystem"  : "origin=bottom-left, Y-up, millimetres ($INSUNITS=4)",
     }
 
     print(json.dumps({
@@ -1275,17 +1106,11 @@ def main():
             "pdfFilename"     : pdf_name if pdf_ok else "",
             "edgePngFilename" : png_name if png_ok else "",
             "edgePngPath"     : str(png_path) if png_ok else "",
-            "mmDxfFilename"   : mm_dxf_name if mm_dxf_size else "",
-            "mmDxfAbsPath"    : str(mm_dxf_path) if mm_dxf_size else "",
-            "mmDxfEntities"   : mm_entity_count,
-            "mmDxfFileSize"   : mm_dxf_size or 0,
             "gcodeFiles"      : {},
             "gcodeFilePaths"  : {},
         },
         "dxfContent"   : dxf_content_str,
-        "mmDxfContent" : mm_dxf_content_str,
         "dxfAvailable" : bool(dxf_size and dxf_size > 0),
-        "mmDxfAvailable": bool(mm_dxf_size and mm_dxf_size > 0),
         "pdfAvailable" : pdf_ok,
         "pngAvailable" : png_ok,
         "gcodeAvailable": False,
