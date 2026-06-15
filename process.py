@@ -877,46 +877,6 @@ def main():
     steps.append(step_record(f"CV-6: Canny (lo={canny_low}, hi={canny_high}) + dot cleanup",
                               f"{edge_px} edge px (preview only), {edge_dot_blobs} stray dot(s) removed", t0))
 
-    # ── STEP 6b: Dilate-Bridge Connected-Component Filter (pre-contour) ──
-    # Incorporated as-is from newcode.py: bridges small gaps in the
-    # cleaned mask so fragmented outline pieces and concentric
-    # double-stroke rings merge into one large blob each, then keeps only
-    # blobs above min_area on the ORIGINAL (undilated) pixels — applied
-    # to `cleaned` right before it is handed to findContours/approxPolyDP.
-    t0 = now_ms()
-
-    binary = cleaned
-
-    # Step 1: dilate slightly to bridge small Canny gaps -- this merges
-    # fragmented outline pieces and concentric circle rings into one
-    # large blob each, without merging separate speckles into anything big
-    kernel = np.ones((3, 3), np.uint8)
-    dilated = cv2.dilate(binary, kernel, iterations=1)
-
-    # Step 2: connected components on the DILATED mask
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(dilated, connectivity=8)
-
-    # Step 3: filter -- after dilation, the gap between "real geometry"
-    # and "speckle/text" sizes is huge and unambiguous:
-    #   main outline = 115,663px, circles = 4,027px / 2,221+1,577px
-    #   text label = 928/564/535px, all speckles <= 352px
-    min_area = 1000
-    keep_mask = np.zeros(labels.shape, dtype=np.uint8)
-    for i in range(1, num_labels):
-        if stats[i, cv2.CC_STAT_AREA] >= min_area:
-            keep_mask[labels == i] = 255
-
-    # Step 4: apply the keep-mask back onto the ORIGINAL (undilated) binary
-    # so line thickness/position stays exactly as in the source image
-    clean = cv2.bitwise_and(binary, keep_mask)
-
-    cleaned_px_before = int(np.count_nonzero(cleaned))
-    cleaned = clean
-    cleaned_px_after = int(np.count_nonzero(cleaned))
-    steps.append(step_record(
-        f"CV-6b: Dilate-Bridge Connected-Component Filter (kernel=3x3, minArea={min_area}px)",
-        f"{cleaned_px_before - cleaned_px_after}px removed — gap-bridged outline/rings preserved", t0))
-
     # ── STEP 7: Contour + hierarchy extraction on CLEANED MASK ────────────
     t0 = now_ms()
     simplified_contours, parents, children = extract_contours_with_hierarchy(cleaned, epsilon_factor)
