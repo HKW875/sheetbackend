@@ -21,22 +21,6 @@ on noisier images (oven_top) for three root causes:
      blob below an area threshold, by construction — not "mostly",
      100% — regardless of where it sits on the page.
 
-  1b. FRAGMENTED STROKES / DOUBLE-STROKE RINGS VS. SPECKLES  (v10.1)
-     A plain area threshold on a fragmented mask is a double-edged
-     sword: if Canny/threshold breaks a REAL stroke — or a hole's
-     concentric double-stroke ring — into several pieces each smaller
-     than minBlobArea, every piece gets deleted too, even though the
-     same shape drawn without gaps would easily clear the threshold.
-     FIX: remove_small_blobs_adaptive() dilates the mask just enough
-     to bridge those small gaps (kernel size self-calibrated per image
-     from its own median stroke width via distance transform), labels
-     + filters on the DILATED mask so the keep/drop decision is made
-     per MERGED feature, then applies that decision back onto the
-     ORIGINAL undilated pixels — so output stroke thickness/position
-     is unchanged, but real fragmented strokes and rings survive while
-     genuinely isolated speckles (of any size, on any image
-     resolution/DPI) are still removed 100%.
-
   2. DOUBLE-EDGE "OFFSET" DUPLICATES
      Running findContours on the *Canny* output means every drawn
      line produces TWO parallel contours (its inner edge and its
@@ -68,10 +52,7 @@ Pipeline:
   2.  Median Blur                (salt-and-pepper pre-clean)
   3.  Adaptive Threshold         (binarise, strokes = WHITE)
   4.  Morph Open                 (remove small attached spurs)
-  5.  Connected-Component Filter (adaptive, gap-bridging — remove EVERY
-                                   blob < minBlobArea — 100% dot removal,
-                                   without deleting real strokes/rings
-                                   that Canny happened to fragment)
+  5.  Connected-Component Filter (remove EVERY blob < minBlobArea — 100% dot removal)
   6.  Canny Edge Detection       (visualisation / PDF preview only)
   7.  Contour + Hierarchy        (cv2.findContours RETR_TREE on the CLEANED MASK)
   8.  Shape Classification       (algebraic LS: Kasa circle fit w/ outlier trim + rect bbox)
@@ -180,99 +161,6 @@ def remove_small_blobs(binary, min_area):
             removed_blobs += 1
     return cleaned, removed_blobs, removed_px
 
-
-def estimate_stroke_width(binary):
-    """
-    Estimate the drawing's typical stroke width (in px) from the binary
-    mask itself via a distance transform: for every foreground pixel,
-    distanceTransform gives its distance to the nearest background pixel,
-    so the median over all foreground pixels approximates the stroke
-    half-width. Doubling it gives a robust full-width estimate that scales
-    naturally with image resolution/DPI -- a high-res scan with thick
-    strokes yields a larger estimate than a small low-res sketch, with no
-    per-image tuning required.
-    """
-    if not np.any(binary):
-        return 1.0
-    dist = cv2.distanceTransform(binary, cv2.DIST_L2, 3)
-    nz = dist[binary > 0]
-    if nz.size == 0:
-        return 1.0
-    return max(1.0, float(np.median(nz)) * 2.0)
-
-
-def remove_small_blobs_adaptive(binary, min_area, dilate_ksize=None):
-    """
-    Resolution-adaptive, gap-safe version of `remove_small_blobs`.
-
-    PROBLEM WITH A PLAIN AREA THRESHOLD ON A FRAGMENTED MASK
-    ----------------------------------------------------------
-    Canny/adaptive-threshold output is rarely one clean, fully-connected
-    blob per real feature. A single drawn stroke can be broken by noise
-    into several small pieces, and a hole drawn as two concentric
-    (double-stroke) circles produces multiple separate ring fragments.
-    If `remove_small_blobs(binary, min_area)` is applied directly to that
-    fragmented mask, every piece is judged ALONE against `min_area` --
-    so a real stroke or a real circle's ring can get fully deleted simply
-    because Canny happened to chop it into pieces each individually
-    smaller than the threshold, even though the same shape drawn without
-    gaps would easily clear it.
-
-    FIX: DILATE -> LABEL -> FILTER -> MASK BACK
-    ----------------------------------------------------------
-    1. Dilate the mask just enough to bridge those small gaps, so
-       fragments of the same real stroke/ring merge into ONE blob.
-    2. Run connected-component labeling + area filtering on the DILATED
-       mask -- decisions are now made per MERGED feature, not per
-       fragment.
-    3. Apply the keep/drop decision back onto the ORIGINAL, undilated
-       pixels (`cv2.bitwise_and`), so stroke thickness/position in the
-       output is completely unchanged -- dilation is only used to make
-       the keep/drop DECISION, never to thicken the actual output.
-
-    RESOLUTION-ADAPTIVE KERNEL
-    ----------------------------------------------------------
-    If `dilate_ksize` isn't given explicitly, it's derived from
-    `estimate_stroke_width(binary)` (median stroke width via distance
-    transform), clamped to an odd value in [3, 9]. This means the same
-    call self-calibrates for a small low-DPI sketch (thin strokes -> 3x3
-    kernel) vs. a large high-DPI scan (thicker strokes -> up to 9x9),
-    without any image-specific tuning.
-
-    `min_area` keeps the exact same meaning as before (the `minBlobArea`
-    option / safety floor) -- it now just operates on correctly-merged
-    blobs instead of arbitrary Canny/threshold fragments.
-
-    Returns (cleaned, removed_blobs, removed_px, dilate_ksize_used).
-    """
-    if not np.any(binary):
-        return binary.copy(), 0, 0, 0
-
-    if dilate_ksize is None:
-        stroke_w = estimate_stroke_width(binary)
-        dilate_ksize = int(np.clip(round(stroke_w), 3, 9))
-        if dilate_ksize % 2 == 0:
-            dilate_ksize += 1
-
-    kernel  = np.ones((dilate_ksize, dilate_ksize), np.uint8)
-    dilated = cv2.dilate(binary, kernel, iterations=1)
-
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(dilated, connectivity=8)
-    keep_mask = np.zeros(labels.shape, dtype=np.uint8)
-    for lbl in range(1, num_labels):  # 0 = background
-        if stats[lbl, cv2.CC_STAT_AREA] >= min_area:
-            keep_mask[labels == lbl] = 255
-
-    cleaned = cv2.bitwise_and(binary, keep_mask)
-
-    removed_px = int(np.count_nonzero(binary)) - int(np.count_nonzero(cleaned))
-
-    num_orig, _, _, _  = cv2.connectedComponentsWithStats(binary,  connectivity=8)
-    num_clean, _, _, _ = cv2.connectedComponentsWithStats(cleaned, connectivity=8)
-    removed_blobs = max(0, (num_orig - 1) - (num_clean - 1))
-
-    return cleaned, removed_blobs, removed_px, dilate_ksize
-
 def canny_edges(cleaned, low_threshold=20, high_threshold=80):
     return cv2.Canny(cleaned, low_threshold, high_threshold)
 
@@ -285,12 +173,8 @@ def clean_edge_preview(edges, min_blob_area=3):
     extraction, which runs on `cleaned`, not `edges` — so they cannot
     affect the DXF). Removing them here makes the preview match the
     "no dots" look of door_lock_grayscale.png for ANY input image.
-
-    Uses the same adaptive gap-bridging filter as Step 5 so that thin,
-    fragmented Canny edge lines (which this preview is full of) don't get
-    accidentally chopped up by the speckle removal itself.
     """
-    edges_clean, removed_blobs, removed_px, _ = remove_small_blobs_adaptive(edges, min_blob_area)
+    edges_clean, removed_blobs, removed_px = remove_small_blobs(edges, min_blob_area)
     return edges_clean, removed_blobs, removed_px
 
 
@@ -978,15 +862,12 @@ def main():
     opened_px = int(np.count_nonzero(opened))
     steps.append(step_record("CV-4: MORPH_OPEN", f"{white_px - opened_px} spur px removed", t0))
 
-    # ── STEP 5: Connected-Component Speckle Removal (adaptive) ───────────
+    # ── STEP 5: Connected-Component Speckle Removal ──────────────────────
     t0 = now_ms()
-    cleaned, removed_blobs, removed_px, dilate_ksize = remove_small_blobs_adaptive(
-        opened, min_blob_area)
+    cleaned, removed_blobs, removed_px = remove_small_blobs(opened, min_blob_area)
     steps.append(step_record(
-        f"CV-5: Adaptive Connected-Component Filter (minBlobArea={min_blob_area}px, "
-        f"gap-bridge kernel={dilate_ksize}x{dilate_ksize} auto)",
-        f"{removed_blobs} speckle blob(s) removed ({removed_px}px) — 100% dot-free mask, "
-        f"real fragmented strokes/rings preserved", t0))
+        f"CV-5: Connected-Component Filter (minBlobArea={min_blob_area}px)",
+        f"{removed_blobs} speckle blob(s) removed ({removed_px}px) — 100% dot-free mask", t0))
 
     # ── STEP 6: Canny (visualisation only) ────────────────────────────────
     t0 = now_ms()
@@ -995,6 +876,46 @@ def main():
     edge_px = int(np.count_nonzero(edges))
     steps.append(step_record(f"CV-6: Canny (lo={canny_low}, hi={canny_high}) + dot cleanup",
                               f"{edge_px} edge px (preview only), {edge_dot_blobs} stray dot(s) removed", t0))
+
+    # ── STEP 6b: Dilate-Bridge Connected-Component Filter (pre-contour) ──
+    # Incorporated as-is from newcode.py: bridges small gaps in the
+    # cleaned mask so fragmented outline pieces and concentric
+    # double-stroke rings merge into one large blob each, then keeps only
+    # blobs above min_area on the ORIGINAL (undilated) pixels — applied
+    # to `cleaned` right before it is handed to findContours/approxPolyDP.
+    t0 = now_ms()
+
+    binary = cleaned
+
+    # Step 1: dilate slightly to bridge small Canny gaps -- this merges
+    # fragmented outline pieces and concentric circle rings into one
+    # large blob each, without merging separate speckles into anything big
+    kernel = np.ones((3, 3), np.uint8)
+    dilated = cv2.dilate(binary, kernel, iterations=1)
+
+    # Step 2: connected components on the DILATED mask
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(dilated, connectivity=8)
+
+    # Step 3: filter -- after dilation, the gap between "real geometry"
+    # and "speckle/text" sizes is huge and unambiguous:
+    #   main outline = 115,663px, circles = 4,027px / 2,221+1,577px
+    #   text label = 928/564/535px, all speckles <= 352px
+    min_area = 1000
+    keep_mask = np.zeros(labels.shape, dtype=np.uint8)
+    for i in range(1, num_labels):
+        if stats[i, cv2.CC_STAT_AREA] >= min_area:
+            keep_mask[labels == i] = 255
+
+    # Step 4: apply the keep-mask back onto the ORIGINAL (undilated) binary
+    # so line thickness/position stays exactly as in the source image
+    clean = cv2.bitwise_and(binary, keep_mask)
+
+    cleaned_px_before = int(np.count_nonzero(cleaned))
+    cleaned = clean
+    cleaned_px_after = int(np.count_nonzero(cleaned))
+    steps.append(step_record(
+        f"CV-6b: Dilate-Bridge Connected-Component Filter (kernel=3x3, minArea={min_area}px)",
+        f"{cleaned_px_before - cleaned_px_after}px removed — gap-bridged outline/rings preserved", t0))
 
     # ── STEP 7: Contour + hierarchy extraction on CLEANED MASK ────────────
     t0 = now_ms()
@@ -1080,7 +1001,6 @@ def main():
         "cannyHigh"      : canny_high,
         "epsilonFactor"  : epsilon_factor,
         "minBlobArea"    : min_blob_area,
-        "dilateKsize"    : dilate_ksize,
         "speckleBlobsRemoved": removed_blobs,
         "imgW"           : img_w,
         "imgH"           : img_h,
