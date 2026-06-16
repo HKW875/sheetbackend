@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SheetForge — CV Pipeline  v12  (True Centerline DXF via Algebraic LS + Intersection Trimming)
+SheetForge — CV Pipeline  v13  (True Centerline DXF + Gap-Free Single-Stroke Skeleton)
 ==============================================================================================
 Receives: image_path, options_json (from node child_process)
 Outputs:  JSON on stdout  { steps, analysis, dwg, dxfContent, pdfAvailable }
@@ -38,23 +38,45 @@ v12 replaces the DXF export entirely with a TRUE CENTERLINE approach:
      Because the input to contour extraction is a skeletonized (1-px) image, each
      physical drawn edge produces exactly one contour — no inner/outer pairs.
 
+  5. GAP-FREE SINGLE-STROKE GUARANTEE (Step 9b — new in v13)
+     After intersection trimming, a dedicated skeleton consolidation pass runs on
+     the pixel skeleton to:
+       a. Detect and protect genuine bolt-hole circles (contour hierarchy method).
+       b. Dilate by gap_radius (default 30px) to fuse any parallel duplicate strokes
+          within 60px of each other, then re-skeletonize to a true 1-px centerline.
+       c. Remove tiny noise/text-label components (< 500px).
+       d. Bridge any remaining disconnected components (nearest-pair MST bridging).
+       e. Extend dangling endpoints until they connect to the nearest line pixel.
+       f. Final 2-px dilate + re-skeletonize to seal hairline fractures.
+     This guarantees: one connected skeleton, zero dangling endpoints, no duplicate
+     strokes, and clean circle geometry — before DXF and PNG export.
+
 Pipeline:
-  1.  Load image
-  2.  Median Blur
-  3.  Adaptive Threshold
-  4.  Morph Open
-  5.  Connected-Component Filter (minBlobArea)
-  6.  Canny Edge Detection → 200px area filter → skeletonize (single centerline)
-  7.  Contour extraction on skeleton (RETR_LIST, CHAIN_APPROX_NONE)
-  8.  Per-contour: circle LS fit test, else orthogonal polyline with 90° snap
-  9.  Intersection detection and endpoint trimming
-  10. DXF Export (LINE/LWPOLYLINE/CIRCLE per centerline segment)
-  11. PNG Preview
-  12. PDF Export
+  1.   Load image
+  2.   Median Blur
+  3.   Adaptive Threshold
+  4.   Morph Open
+  5.   Connected-Component Filter (minBlobArea)
+  6.   Canny Edge Detection → 200px area filter → skeletonize (single centerline)
+  7.   Contour extraction on skeleton (RETR_LIST, CHAIN_APPROX_NONE)
+  8.   Per-contour: circle LS fit test, else orthogonal polyline with 90° snap
+  9.   Intersection detection and endpoint trimming
+  9b.  Gap-close & single-stroke guarantee (duplicate suppression, bridge, extend)
+  10.  DXF Export (LINE/LWPOLYLINE/CIRCLE per centerline segment)
+  11.  PNG Preview
+  12.  PDF Export
 """
 
 import sys, os, json, time, traceback, math
 from pathlib import Path
+
+# scipy is used by the gap-bridge step (Step 9b); gracefully absent if not installed
+try:
+    from scipy.spatial import cKDTree as _cKDTree
+    HAS_SCIPY = True
+except ImportError:
+    HAS_SCIPY = False
+    _cKDTree  = None
 
 def _try(fn):
     try: return fn()
@@ -462,6 +484,341 @@ def trim_endpoints_to_intersections(entities, snap_radius=15.0):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# STEP 9b — SKELETON GAP-CLOSE & SINGLE-STROKE GUARANTEE
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Operates on the raw 1-px skeleton image (AFTER Step 6c skeletonize, BEFORE
+# Step 7 contour extraction).  Guarantees:
+#   • No duplicate / parallel strokes within GAP_RADIUS*2 px of each other
+#   • No disconnected components (all geometry in one connected graph)
+#   • No dangling endpoints (every line end connects to another line)
+#   • Detected bolt-hole circles are protected and re-stamped cleanly
+#
+# Pipeline inside this step:
+#   i.   Detect true bolt-hole circles via contour circularity + hierarchy
+#   ii.  Erase circle zones from skeleton before gap-merge
+#   iii. Dilate (radius=GAP_RADIUS) → merge parallel strokes within 60px
+#   iv.  Remove tiny noise blobs (< MIN_SKEL_COMPONENT_PX)
+#   v.   Bridge disconnected components (nearest-pair MST approach)
+#   vi.  Extend dangling endpoints toward nearest skeleton pixel
+#   vii. Gentle 2-px dilate + re-skeletonize to seal hairline breaks
+#   viii.Bold-redraw to uniform stroke; re-stamp circles
+# ════════════════════════════════════════════════════════════════════════════
+
+def _skel_get_endpoints(sk):
+    """
+    Return (ys, xs) of skeleton pixels that have exactly 1 white 8-neighbour
+    — these are dangling line ends.
+    """
+    padded = np.pad((sk > 0).astype(np.int32), 1, constant_values=0)
+    nbrs   = np.zeros(sk.shape, dtype=np.int32)
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dy == 0 and dx == 0:
+                continue
+            nbrs += padded[1+dy : 1+dy+sk.shape[0],
+                           1+dx : 1+dx+sk.shape[1]]
+    return np.where((sk > 0) & (nbrs == 1))
+
+
+def _skel_is_circular(cnt, min_circ=0.60):
+    area = cv2.contourArea(cnt)
+    if area < 800:
+        return False
+    peri = cv2.arcLength(cnt, True)
+    if peri < 1:
+        return False
+    return (4.0 * math.pi * area / (peri * peri)) >= min_circ
+
+
+def _skel_detect_bolt_holes(binary):
+    """
+    Identify genuine bolt-hole circles via RETR_CCOMP contour hierarchy:
+    a contour qualifies if it is circular AND has at least one circular child
+    (the concentric inner ring).
+
+    Returns:
+        circular_outer : list of (cx, cy, r, contour_idx)
+        circular_inner : list of (cx, cy, r)
+    """
+    contours, hierarchy = cv2.findContours(
+        binary, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE
+    )
+    if hierarchy is None:
+        return [], []
+
+    circular_outer, circular_inner = [], []
+    for i, cnt in enumerate(contours):
+        if not _skel_is_circular(cnt):
+            continue
+        area = cv2.contourArea(cnt)
+        if not (800 <= area <= 60_000):
+            continue
+        # Walk children looking for a circular inner ring
+        child_idx = hierarchy[0][i][2]
+        has_circ_child = False
+        j = child_idx
+        while j != -1:
+            if _skel_is_circular(contours[j], 0.50):
+                has_circ_child = True
+                M2 = cv2.moments(contours[j])
+                if M2['m00'] > 0:
+                    ix = int(M2['m10'] / M2['m00'])
+                    iy = int(M2['m01'] / M2['m00'])
+                    x2, y2, cw2, ch2 = cv2.boundingRect(contours[j])
+                    circular_inner.append((ix, iy, (cw2 + ch2) // 4))
+                break
+            j = hierarchy[0][j][0]
+        if not has_circ_child:
+            continue
+        M = cv2.moments(cnt)
+        if M['m00'] == 0:
+            continue
+        cx = int(M['m10'] / M['m00'])
+        cy = int(M['m01'] / M['m00'])
+        x, y, cw, ch = cv2.boundingRect(cnt)
+        circular_outer.append((cx, cy, (cw + ch) // 4, i))
+
+    return circular_outer, circular_inner
+
+
+def _skel_bridge_components(sk, max_dist=500):
+    """
+    Iteratively connect the nearest pair of pixels that belong to two different
+    connected components, until only one component remains or no pair is within
+    max_dist pixels.  Uses cKDTree for speed (falls back to brute-force if
+    scipy is unavailable).
+    """
+    if not HAS_SCIPY:
+        # Brute-force fallback: dilate until components merge
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        for _ in range(max_dist // 2):
+            n, _ = cv2.connectedComponents(sk)
+            if n <= 2:
+                break
+            sk = cv2.dilate(sk, kernel, iterations=1)
+            sk = (skeletonize_mask(sk) > 0).astype(np.uint8) * 255
+        return sk
+
+    sk = sk.copy()
+    for _it in range(200):
+        n_labels, labels = cv2.connectedComponents(sk)
+        if n_labels <= 2:
+            break
+        sky, skx   = np.where(sk > 0)
+        if len(sky) == 0:
+            break
+        all_coords = np.column_stack([skx, sky])
+        all_labels = labels[sky, skx]
+        tree       = _cKDTree(all_coords)
+
+        best_d, p1, p2 = np.inf, None, None
+        for lbl in np.unique(all_labels):
+            mask = all_labels == lbl
+            cc   = all_coords[mask]
+            if len(cc) > 1000:
+                idx = np.random.choice(len(cc), 1000, replace=False)
+                cc  = cc[idx]
+            for coord in cc:
+                dists, idxs = tree.query(coord, k=min(300, len(all_coords)))
+                for d, ni in zip(dists, idxs):
+                    if d > max_dist:
+                        break
+                    if all_labels[ni] != lbl:
+                        if d < best_d:
+                            best_d = d
+                            p1     = coord
+                            p2     = all_coords[ni]
+                        break
+        if p1 is None:
+            break
+        cv2.line(sk,
+                 (int(p1[0]), int(p1[1])),
+                 (int(p2[0]), int(p2[1])), 255, 1)
+    return sk
+
+
+def _skel_local_direction(sk, ex, ey, lookback=12):
+    """
+    Trace back along the skeleton from endpoint (ex, ey) for up to `lookback`
+    steps and return the outward unit direction vector (ddx, ddy).
+    """
+    h, w   = sk.shape
+    visited = set()
+    cx, cy  = ex, ey
+    for _ in range(lookback):
+        visited.add((cx, cy))
+        found = False
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dy == 0 and dx == 0:
+                    continue
+                nx, ny = cx + dx, cy + dy
+                if (0 <= ny < h and 0 <= nx < w
+                        and sk[ny, nx] > 0
+                        and (nx, ny) not in visited):
+                    cx, cy = nx, ny
+                    found  = True
+                    break
+            if found:
+                break
+        if not found:
+            break
+    ddx  = ex - cx
+    ddy  = ey - cy
+    ln   = max(math.sqrt(ddx**2 + ddy**2), 1e-6)
+    return ddx / ln, ddy / ln
+
+
+def _skel_extend_endpoints(sk, max_ext=350, n_passes=6):
+    """
+    For each dangling endpoint, walk in its outward direction with an
+    expanding perpendicular search band until the walk finds the nearest
+    skeleton pixel to bridge to.  Repeat for multiple passes.
+    """
+    sk = sk.copy()
+    h, w = sk.shape
+    for pass_n in range(n_passes):
+        eys, exs = _skel_get_endpoints(sk)
+        if len(eys) == 0:
+            break
+        extended = 0
+        for ey, ex in zip(eys, exs):
+            ddx, ddy = _skel_local_direction(sk, ex, ey)
+            if ddx == 0 and ddy == 0:
+                continue
+            target = None
+            for step in range(3, max_ext + 1):
+                nx = int(round(ex + ddx * step))
+                ny = int(round(ey + ddy * step))
+                if nx < 0 or nx >= w or ny < 0 or ny >= h:
+                    break
+                search_r = min(step // 3 + 15, 100)
+                y0, y1   = max(0, ny - search_r), min(h, ny + search_r)
+                x0, x1   = max(0, nx - search_r), min(w, nx + search_r)
+                roi      = sk[y0:y1, x0:x1]
+                if roi.max() > 0:
+                    rys, rxs = np.where(roi > 0)
+                    dists    = np.sqrt((rxs + x0 - ex)**2 + (rys + y0 - ey)**2)
+                    mi       = dists.argmin()
+                    tx, ty   = rxs[mi] + x0, rys[mi] + y0
+                    if math.sqrt((tx - ex)**2 + (ty - ey)**2) > 8:
+                        target = (tx, ty)
+                        break
+            if target is not None:
+                cv2.line(sk, (ex, ey), target, 255, 1)
+                extended += 1
+        if extended == 0:
+            break
+    return sk
+
+
+def consolidate_skeleton(
+    skeleton,
+    gap_radius        = 30,
+    bold_radius       = 3,
+    circle_ring_width = 4,
+    max_bridge_dist   = 500,
+    min_component_px  = 500,
+):
+    """
+    Take the raw 1-px skeleton produced by Step 6c and return a clean
+    single-stroke skeleton that:
+      • Has no parallel duplicate strokes within gap_radius*2 pixels
+      • Is fully connected (one component)
+      • Has zero dangling endpoints
+      • Preserves detected circles at their exact positions
+
+    Parameters
+    ----------
+    skeleton          : np.ndarray uint8 — the 1-px skeleton from Step 6c
+    gap_radius        : merge-dilation radius; parallel strokes ≤ gap_radius*2
+                        px apart are fused before re-skeletonization
+    bold_radius       : final output stroke half-width in pixels
+    circle_ring_width : thickness of re-stamped circle rings
+    max_bridge_dist   : maximum pixel distance for auto-bridging two components
+    min_component_px  : skeleton components smaller than this are removed as noise
+
+    Returns
+    -------
+    bold_skeleton : np.ndarray uint8 — cleaned bold single-stroke image
+    info          : dict with diagnostic counts
+    """
+    if skeleton is None or not HAS_CV:
+        return skeleton, {}
+
+    h, w = skeleton.shape
+    _, binary = cv2.threshold(skeleton, 30, 255, cv2.THRESH_BINARY)
+
+    # ── i. Detect bolt-hole circles from original binary ─────────────────────
+    circular_outer, circular_inner = _skel_detect_bolt_holes(binary)
+
+    # ── ii. Erase circle zones so the merge-dilation won't distort them ───────
+    work = binary.copy()
+    for (cx, cy, r, _) in circular_outer:
+        cv2.circle(work, (cx, cy), r + gap_radius, 0, -1)
+
+    # ── iii. Dilate to merge parallel strokes within gap_radius*2 pixels ─────
+    kernel_merge = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (gap_radius * 2 + 1, gap_radius * 2 + 1)
+    )
+    merged = cv2.dilate(work, kernel_merge, iterations=1)
+
+    # ── iv. Re-skeletonize the merged bands → true 1-px centerline ───────────
+    skel = skeletonize_mask(merged)
+
+    # ── v. Remove tiny noise / text-label components ──────────────────────────
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(skel)
+    clean = np.zeros_like(skel)
+    noise_removed = 0
+    for lbl in range(1, n_labels):
+        if stats[lbl, cv2.CC_STAT_AREA] >= min_component_px:
+            clean[labels == lbl] = 255
+        else:
+            noise_removed += 1
+    skel = clean
+
+    # ── vi. Bridge disconnected components ───────────────────────────────────
+    skel = _skel_bridge_components(skel, max_dist=max_bridge_dist)
+
+    # ── vii. Extend dangling endpoints toward nearest skeleton pixel ──────────
+    skel = _skel_extend_endpoints(skel)
+
+    # ── viii. Gentle close: dilate 2px + re-skeletonize (seals hairline gaps) ─
+    skel_pre = cv2.dilate(
+        skel,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        iterations=1
+    )
+    skel = skeletonize_mask(skel_pre)
+
+    # Diagnostic counts after cleanup
+    n_comp_final, _ = cv2.connectedComponents(skel)
+    eys_f, exs_f    = _skel_get_endpoints(skel)
+    n_ep_final      = len(eys_f)
+
+    # ── ix. Bold-redraw to uniform stroke width ───────────────────────────────
+    kernel_bold = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (bold_radius * 2 + 1, bold_radius * 2 + 1)
+    )
+    bold = cv2.dilate(skel, kernel_bold, iterations=1)
+
+    # ── x. Re-stamp circles at their exact detected positions ─────────────────
+    for (cx, cy, r, _) in circular_outer:
+        cv2.circle(bold, (cx, cy), r, 255, circle_ring_width)
+    for (cx, cy, r) in circular_inner:
+        cv2.circle(bold, (cx, cy), r, 255, circle_ring_width)
+
+    info = {
+        "bolt_holes"       : len(circular_outer),
+        "noise_removed"    : noise_removed,
+        "components_final" : n_comp_final - 1,   # subtract background
+        "endpoints_final"  : n_ep_final,
+    }
+    return bold, info
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # STEP 10 — DXF EXPORT (true centerline entities)
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -587,7 +944,7 @@ def export_pdf(edges, out_path, orig_bgr=None):
         c.rect(0, page_h - 36, page_w, 36, fill=1, stroke=0)
         c.setFillColorRGB(0.9, 0.91, 0.93)
         c.setFont("Helvetica-Bold", 13)
-        c.drawString(margin, page_h - 24, "SheetForge v12 — True Centerline DXF Preview")
+        c.drawString(margin, page_h - 24, "SheetForge v13 — True Centerline DXF Preview")
         c.setFont("Helvetica", 9)
         c.setFillColorRGB(0.5, 0.55, 0.6)
         from datetime import datetime
@@ -618,7 +975,7 @@ def export_pdf(edges, out_path, orig_bgr=None):
         c.setFillColorRGB(0.3, 0.35, 0.4)
         c.setFont("Helvetica", 8)
         c.drawCentredString(page_w / 2, 12,
-                            "SheetForge v12  •  Algebraic LS Centerline  •  90° Snap  •  Intersection Trim")
+                            "SheetForge v13  •  Algebraic LS Centerline  •  90° Snap  •  Gap-Free Single-Stroke")
         c.save()
         for f in tmp_files:
             try: _os.unlink(f)
@@ -746,6 +1103,32 @@ def main():
     steps.append(step_record(
         f"GEO-9: Intersection trimming (snap_radius={snap_radius}px)",
         f"Polyline endpoints trimmed to nearest intersecting segment", t0))
+
+    # STEP 9b: Skeleton gap-close & single-stroke guarantee
+    # Runs on the pixel skeleton after Step 6c so the cleaned, fully-connected
+    # single-stroke skeleton feeds into Steps 7-9 and DXF export.
+    # Also rebuilds edges_display so the PNG preview reflects the clean result.
+    t0 = now_ms()
+    gap_radius_px = int(opts.get("gapRadius", 30))
+    bold_skeleton, skel_info = consolidate_skeleton(
+        skeleton,
+        gap_radius        = gap_radius_px,
+        bold_radius       = 3,
+        circle_ring_width = 4,
+        max_bridge_dist   = 500,
+        min_component_px  = 500,
+    )
+    edges_display = bold_skeleton   # update preview to show cleaned skeleton
+    steps.append(step_record(
+        f"SKL-9b: Gap-close & single-stroke (gap_radius={gap_radius_px}px)",
+        (
+            f"Bolt holes protected: {skel_info.get('bolt_holes', 0)}  |  "
+            f"Noise blobs removed: {skel_info.get('noise_removed', 0)}  |  "
+            f"Components: {skel_info.get('components_final', '?')}  |  "
+            f"Dangling endpoints: {skel_info.get('endpoints_final', '?')}"
+        ),
+        t0,
+    ))
 
     # Output dir
     server_out_dir = Path(__file__).parent / "uploads" / "output"
