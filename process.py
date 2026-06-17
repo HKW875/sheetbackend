@@ -104,7 +104,7 @@ def load_image(image_path):
 # ════════════════════════════════════════════════════════════════════════════
 # STEPS 2-5 — DENOISE / BINARISE / SPECKLE REMOVAL
 # ════════════════════════════════════════════════════════════════════════════
-min_area = 200
+
 def median_blur(gray, ksize=5):
     if ksize % 2 == 0: ksize += 1
     return cv2.medianBlur(gray, ksize)
@@ -114,7 +114,7 @@ def adaptive_threshold_binarize(blurred):
         blurred, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY_INV,
-        blockSize=5, C=1,
+        blockSize=15, C=1,
     )
 
 def morph_clean(binary):
