@@ -52,7 +52,7 @@ Pipeline:
   11. PNG Preview
   12. PDF Export
 """
-
+import numpy as np
 import sys, os, json, time, traceback, math
 from pathlib import Path
 
@@ -88,12 +88,12 @@ def load_image(image_path):
     bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
     if bgr is None or bgr.size == 0:
         raise ValueError(f"cv2.imread returned None for: {image_path}")
-    dpi = 96.0
+    dpi = 1200.0
     if HAS_PIL:
         try:
             pil  = Image.open(str(image_path))
-            xdpi = pil.info.get("dpi", (96, 96))
-            dpi  = float(xdpi[0]) if xdpi and xdpi[0] > 1 else 96.0
+            xdpi = pil.info.get("dpi", (1200, 1200))
+            dpi  = float(xdpi[0]) if xdpi and xdpi[0] > 1 else 1200.0
         except Exception:
             pass
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
@@ -104,7 +104,7 @@ def load_image(image_path):
 # ════════════════════════════════════════════════════════════════════════════
 # STEPS 2-5 — DENOISE / BINARISE / SPECKLE REMOVAL
 # ════════════════════════════════════════════════════════════════════════════
-
+min_area = 200
 def median_blur(gray, ksize=5):
     if ksize % 2 == 0: ksize += 1
     return cv2.medianBlur(gray, ksize)
@@ -118,22 +118,38 @@ def adaptive_threshold_binarize(blurred):
     )
 
 def morph_clean(binary):
-    kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+    kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (5, 5))
     return cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
 
+
+
+
 def remove_small_blobs(binary, min_area):
-    """Remove all 8-connected blobs with pixel area < min_area."""
+    """Remove all 8-connected blobs with pixel area < min_area efficiently using NumPy."""
+    # Find all connected components
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
-    cleaned = np.zeros_like(binary)
-    removed_px, removed_blobs = 0, 0
-    for lbl in range(1, num_labels):
-        area = int(stats[lbl, cv2.CC_STAT_AREA])
-        if area >= min_area:
-            cleaned[labels == lbl] = 255
-        else:
-            removed_px += area
-            removed_blobs += 1
+    
+    # Extract the areas of all components (index 0 is the background)
+    areas = stats[:, cv2.CC_STAT_AREA]
+    
+    # Identify which labels fail the area threshold (excluding background label 0)
+    small_blobs_mask = (areas < min_area)
+    small_blobs_mask[0] = False  # Keep background
+    
+    # Calculate tracking metrics
+    removed_blobs = int(np.sum(small_blobs_mask))
+    removed_px = int(np.sum(areas[small_blobs_mask]))
+    
+    # Generate a lookup table: set invalid labels to 0, valid labels to 255
+    lut = np.ones(num_labels, dtype=np.uint8) * 255
+    lut[small_blobs_mask] = 0
+    lut[0] = 0  # Background stays black
+    
+    # Instantly map labels to the final image without loop iteration
+    cleaned = lut[labels]
+    
     return cleaned, removed_blobs, removed_px
+
 
 
 # ════════════════════════════════════════════════════════════════════════════
