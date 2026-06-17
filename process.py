@@ -156,7 +156,7 @@ def remove_small_blobs(binary, min_area):
 # STEP 6 — CANNY → 200px AREA FILTER → SKELETONIZE
 # ════════════════════════════════════════════════════════════════════════════
 
-def canny_edges(cleaned, low_threshold=20, high_threshold=80):
+def canny_edges(cleaned, low_threshold=20, high_threshold=200):
     return cv2.Canny(cleaned, low_threshold, high_threshold)
 
 def skeletonize_mask(binary_mask):
