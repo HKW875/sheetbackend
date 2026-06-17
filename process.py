@@ -127,7 +127,7 @@ def load_image(image_path):
 # STEPS 2-5 — DENOISE / BINARISE / SPECKLE REMOVAL
 # ════════════════════════════════════════════════════════════════════════════
 
-def median_blur(gray, ksize=5):
+def median_blur(gray, ksize=3):
     if ksize % 2 == 0: ksize += 1
     return cv2.medianBlur(gray, ksize)
 
