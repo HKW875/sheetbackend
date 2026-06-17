@@ -304,18 +304,15 @@ def _fit_rect_algebraic(pts_xy):
     return cx, cy, w, h
 
 def _classify_contour(pts_xy, min_pts_for_circle=12, circle_rms_tol=0.12):
-    """
-    Classify a contour as 'circle' or 'rect' using algebraic LS.
-    Returns a shape dict or None.
-    """
     x, y = pts_xy[:, 0], pts_xy[:, 1]
-    w    = float(x.max() - x.min())
-    h    = float(y.max() - y.min())
+    w = float(x.max() - x.min())
+    h = float(y.max() - y.min())
     if w < 1e-6 or h < 1e-6:
         return None
 
     aspect = min(w, h) / max(w, h)
 
+    # Try circle fit first
     if aspect > 0.60 and len(pts_xy) >= min_pts_for_circle:
         try:
             cx, cy, r, rms = _fit_circle_algebraic(pts_xy, outlier_trim_passes=1)
@@ -331,6 +328,18 @@ def _classify_contour(pts_xy, min_pts_for_circle=12, circle_rms_tol=0.12):
         except Exception:
             pass
 
+    # For complex shapes with many vertices, keep as polygon instead of bounding box
+    if len(pts_xy) > 8:
+        return {
+            'type': 'poly',
+            'points': pts_xy.tolist(),  # Keep all approxPolyDP vertices
+            'area': cv2.contourArea(np.array(pts_xy, dtype=np.float32).reshape(-1, 1, 2)),
+            'w': w, 'h': h,
+            'cx': (x.min() + x.max()) / 2.0,
+            'cy': (y.min() + y.max()) / 2.0,
+        }
+
+    # Simple rectangle fallback for truly simple 4-corner shapes
     cx_b, cy_b, w_b, h_b = _fit_rect_algebraic(pts_xy)
     return {
         'type': 'rect',
@@ -344,57 +353,59 @@ def _classify_contour(pts_xy, min_pts_for_circle=12, circle_rms_tol=0.12):
 # ════════════════════════════════════════════════════════════════════════════
 
 def _shapes_similar_for_pairing(a, b):
-    """
-    True only if `a` and `b` look like the inner/outer edge of the SAME
-    drawn stroke: same classified type, centres essentially coincident,
-    and overall size differing only by roughly a stroke-width.
-
-    This deliberately does NOT match e.g. a big rectangle's inner "hole"
-    contour against a much smaller cut-out that happens to be its child in
-    the hierarchy tree — those have very different centres/sizes and will
-    correctly be treated as independent shapes.
-    """
     if a['type'] != b['type']:
         return False
     dc = math.hypot(a['cx'] - b['cx'], a['cy'] - b['cy'])
+    
     if a['type'] == 'circle':
         size_a, size_b = a['r'], b['r']
         if size_a <= 0 or size_b <= 0:
             return False
-        size_rel   = abs(size_a - size_b) / max(size_a, size_b)
+        size_rel = abs(size_a - size_b) / max(size_a, size_b)
         center_tol = max(6.0, 0.08 * max(size_a, size_b))
         return dc <= center_tol and size_rel <= 0.30
-    else:
-        # For rects, BOTH width and height must independently be similar —
-        # comparing only max(w,h) would (incorrectly) match a thin vertical
-        # strip against a wide rectangle of similar height, as happens when
-        # a stroke fragments into a main outline plus a stray parallel edge.
+    
+    elif a['type'] == 'poly':
+        # Compare polygons by bounding box metrics
+        size_a = max(a['w'], a['h'])
+        size_b = max(b['w'], b['h'])
+        if size_a <= 0 or size_b <= 0:
+            return False
+        size_rel = abs(size_a - size_b) / max(size_a, size_b)
+        center_tol = max(6.0, 0.08 * max(size_a, size_b))
+        return dc <= center_tol and size_rel <= 0.30
+    
+    else:  # rect
         if a['w'] <= 0 or a['h'] <= 0 or b['w'] <= 0 or b['h'] <= 0:
             return False
         w_rel = abs(a['w'] - b['w']) / max(a['w'], b['w'])
         h_rel = abs(a['h'] - b['h']) / max(a['h'], b['h'])
-        size_rel   = max(w_rel, h_rel)
+        size_rel = max(w_rel, h_rel)
         center_tol = max(6.0, 0.08 * max(a['w'], a['h'], b['w'], b['h']))
         return dc <= center_tol and size_rel <= 0.30
 
 def _average_shapes(a, b):
-    """
-    Average two paired inner/outer edge fits into a single shape that
-    represents the TRUE CENTRELINE of the drawn stroke — i.e. the position
-    a CAD/CAM user would actually want to cut along.
-    """
     if a['type'] == 'circle':
         cx = (a['cx'] + b['cx']) / 2.0
         cy = (a['cy'] + b['cy']) / 2.0
-        r  = (a['r']  + b['r'])  / 2.0
+        r = (a['r'] + b['r']) / 2.0
         return {'type': 'circle', 'cx': cx, 'cy': cy, 'r': r,
                 'err': max(a.get('err', 0.0), b.get('err', 0.0)),
                 'area': math.pi * r * r}
-    else:
+    
+    elif a['type'] == 'poly':
+        # Average the point sets by using the outer one (larger area)
+        # or interpolate between corresponding points
+        # For simplicity, use the one with more points (more detailed)
+        if len(a['points']) >= len(b['points']):
+            return a
+        return b
+    
+    else:  # rect
         cx = (a['cx'] + b['cx']) / 2.0
         cy = (a['cy'] + b['cy']) / 2.0
-        w  = (a['w']  + b['w'])  / 2.0
-        h  = (a['h']  + b['h'])  / 2.0
+        w = (a['w'] + b['w']) / 2.0
+        h = (a['h'] + b['h']) / 2.0
         return {'type': 'rect', 'cx': cx, 'cy': cy, 'w': w, 'h': h, 'area': w * h}
 
 def pair_by_hierarchy(shapes, parents, children):
@@ -470,6 +481,14 @@ def _dedup_residual(shapes, kind):
                 size_rel   = abs(size_a - size_b) / max(size_a, size_b, 1e-9)
                 center_tol = max(8.0, 0.10 * max(size_a, size_b))
                 similar = dc <= center_tol and size_rel <= 0.30
+
+            elif kind == 'poly':
+                size_a = max(s['w'], s['h'])
+                size_b = max(s2['w'], s2['h'])
+                size_rel = abs(size_a - size_b) / max(size_a, size_b, 1e-9)
+                center_tol = max(8.0, 0.10 * max(size_a, size_b))
+                similar = dc <= center_tol and size_rel <= 0.30
+              
             else:
                 # Require BOTH width and height to match independently —
                 # otherwise a thin stray strip with a similar height (but
@@ -494,6 +513,12 @@ def _dedup_residual(shapes, kind):
                 result.append({'type': 'circle', 'cx': cx, 'cy': cy, 'r': r,
                                 'err': max(g.get('err', 0.0) for g in grp),
                                 'area': math.pi * r * r})
+
+            elif kind == 'poly':
+                # Use the polygon with the most points (most detailed)
+                best = max(grp, key=lambda g: len(g['points']))
+                result.append(best)
+              
             else:
                 cx = float(np.mean([g['cx'] for g in grp]))
                 cy = float(np.mean([g['cy'] for g in grp]))
@@ -528,17 +553,17 @@ def _circles_overlap(a, b):
 def _dedup_overlapping_circles(circles):
     """
     Cluster circles whose disks overlap (per `_circles_overlap`) and keep
-    only ONE representative per cluster — the one with the lowest algebraic
-    fit error (`err`), tie-broken by the larger radius (the outer edge is
-    the more representative boundary of a stroke). All other members of the
-    cluster are dropped as duplicates of the same physical hole.
+    only ONE representative per cluster — ALWAYS the one with the SMALLEST
+    radius/diameter (the inner edge of the drawn stroke, which represents
+    the true hole boundary). All other members of the cluster are dropped
+    as duplicates of the same physical hole.
     """
     n = len(circles)
     used = [False] * n
     result = []
-    # Process largest-first so a big "true" circle absorbs smaller
-    # overlapping duplicates rather than the reverse.
-    order = sorted(range(n), key=lambda i: circles[i]['r'], reverse=True)
+    # Process smallest-first so a small "true" circle is selected before
+    # larger overlapping duplicates are absorbed into its cluster.
+    order = sorted(range(n), key=lambda i: circles[i]['r'])  # ascending: smallest first
     for i in order:
         if used[i]:
             continue
@@ -550,7 +575,8 @@ def _dedup_overlapping_circles(circles):
             if _circles_overlap(circles[i], circles[j]):
                 cluster.append(j)
                 used[j] = True
-        best = min(cluster, key=lambda k: (circles[k].get('err', 0.0), -circles[k]['r']))
+        # ALWAYS keep the smallest radius in the cluster
+        best = min(cluster, key=lambda k: circles[k]['r'])
         result.append(circles[best])
     return result
 
@@ -736,6 +762,16 @@ def build_clean_dxf(final_shapes, img_w, img_h, out_path):
             )
             entity_count += 1
 
+        elif s['type'] == 'poly':
+            # Export as closed LWPOLYLINE with all vertices
+            pts = [(p[0], p[1]) for p in s['points']]
+            poly = msp.add_lwpolyline(
+                pts, format="xy",
+                dxfattribs={"layer": "SHAPES", "color": 256}
+            )
+            poly.close(True)
+            entity_count += 1
+
         elif s['type'] == 'rect':
             x0, y0 = s['cx'] - s['w'] / 2.0, s['cy'] - s['h'] / 2.0
             x1, y1 = s['cx'] + s['w'] / 2.0, s['cy'] + s['h'] / 2.0
@@ -775,6 +811,12 @@ def build_comparison_png(edges, final_shapes, img_w, img_h, out_path):
             if s['type'] == 'circle':
                 r_px = int(round(s['r']))
                 cv2.circle(right, (cx_px, cy_px), r_px, (80, 80, 220), 2, cv2.LINE_AA)
+
+            elif s['type'] == 'poly':
+                # Draw polygon using all vertices
+                pts = np.array([[int(p[0]), int(p[1])] for p in s['points']], dtype=np.int32)
+                cv2.polylines(right, [pts], True, (80, 200, 80), 2, cv2.LINE_AA)
+              
             elif s['type'] == 'rect':
                 x0 = int(round(s['cx'] - s['w'] / 2.0))
                 y0 = int(round(s['cy'] - s['h'] / 2.0))
