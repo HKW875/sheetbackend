@@ -661,8 +661,10 @@ def build_clean_shapes(simplified_contours, parents, children, img_w, img_h,
     # Step 2: residual proximity dedup, per type
     circles = [s for s in paired if s['type'] == 'circle']
     rects   = [s for s in paired if s['type'] == 'rect']
+    polys   = [s for s in paired if s['type'] == 'poly']
     circles = _dedup_residual(circles, 'circle')
     rects   = _dedup_residual(rects,   'rect')
+    polys   = _dedup_residual(polys,   'poly')
 
     # Step 3: absolute-area noise filter.
     # With minBlobArea lowered to 20px (to satisfy a <20px speckle-removal
@@ -676,17 +678,26 @@ def build_clean_shapes(simplified_contours, parents, children, img_w, img_h,
 
     circles = [c for c in circles if (math.pi * c['r'] * c['r']) >= min_shape_area]
     rects   = [r for r in rects   if (r['w'] * r['h'])           >= min_shape_area]
+    polys   = [p for p in polys   if p['area']                   >= min_shape_area]
 
     # Step 4a: rect aspect-ratio filter (drop thin dimension-line shafts)
-    rects = [r for r in rects
+        rects = [r for r in rects
              if max(r['w'], r['h']) > 0
              and (min(r['w'], r['h']) / max(r['w'], r['h'])) >= rect_aspect_min]
+    # For polys, use bounding box aspect as proxy
+    polys = [p for p in polys
+             if max(p['w'], p['h']) > 0
+             and (min(p['w'], p['h']) / max(p['w'], p['h'])) >= rect_aspect_min]
 
     # Step 4b: rect relative-area filter (drop annotation text blocks,
     # measured against the largest surviving rect — typically the board)
-    if rects:
+        if rects:
         max_rect_area = max(r['w'] * r['h'] for r in rects)
         rects = [r for r in rects if (r['w'] * r['h']) >= rect_rel_area_min * max_rect_area]
+    # For polys, filter against largest poly area
+    if polys:
+        max_poly_area = max(p['area'] for p in polys)
+        polys = [p for p in polys if p['area'] >= rect_rel_area_min * max_poly_area]
 
     # Step 4c: circle-circle overlap dedup (collapse offset-duplicate rings)
     circles = _dedup_overlapping_circles(circles)
@@ -715,11 +726,13 @@ def build_clean_shapes(simplified_contours, parents, children, img_w, img_h,
     # configurable min_shape_area / relative filters above allowed through.
     circles = [c for c in circles if (math.pi * c['r'] * c['r']) >= HARD_MIN_SHAPE_AREA_PX]
     rects   = [r for r in rects   if (r['w'] * r['h'])           >= HARD_MIN_SHAPE_AREA_PX]
+    polys   = [p for p in polys   if p['area']                   >= HARD_MIN_SHAPE_AREA_PX]
 
     circles_final = circles
     rects_final   = rects
-    final_shapes  = list(rects_final) + list(circles_final)
-    return final_shapes, circles_final, rects_final
+    polys_final   = polys
+    final_shapes  = list(rects_final) + list(circles_final) + list(polys_final)
+    return final_shapes, circles_final, rects_final, polys_final                     
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1005,8 +1018,9 @@ def main():
         f"{len(simplified_contours)} contours  |  {total_pts} vertices", t0))
 
     # ── STEP 8-10: classify, pair, dedup, filter ───────────────────────────
+        # ── STEP 8-10: classify, pair, dedup, filter ───────────────────────────
     t0 = now_ms()
-    final_shapes, circles_f, rects_f = build_clean_shapes(
+    final_shapes, circles_f, rects_f, polys_f = build_clean_shapes(
         simplified_contours, parents, children, img_w, img_h, min_shape_area,
         rect_aspect_min=rect_aspect_min,
         rect_rel_area_min=rect_rel_area_min,
@@ -1014,6 +1028,7 @@ def main():
         circle_rect_overlap_frac=circle_rect_overlap_frac)
     n_circles = len(circles_f)
     n_rects   = len(rects_f)
+    n_polys   = len(polys_f)
     steps.append(step_record(
         "LS-8/9/10: LS classification + hierarchy offset-pair averaging + residual dedup + area filter",
         f"{len(simplified_contours)} raw contours → {n_rects} rect(s) + {n_circles} circle(s)  "
@@ -1087,8 +1102,9 @@ def main():
         "coordSystem"    : "origin=top-left px, Y-down (image convention), no offset/re-centering",
         "circlesDetected": n_circ_final,
         "rectsDetected"  : n_rect_final,
+        "polysDetected": n_poly_final,
         "shapeSummary"   : (
-            f"{n_rect_final} rectangle(s), {n_circ_final} circle(s)"
+            f"{n_rect_final} rectangle(s), {n_circ_final} circle(s), {n_poly_final} polygon(s)"
             f" — speckle-free mask, hierarchy offset-pairs averaged to centreline,"
             f" true measured positions"
         ),
