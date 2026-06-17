@@ -1,59 +1,61 @@
 #!/usr/bin/env python3
 """
-SheetForge — CV Pipeline  v11  (Bold Centerline Skeletonization)
-================================================================
+SheetForge — CV Pipeline  v12  (True Centerline DXF via Algebraic LS + Intersection Trimming)
+==============================================================================================
 Receives: image_path, options_json (from node child_process)
 Outputs:  JSON on stdout  { steps, analysis, dwg, dxfContent, pdfAvailable }
 
-WHAT CHANGED FROM v10 AND WHY
+WHAT CHANGED FROM v11 AND WHY
 -------------------------------
-v10 produced correct shape counts and positions but its Canny preview image
-still showed double-edge rings (inner + outer stroke edge) rather than single
-bold centrelines.  This also meant findContours worked on double-ring strokes
-and required the hierarchy inner/outer pairing pass to average geometry.
+v11 produced shape-level DXF (one CIRCLE or LWPOLYLINE rectangle per detected shape),
+which meant the DXF was a re-construction of classified shapes, not a true tracing of
+the actual drawn geometry.
 
-v11 fixes both with a SKELETONIZE → THICKEN step applied to:
+v12 replaces the DXF export entirely with a TRUE CENTERLINE approach:
 
-  1. THE CANNY PREVIEW (edges image)
-     After Canny + dot cleanup, the edge image is skeletonized to a true 1-px
-     centreline (Zhang-Suen via cv2.ximgproc.thinning, with a pure-OpenCV
-     iterative fallback), then dilated to exactly 4 px at intensity 255.
-     Result: every shape in the preview / PDF is a bold, unambiguous solid
-     line — not a faint double-edge ring — immediately recognisable and ready
-     for DXF overlay validation.
+  1. CANNY AREA FILTER (200px minimum)
+     Every connected blob in the Canny edge result with pixel area < 200px is removed
+     before any further processing. This eliminates all noise specks, annotation dots,
+     and dimension-line arrowheads from the edge image.
 
-  2. THE CLEANED MASK (used for findContours)
-     The same skeletonize → thicken pipeline is applied to the cleaned binary
-     mask before contour extraction (Step 6b).  This collapses every drawn
-     stroke's double-edge to a single bold centreline BEFORE findContours runs,
-     so:
-       • Each shape produces exactly ONE contour (not an inner+outer pair).
-       • The hierarchy offset-pair averaging in Step 9 still works as a safety
-         net for any edge case, but is rarely needed.
-       • Contour geometry is the artist's intended centreline by construction —
-         no arithmetic averaging required.
+  2. ALGEBRAIC LEAST-SQUARES CENTERLINE FITTING ON CANNY WHITE PIXELS
+     Instead of classifying shapes and re-drawing idealized rectangles/circles, the
+     pipeline now:
+       a. Skeletonizes the 200px-filtered Canny edge to a true 1-px centerline.
+       b. Extracts all contours from the skeleton (RETR_LIST, no hierarchy needed).
+       c. For each contour segment, tests whether it fits a circle (Kasa algebraic
+          LS) or is better represented as a polyline.
+       d. Straight/orthogonal segments are snapped to exact 90-degree horizontal or
+          vertical directions using LS line fitting so DXF lines are perfectly aligned.
+       e. Each contour produces EXACTLY ONE DXF entity (LINE, LWPOLYLINE, or CIRCLE).
+
+  3. INTERSECTION TRIMMING (polylines end at intersections)
+     After all segments are computed, segment endpoints are extended to their true
+     intersection points with adjacent segments. Each polyline starts and ends exactly
+     where it meets another polyline — no floating endpoints.
+
+  4. SINGLE CENTERLINE PER EDGE
+     Because the input to contour extraction is a skeletonized (1-px) image, each
+     physical drawn edge produces exactly one contour — no inner/outer pairs.
 
 Pipeline:
   1.  Load image
-  2.  Median Blur                (salt-and-pepper pre-clean)
-  3.  Adaptive Threshold         (binarise, strokes = WHITE)
-  4.  Morph Open                 (remove small attached spurs)
-  5.  Connected-Component Filter (remove EVERY blob < minBlobArea — 100% dot removal)
-  6.  Canny Edge Detection       → dot cleanup → skeletonize → 4px bold centerline (preview/PDF)
-  6b. Skeletonize + 4px thicken of cleaned mask  (single-stroke input for findContours)
-  7.  Contour + Hierarchy        (cv2.findContours RETR_TREE on skeletonized mask)
-  8.  Shape Classification       (algebraic LS: Kasa circle fit w/ outlier trim + rect bbox)
-  9.  Hierarchy Pairing          (outer/inner stroke-edge pairs -> averaged centreline shape)
-  10. Residual Dedup + Filter    (proximity-average safety net, absolute-area noise filter)
-  11. DXF Export — CLEAN         (one CIRCLE or closed LWPOLYLINE per true shape, true cx/cy)
-  12. PNG Preview                (side-by-side: bold Canny centerline vs final shapes)
-  13. PDF Export                 (reportlab)
+  2.  Median Blur
+  3.  Adaptive Threshold
+  4.  Morph Open
+  5.  Connected-Component Filter (minBlobArea)
+  6.  Canny Edge Detection → 200px area filter → skeletonize (single centerline)
+  7.  Contour extraction on skeleton (RETR_LIST, CHAIN_APPROX_NONE)
+  8.  Per-contour: circle LS fit test, else orthogonal polyline with 90° snap
+  9.  Intersection detection and endpoint trimming
+  10. DXF Export (LINE/LWPOLYLINE/CIRCLE per centerline segment)
+  11. PNG Preview
+  12. PDF Export
 """
 
 import sys, os, json, time, traceback, math
 from pathlib import Path
 
-# ── Graceful optional imports ────────────────────────────────────────────────
 def _try(fn):
     try: return fn()
     except Exception: return None
@@ -83,11 +85,9 @@ def load_image(image_path):
         raise RuntimeError("OpenCV (cv2) is not installed.")
     if not image_path or not os.path.exists(image_path):
         raise FileNotFoundError(f"Image not found: {image_path}")
-
     bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
     if bgr is None or bgr.size == 0:
         raise ValueError(f"cv2.imread returned None for: {image_path}")
-
     dpi = 96.0
     if HAS_PIL:
         try:
@@ -96,7 +96,6 @@ def load_image(image_path):
             dpi  = float(xdpi[0]) if xdpi and xdpi[0] > 1 else 96.0
         except Exception:
             pass
-
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     img_h, img_w = bgr.shape[:2]
     return bgr, gray, dpi, img_w, img_h
@@ -123,23 +122,11 @@ def morph_clean(binary):
     return cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
 
 def remove_small_blobs(binary, min_area):
-    """
-    Remove EVERY 8-connected white blob whose pixel area is below
-    `min_area`. Unlike MORPH_OPEN (which only erodes-then-dilates and can
-    miss speckles or merge them into nearby strokes), this is exact and
-    deterministic: connectedComponentsWithStats labels every blob, and any
-    blob below the threshold is dropped completely, wherever it sits.
-
-    This is what guarantees the cleaned mask used for contour extraction
-    is 100% free of the 1px "salt" dots seen in oven_top_grayscale.png —
-    the same property door_lock_grayscale.png already had "for free"
-    because its source scan simply had no speckle to begin with.
-    """
+    """Remove all 8-connected blobs with pixel area < min_area."""
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
     cleaned = np.zeros_like(binary)
-    removed_px = 0
-    removed_blobs = 0
-    for lbl in range(1, num_labels):  # 0 = background
+    removed_px, removed_blobs = 0, 0
+    for lbl in range(1, num_labels):
         area = int(stats[lbl, cv2.CC_STAT_AREA])
         if area >= min_area:
             cleaned[labels == lbl] = 255
@@ -148,65 +135,28 @@ def remove_small_blobs(binary, min_area):
             removed_blobs += 1
     return cleaned, removed_blobs, removed_px
 
+
+# ════════════════════════════════════════════════════════════════════════════
+# STEP 6 — CANNY → 200px AREA FILTER → SKELETONIZE
+# ════════════════════════════════════════════════════════════════════════════
+
 def canny_edges(cleaned, low_threshold=20, high_threshold=80):
     return cv2.Canny(cleaned, low_threshold, high_threshold)
 
-def clean_edge_preview(edges, min_blob_area=3):
-    """
-    Cosmetic pass on the Canny output used ONLY for the side-by-side
-    preview / PDF: Canny's internal Gaussian smoothing + gradient steps
-    can leave a handful of isolated 1-2px edge specks even when the input
-    mask is itself 100% speckle-free (these specks never reach contour
-    extraction, which runs on `cleaned`, not `edges` — so they cannot
-    affect the DXF). Removing them here makes the preview match the
-    "no dots" look of door_lock_grayscale.png for ANY input image.
-    """
-    edges_clean, removed_blobs, removed_px = remove_small_blobs(edges, min_blob_area)
-    return edges_clean, removed_blobs, removed_px
-
-
 def skeletonize_mask(binary_mask):
-    """
-    Reduce every stroke in `binary_mask` to a TRUE 1-PIXEL CENTRELINE using
-    morphological thinning (Zhang-Suen algorithm).
-
-    Strategy (in order of preference):
-      1. cv2.ximgproc.thinning  — fastest, uses the contrib module
-      2. Iterative morphological erosion skeleton (pure OpenCV, no contrib)
-
-    The input should be a binary image (white strokes, black background).
-    Returns a binary image of the same size where every connected stroke is
-    exactly 1 px wide, at intensity 255.
-
-    WHY THIS MATTERS
-    ----------------
-    Canny and adaptive-threshold both produce DOUBLE-EDGE strokes: for every
-    drawn line there are two parallel white curves (inner edge + outer edge).
-    When findContours sees these it creates inner/outer contour pairs whose
-    averaged geometry is an approximation.  After skeletonization EACH DRAWN
-    LINE IS A SINGLE CURVE — findContours finds exactly one contour per shape,
-    the inner/outer pairing step becomes a no-op, and DXF coordinates map
-    exactly to the artist's intended centreline.
-    """
+    """Zhang-Suen thinning to 1-px centerline."""
     if binary_mask is None or not HAS_CV:
         return binary_mask
-
-    # Ensure strict binary (0 / 255)
     _, bw = cv2.threshold(binary_mask, 127, 255, cv2.THRESH_BINARY)
-
-    # --- Method 1: ximgproc thinning (Zhang-Suen, preferred) ---
     try:
         thinned = cv2.ximgproc.thinning(bw, thinningType=cv2.ximgproc.THINNING_ZHANGSUEN)
         return thinned
     except (AttributeError, cv2.error):
         pass
-
-    # --- Method 2: iterative morphological skeleton (pure OpenCV fallback) ---
-    # Repeatedly erode + open and accumulate "skeleton" pixels.
     element  = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
     skeleton = np.zeros_like(bw)
     img      = bw.copy()
-    for _ in range(200):          # upper bound — terminates when img is empty
+    for _ in range(200):
         eroded   = cv2.erode(img, element)
         temp     = cv2.dilate(eroded, element)
         temp     = cv2.subtract(img, temp)
@@ -216,19 +166,7 @@ def skeletonize_mask(binary_mask):
             break
     return skeleton
 
-
 def thicken_to_centerline(binary_mask, thickness_px=4):
-    """
-    Dilate a skeletonized (1-px) binary mask to `thickness_px` pixels wide,
-    producing a bold, unambiguous centerline at intensity 255, suitable for:
-      • the Canny preview image (left panel) and PDF export
-      • contour extraction — findContours sees thick SINGLE strokes, not
-        double rings, so every shape yields exactly ONE contour and the
-        inner/outer hierarchy-pairing step is no longer needed
-
-    The dilation uses an elliptical kernel whose radius gives the desired
-    visible thickness.  All output pixels are at intensity 255.
-    """
     if binary_mask is None or not HAS_CV:
         return binary_mask
     radius = max(1, thickness_px // 2)
@@ -238,462 +176,305 @@ def thicken_to_centerline(binary_mask, thickness_px=4):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# STEP 7 — CONTOUR + HIERARCHY EXTRACTION (on the CLEANED BINARY MASK)
+# STEP 7 — CONTOUR EXTRACTION ON SKELETON
 # ════════════════════════════════════════════════════════════════════════════
 
-def extract_contours_with_hierarchy(cleaned_mask, epsilon_factor=0.5):
+def extract_centerline_contours(skeleton, min_contour_len=10):
     """
-    Find contours of the cleaned stroke mask using RETR_TREE so that the
-    inner/outer edge of every drawn ring (rectangle outline, circle outline)
-    is captured as an explicit parent/child pair. Each contour is simplified
-    with approxPolyDP (closed=True, since these are always closed blob
-    outlines).
-
-    Returns:
-      simplified: list of approx-point arrays (Nx1x2)
-      parents:    list (same length) — parent index per contour, or -1
-      children:   list (same length) — first-child index per contour, or -1
+    Extract all contours from the 1-px skeleton using RETR_LIST (no hierarchy)
+    and CHAIN_APPROX_NONE (keep all points for accurate LS fitting).
+    Returns list of (Nx2) float arrays of pixel coordinates.
     """
-    contours, hierarchy = cv2.findContours(cleaned_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
-    simplified, parents, children = [], [], []
-
-    # cv2.findContours preserves contour order alongside hierarchy rows,
-    # so index i in `contours` corresponds to hierarchy[0][i].
-    for i, cnt in enumerate(contours):
-        if len(cnt) < 3:
-            continue
-        arc     = cv2.arcLength(cnt, closed=True)
-        epsilon = epsilon_factor * arc / max(len(cnt), 1)
-        epsilon = max(epsilon, 0.3)
-        approx  = cv2.approxPolyDP(cnt, epsilon, closed=True)
-        if len(approx) < 2:
-            continue
-        simplified.append(approx)
-        # hierarchy[0][i] = [next, previous, first_child, parent]
-        h = hierarchy[0][i] if hierarchy is not None else [-1, -1, -1, -1]
-        parents.append(int(h[3]))
-        children.append(int(h[2]))
-
-    return simplified, parents, children
+    # Thicken slightly so findContours can trace the skeleton
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    thick = cv2.dilate(skeleton, kernel, iterations=1)
+    contours, _ = cv2.findContours(thick, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+    result = []
+    for cnt in contours:
+        pts = np.array([[p[0][0], p[0][1]] for p in cnt], dtype=float)
+        if len(pts) >= min_contour_len:
+            result.append(pts)
+    return result
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# STEP 8 — ALGEBRAIC LEAST-SQUARES SHAPE CLASSIFICATION
+# STEP 8 — ALGEBRAIC LS FITTING: CIRCLE OR ORTHOGONAL POLYLINE
 # ════════════════════════════════════════════════════════════════════════════
 
-def _fit_circle_algebraic(pts_xy, outlier_trim_passes=1):
+def _fit_circle_kasa(pts):
     """
-    Kasa algebraic circle fit, with optional outlier-rejection passes:
-    after the first fit, points whose residual distance from the fitted
-    circle exceeds 2*rms are dropped and the circle is refit. This guards
-    against any stray point (e.g. a small connecting spur where two
-    contours nearly touch) dragging the fit off-centre.
-    Returns (cx, cy, r, rms).
+    Kasa algebraic least-squares circle fit.
+    Returns (cx, cy, r, rms_relative) or None if degenerate.
     """
-    x, y = pts_xy[:, 0].copy(), pts_xy[:, 1].copy()
-    cx = cy = r = rms = 0.0
-    passes = max(0, outlier_trim_passes)
-    for _ in range(passes + 1):
-        A  = np.column_stack([x, y, np.ones(len(x))])
-        b_ = x**2 + y**2
+    x, y = pts[:, 0].astype(float), pts[:, 1].astype(float)
+    A = np.column_stack([x, y, np.ones(len(x))])
+    b_ = x**2 + y**2
+    try:
         res, _, _, _ = np.linalg.lstsq(A, b_, rcond=None)
-        cx = res[0] / 2.0
-        cy = res[1] / 2.0
-        r  = math.sqrt(abs(res[2] + cx**2 + cy**2))
-        dists = np.sqrt((x - cx)**2 + (y - cy)**2)
-        rms   = float(np.sqrt(((dists - r)**2).mean()))
-        if passes <= 0:
-            break
-        keep = np.abs(dists - r) <= max(2.0 * rms, 1.0)
-        if keep.sum() < 8 or keep.all():
-            break
-        x, y = x[keep], y[keep]
-        passes -= 1
-    return cx, cy, r, rms
-
-def _fit_rect_algebraic(pts_xy):
-    """
-    Axis-aligned rectangle: min/max extents of the contour's point cloud.
-    Because pts_xy now comes from a single clean blob outline (speckle and
-    spur-free), the extreme points ARE the true corners — no percentile
-    trimming is applied here, since trimming would clip the very corner
-    points that define w/h and reintroduce an offset.
-    Returns (cx, cy, w, h).
-    """
-    x, y = pts_xy[:, 0], pts_xy[:, 1]
-    cx   = (float(x.min()) + float(x.max())) / 2.0
-    cy   = (float(y.min()) + float(y.max())) / 2.0
-    w    = float(x.max() - x.min())
-    h    = float(y.max() - y.min())
-    return cx, cy, w, h
-
-def _classify_contour(pts_xy, min_pts_for_circle=12, circle_rms_tol=0.12):
-    """
-    Classify a contour as 'circle' or 'rect' using algebraic LS.
-    Returns a shape dict or None.
-    """
-    x, y = pts_xy[:, 0], pts_xy[:, 1]
-    w    = float(x.max() - x.min())
-    h    = float(y.max() - y.min())
-    if w < 1e-6 or h < 1e-6:
+    except Exception:
         return None
-
-    aspect = min(w, h) / max(w, h)
-
-    if aspect > 0.60 and len(pts_xy) >= min_pts_for_circle:
-        try:
-            cx, cy, r, rms = _fit_circle_algebraic(pts_xy, outlier_trim_passes=1)
-            rel_err = rms / (r + 1e-9)
-            if rel_err < circle_rms_tol:
-                return {
-                    'type': 'circle',
-                    'cx': float(cx), 'cy': float(cy), 'r': float(r),
-                    'err': float(rel_err),
-                    'area': math.pi * r * r,
-                    'w': w, 'h': h,
-                }
-        except Exception:
-            pass
-
-    cx_b, cy_b, w_b, h_b = _fit_rect_algebraic(pts_xy)
-    return {
-        'type': 'rect',
-        'cx': cx_b, 'cy': cy_b, 'w': w_b, 'h': h_b,
-        'area': w_b * h_b,
-    }
+    cx = res[0] / 2.0
+    cy = res[1] / 2.0
+    r  = math.sqrt(abs(res[2] + cx**2 + cy**2))
+    if r < 2.0:
+        return None
+    dists = np.sqrt((x - cx)**2 + (y - cy)**2)
+    rms   = float(np.sqrt(((dists - r)**2).mean()))
+    rel   = rms / (r + 1e-9)
+    return cx, cy, r, rel
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# STEP 9 — HIERARCHY-BASED OFFSET-PAIR AVERAGING
-# ════════════════════════════════════════════════════════════════════════════
+def _is_closed_contour(pts, tol=8.0):
+    """True if first and last points are close enough to form a closed shape."""
+    return math.hypot(pts[0, 0] - pts[-1, 0], pts[0, 1] - pts[-1, 1]) < tol
 
-def _shapes_similar_for_pairing(a, b):
+
+def _snap_angle_90(angle_rad):
+    """Snap an angle to the nearest 0, 90, 180, 270 degrees."""
+    deg = math.degrees(angle_rad) % 180
+    if deg <= 45 or deg > 135:
+        return 0.0  # horizontal
+    return math.pi / 2  # vertical
+
+
+def _fit_line_ls(pts):
     """
-    True only if `a` and `b` look like the inner/outer edge of the SAME
-    drawn stroke: same classified type, centres essentially coincident,
-    and overall size differing only by roughly a stroke-width.
-
-    This deliberately does NOT match e.g. a big rectangle's inner "hole"
-    contour against a much smaller cut-out that happens to be its child in
-    the hierarchy tree — those have very different centres/sizes and will
-    correctly be treated as independent shapes.
+    Fit a line through pts using SVD (total least squares).
+    Returns (angle_rad, midpoint_x, midpoint_y).
     """
-    if a['type'] != b['type']:
-        return False
-    dc = math.hypot(a['cx'] - b['cx'], a['cy'] - b['cy'])
-    if a['type'] == 'circle':
-        size_a, size_b = a['r'], b['r']
-    else:
-        size_a, size_b = max(a['w'], a['h']), max(b['w'], b['h'])
-    if size_a <= 0 or size_b <= 0:
-        return False
-    size_rel   = abs(size_a - size_b) / max(size_a, size_b)
-    center_tol = max(6.0, 0.08 * max(size_a, size_b))
-    return dc <= center_tol and size_rel <= 0.30
+    cx, cy = pts[:, 0].mean(), pts[:, 1].mean()
+    centered = pts - np.array([cx, cy])
+    _, _, Vt = np.linalg.svd(centered, full_matrices=False)
+    direction = Vt[0]  # principal direction
+    angle = math.atan2(float(direction[1]), float(direction[0]))
+    return angle, cx, cy
 
-def _average_shapes(a, b):
+
+def _project_pts_onto_line(pts, angle, cx, cy):
+    """Project all pts onto the fitted line, return (t_min, t_max) parameter range."""
+    dx, dy = math.cos(angle), math.sin(angle)
+    ts = [(p[0] - cx) * dx + (p[1] - cy) * dy for p in pts]
+    return min(ts), max(ts)
+
+
+def _orthogonal_polyline_from_contour(pts, angle_snap_tol=0.3):
     """
-    Average two paired inner/outer edge fits into a single shape that
-    represents the TRUE CENTRELINE of the drawn stroke — i.e. the position
-    a CAD/CAM user would actually want to cut along.
+    Convert a contour point cloud to an orthogonal polyline with 90-degree snapping.
+    Splits the contour into roughly-straight segments, fits a line to each,
+    snaps each to horizontal or vertical, then chains them together.
+    Returns list of (x, y) corner points defining the polyline.
     """
-    if a['type'] == 'circle':
-        cx = (a['cx'] + b['cx']) / 2.0
-        cy = (a['cy'] + b['cy']) / 2.0
-        r  = (a['r']  + b['r'])  / 2.0
-        return {'type': 'circle', 'cx': cx, 'cy': cy, 'r': r,
-                'err': max(a.get('err', 0.0), b.get('err', 0.0)),
-                'area': math.pi * r * r}
-    else:
-        cx = (a['cx'] + b['cx']) / 2.0
-        cy = (a['cy'] + b['cy']) / 2.0
-        w  = (a['w']  + b['w'])  / 2.0
-        h  = (a['h']  + b['h'])  / 2.0
-        return {'type': 'rect', 'cx': cx, 'cy': cy, 'w': w, 'h': h, 'area': w * h}
+    # Use Douglas-Peucker to find key corners
+    pts_int = pts.astype(np.int32).reshape((-1, 1, 2))
+    arc = cv2.arcLength(pts_int, closed=False)
+    epsilon = max(2.0, 0.02 * arc)
+    approx = cv2.approxPolyDP(pts_int, epsilon, closed=False)
+    corners = np.array([[p[0][0], p[0][1]] for p in approx], dtype=float)
 
-def pair_by_hierarchy(shapes, parents, children):
-    """
-    For every contour, check its hierarchy parent and first-child. If either
-    is a "same stroke, offset edge" match (per _shapes_similar_for_pairing),
-    average the pair into one shape and mark both as consumed. Any contour
-    left unconsumed is passed through standalone (e.g. a filled circle drawn
-    without a separate hole contour, or a shape whose pair didn't survive
-    classification).
-    """
-    n = len(shapes)
-    consumed = [False] * n
-    output = []
+    if len(corners) < 2:
+        return [(float(pts[0, 0]), float(pts[0, 1])),
+                (float(pts[-1, 0]), float(pts[-1, 1]))]
 
-    for i in range(n):
-        if consumed[i] or shapes[i] is None:
-            continue
-        s_i = shapes[i]
-        partner = -1
-
-        c = children[i]
-        if c != -1 and 0 <= c < n and not consumed[c] and shapes[c] is not None \
-                and _shapes_similar_for_pairing(s_i, shapes[c]):
-            partner = c
-
-        if partner == -1:
-            p = parents[i]
-            if p != -1 and 0 <= p < n and not consumed[p] and shapes[p] is not None \
-                    and _shapes_similar_for_pairing(s_i, shapes[p]):
-                partner = p
-
-        if partner != -1:
-            output.append(_average_shapes(s_i, shapes[partner]))
-            consumed[i] = True
-            consumed[partner] = True
-        else:
-            output.append(s_i)
-            consumed[i] = True
-
-    return output
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# STEP 10 — RESIDUAL DEDUP (proximity-average safety net) + ABSOLUTE FILTER
-# ════════════════════════════════════════════════════════════════════════════
-
-def _dedup_residual(shapes, kind):
-    """
-    Safety net for any near-duplicate shapes that the hierarchy pass didn't
-    catch (e.g. extra contour fragments from a thicker stroke). Groups
-    same-type shapes by proximity and AVERAGES each group into one shape
-    (instead of arbitrarily discarding the larger one — averaging keeps the
-    result centred on the true geometry rather than biased toward whichever
-    edge happened to be "smaller").
-    """
-    used = [False] * len(shapes)
     result = []
-    for i, s in enumerate(shapes):
-        if used[i]:
+    for i in range(len(corners) - 1):
+        p0 = corners[i]
+        p1 = corners[i + 1]
+        dx = p1[0] - p0[0]
+        dy = p1[1] - p0[1]
+        length = math.hypot(dx, dy)
+        if length < 1e-6:
             continue
-        grp = [s]
-        used[i] = True
-        for j in range(i + 1, len(shapes)):
-            if used[j]:
-                continue
-            s2 = shapes[j]
-            if s2['type'] != kind:
-                continue
-            dc = math.hypot(s['cx'] - s2['cx'], s['cy'] - s2['cy'])
-            if kind == 'circle':
-                size_a, size_b = s['r'], s2['r']
-            else:
-                size_a, size_b = max(s['w'], s['h']), max(s2['w'], s2['h'])
-            size_rel   = abs(size_a - size_b) / max(size_a, size_b, 1e-9)
-            center_tol = max(8.0, 0.10 * max(size_a, size_b))
-            if dc <= center_tol and size_rel <= 0.30:
-                grp.append(s2)
-                used[j] = True
+        angle = math.atan2(abs(dy), abs(dx))
+        # Snap to horizontal (angle < 45°) or vertical (angle >= 45°)
+        if angle < math.pi / 4:  # horizontal
+            mid_y = (p0[1] + p1[1]) / 2.0
+            seg_p0 = (p0[0], mid_y)
+            seg_p1 = (p1[0], mid_y)
+        else:  # vertical
+            mid_x = (p0[0] + p1[0]) / 2.0
+            seg_p0 = (mid_x, p0[1])
+            seg_p1 = (mid_x, p1[1])
 
-        if len(grp) == 1:
-            result.append(grp[0])
+        if not result:
+            result.append(seg_p0)
         else:
-            if kind == 'circle':
-                cx = float(np.mean([g['cx'] for g in grp]))
-                cy = float(np.mean([g['cy'] for g in grp]))
-                r  = float(np.mean([g['r']  for g in grp]))
-                result.append({'type': 'circle', 'cx': cx, 'cy': cy, 'r': r,
-                                'err': max(g.get('err', 0.0) for g in grp),
-                                'area': math.pi * r * r})
-            else:
-                cx = float(np.mean([g['cx'] for g in grp]))
-                cy = float(np.mean([g['cy'] for g in grp]))
-                w  = float(np.mean([g['w']  for g in grp]))
-                h  = float(np.mean([g['h']  for g in grp]))
-                result.append({'type': 'rect', 'cx': cx, 'cy': cy, 'w': w, 'h': h, 'area': w * h})
-    return result
+            # Connect previous endpoint to this segment start with a clean join
+            prev = result[-1]
+            if abs(seg_p0[0] - prev[0]) > 1 or abs(seg_p0[1] - prev[1]) > 1:
+                # Insert an elbow point
+                if angle < math.pi / 4:  # current is horizontal → elbow at same y as current, same x as prev
+                    elbow = (prev[0], seg_p0[1])
+                else:  # current is vertical → elbow at same x as current, same y as prev
+                    elbow = (seg_p0[0], prev[1])
+                result.append(elbow)
+            result.append(seg_p0)
+        result.append(seg_p1)
+
+    # Deduplicate consecutive identical points
+    deduped = [result[0]] if result else []
+    for p in result[1:]:
+        if abs(p[0] - deduped[-1][0]) > 0.5 or abs(p[1] - deduped[-1][1]) > 0.5:
+            deduped.append(p)
+    return deduped
 
 
-def _circles_overlap(a, b):
+def classify_and_fit_contours(contours, circle_rms_tol=0.10, min_pts_circle=16):
     """
-    True if circle `a` and circle `b` substantially overlap — i.e. one
-    circle's centre lies inside the other's disk. This catches the case
-    where a single wobbly hand-drawn ring produces an outer-edge contour
-    and an inner-edge ("hole") contour whose CENTRES differ by more than
-    `_shapes_similar_for_pairing`'s tight hierarchy-pairing tolerance (so
-    they were never paired/averaged) and also differ enough in radius that
-    `_dedup_residual`'s tolerance didn't merge them either — leaving two
-    near-duplicate circles of the SAME physical hole, one slightly smaller
-    and offset from the other (the "smallest diameter circle" symptom).
+    For each contour:
+      - If it is closed and the Kasa circle fit has rel RMS < circle_rms_tol → CIRCLE entity
+      - Otherwise → orthogonal LWPOLYLINE with 90° snapping
+    Returns list of entity dicts.
     """
-    dc = math.hypot(a['cx'] - b['cx'], a['cy'] - b['cy'])
-    return dc < max(a['r'], b['r'])
+    entities = []
+    for pts in contours:
+        closed = _is_closed_contour(pts)
+        # Attempt circle fit on closed contours with enough points
+        if closed and len(pts) >= min_pts_circle:
+            fit = _fit_circle_kasa(pts)
+            if fit is not None:
+                cx, cy, r, rel = fit
+                if rel < circle_rms_tol:
+                    entities.append({
+                        'type': 'circle',
+                        'cx': float(cx), 'cy': float(cy), 'r': float(r),
+                        'closed': True,
+                    })
+                    continue
 
-def _dedup_overlapping_circles(circles):
+        # Fallback: orthogonal polyline
+        poly_pts = _orthogonal_polyline_from_contour(pts)
+        if len(poly_pts) >= 2:
+            entities.append({
+                'type': 'polyline',
+                'pts': poly_pts,
+                'closed': closed and len(poly_pts) >= 3,
+            })
+    return entities
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# STEP 9 — INTERSECTION DETECTION & ENDPOINT TRIMMING
+# ════════════════════════════════════════════════════════════════════════════
+
+def _seg_intersect(p1, p2, p3, p4, tol=20.0):
     """
-    Cluster circles whose disks overlap (per `_circles_overlap`) and keep
-    only ONE representative per cluster — the one with the lowest algebraic
-    fit error (`err`), tie-broken by the larger radius (the outer edge is
-    the more representative boundary of a stroke). All other members of the
-    cluster are dropped as duplicates of the same physical hole.
+    Find intersection of line segment p1→p2 with line (infinite) through p3→p4.
+    Returns intersection point or None.
+    Uses parameter t along p1→p2; returns point if 0 <= t <= 1 (within segment).
     """
-    n = len(circles)
-    used = [False] * n
-    result = []
-    # Process largest-first so a big "true" circle absorbs smaller
-    # overlapping duplicates rather than the reverse.
-    order = sorted(range(n), key=lambda i: circles[i]['r'], reverse=True)
-    for i in order:
-        if used[i]:
+    x1, y1 = p1
+    x2, y2 = p2
+    x3, y3 = p3
+    x4, y4 = p4
+    d1x, d1y = x2 - x1, y2 - y1
+    d2x, d2y = x4 - x3, y4 - y3
+    denom = d1x * d2y - d1y * d2x
+    if abs(denom) < 1e-9:
+        return None  # parallel
+    t = ((x3 - x1) * d2y - (y3 - y1) * d2x) / denom
+    # Allow slight overshoot for trimming (extend endpoint up to tol px)
+    seg_len = math.hypot(d1x, d1y)
+    t_tol = tol / (seg_len + 1e-9)
+    if -t_tol <= t <= 1 + t_tol:
+        ix = x1 + t * d1x
+        iy = y1 + t * d1y
+        return (ix, iy)
+    return None
+
+
+def trim_endpoints_to_intersections(entities, snap_radius=15.0):
+    """
+    For each polyline entity, attempt to extend/trim its start and end points
+    to the nearest intersection with any other entity's segments.
+    Circles are not modified (they are closed by definition).
+
+    Algorithm:
+      For each polyline P:
+        For each of its two endpoints (start, end):
+          Gather the endpoint's final segment direction.
+          For each other entity Q (polyline or circle):
+            For each segment of Q: test intersection with endpoint-ray.
+            Keep the nearest intersection within snap_radius.
+          If found: move the endpoint to the intersection.
+    """
+    polylines = [e for e in entities if e['type'] == 'polyline']
+
+    for i, poly in enumerate(polylines):
+        pts = list(poly['pts'])
+        if len(pts) < 2:
             continue
-        cluster = [i]
-        used[i] = True
-        for j in order:
-            if used[j]:
+
+        # Try to trim/extend START endpoint
+        # The outward ray at start goes from pts[1] → pts[0] (and beyond)
+        p_start = pts[0]
+        p_start_dir = pts[1]  # direction reference
+
+        best_pt = None
+        best_dist = snap_radius
+
+        for j, other in enumerate(entities):
+            if i == j and other['type'] == 'polyline':
                 continue
-            if _circles_overlap(circles[i], circles[j]):
-                cluster.append(j)
-                used[j] = True
-        best = min(cluster, key=lambda k: (circles[k].get('err', 0.0), -circles[k]['r']))
-        result.append(circles[best])
-    return result
+            if other['type'] == 'polyline':
+                segs = list(zip(other['pts'][:-1], other['pts'][1:]))
+            else:
+                # Circle: skip for endpoint trimming
+                continue
+            for (q0, q1) in segs:
+                ip = _seg_intersect(p_start, p_start_dir, q0, q1, tol=snap_radius)
+                if ip is not None:
+                    d = math.hypot(ip[0] - p_start[0], ip[1] - p_start[1])
+                    if d < best_dist:
+                        best_dist = d
+                        best_pt = ip
 
-def _circle_overlaps_any_rect(c, rects, center_inside_frac=0.5):
-    """
-    True if circle `c`'s centre lies inside (or within `center_inside_frac`
-    of its radius from) any rect's bounding box.
+        if best_pt is not None:
+            pts[0] = best_pt
 
-    In sheet-layout sketches a real bore/hole is drawn in open material, not
-    stacked on top of a separate cut-out rectangle. When a rectangle's
-    "hole" contour has rounded/eroded corners (common after MORPH_OPEN on a
-    hand-drawn line of uneven thickness), its aspect ratio can exceed the
-    circle-fit threshold and the Kasa fit happily returns a "circle" sitting
-    on top of that rectangle — the "circle at lower-bottom-left" symptom.
-    Such circles are rejected here.
-    """
-    for r in rects:
-        x0 = r['cx'] - r['w'] / 2.0
-        x1 = r['cx'] + r['w'] / 2.0
-        y0 = r['cy'] - r['h'] / 2.0
-        y1 = r['cy'] + r['h'] / 2.0
-        dx = max(x0 - c['cx'], 0.0, c['cx'] - x1)
-        dy = max(y0 - c['cy'], 0.0, c['cy'] - y1)
-        dist = math.hypot(dx, dy)
-        if dist < c['r'] * center_inside_frac:
-            return True
-    return False
+        # Try to trim/extend END endpoint
+        p_end = pts[-1]
+        p_end_dir = pts[-2]
 
+        best_pt = None
+        best_dist = snap_radius
 
-def build_clean_shapes(simplified_contours, parents, children, img_w, img_h,
-                       min_shape_area=None, rect_aspect_min=0.15,
-                       rect_rel_area_min=0.01, circle_rel_radius_min=0.4,
-                       circle_rect_overlap_frac=0.5):
-    """
-    Full v10 pipeline:
-      a. Classify every contour as circle or rect.
-      b. Pair inner/outer stroke edges via hierarchy and AVERAGE -> true
-         centreline geometry (replaces v9.1's "discard the larger" hack).
-      c. Residual proximity dedup (averaging) as a safety net.
-      d. Absolute-area noise filter (drops any leftover speckle-derived
-         micro-shapes).
-      e. Annotation filter (scale-invariant — does NOT depend on image
-         resolution):
-           - Rect aspect filter: drops thin line-like contours
-             (dimension lines / arrow shafts) whose min(w,h)/max(w,h)
-             falls below `rect_aspect_min`. A real cut-rectangle is never
-             that thin; a dimension line is.
-           - Rect relative-area filter: drops rects whose area is below
-             `rect_rel_area_min` of the LARGEST rect found (the outer
-             sheet/board boundary). Annotation text blocks (e.g. "900mm")
-             are small relative to the board; real cut-outs are not.
-      f. Spurious-circle filters (run BEFORE the relative-radius filter,
-         since these artefacts can be similar in size to the real circle):
-           - Circle-circle overlap dedup: collapses near-duplicate circles
-             whose disks overlap (offset inner/outer edges of one wobbly
-             stroke) down to a single best-fit circle.
-           - Circle-rect overlap rejection: drops any circle centred inside
-             a detected rectangle's bounding box (a rectangle "hole"
-             contour misclassified as round).
-      g. Circle relative-radius filter: drops circles whose radius is below
-         `circle_rel_radius_min` of the largest remaining circle (text
-         glyph circles like the "0" in "900mm").
-      h. NO re-centering. Every shape keeps its measured (cx, cy) — output
-         geometry matches the Canny image pixel-for-pixel.
-    Returns final_shapes, circles_final, rects_final.
-    """
-    classified = []
-    for cnt in simplified_contours:
-        pts_xy = np.array([[float(p[0][0]), float(p[0][1])] for p in cnt], dtype=float)
-        if len(pts_xy) < 2:
-            classified.append(None)
-            continue
-        classified.append(_classify_contour(pts_xy))
+        for j, other in enumerate(entities):
+            if i == j and other['type'] == 'polyline':
+                continue
+            if other['type'] == 'polyline':
+                segs = list(zip(other['pts'][:-1], other['pts'][1:]))
+            else:
+                continue
+            for (q0, q1) in segs:
+                ip = _seg_intersect(p_end, p_end_dir, q0, q1, tol=snap_radius)
+                if ip is not None:
+                    d = math.hypot(ip[0] - p_end[0], ip[1] - p_end[1])
+                    if d < best_dist:
+                        best_dist = d
+                        best_pt = ip
 
-    # Step 1: hierarchy-based offset-pair averaging
-    paired = pair_by_hierarchy(classified, parents, children)
-    paired = [s for s in paired if s is not None]
+        if best_pt is not None:
+            pts[-1] = best_pt
 
-    # Step 2: residual proximity dedup, per type
-    circles = [s for s in paired if s['type'] == 'circle']
-    rects   = [s for s in paired if s['type'] == 'rect']
-    circles = _dedup_residual(circles, 'circle')
-    rects   = _dedup_residual(rects,   'rect')
+        poly['pts'] = pts
 
-    # Step 3: absolute-area noise filter
-    if min_shape_area is None:
-        min_shape_area = max(16.0, 0.00003 * img_w * img_h)
-
-    circles = [c for c in circles if (math.pi * c['r'] * c['r']) >= min_shape_area]
-    rects   = [r for r in rects   if (r['w'] * r['h'])           >= min_shape_area]
-
-    # Step 4a: rect aspect-ratio filter (drop thin dimension-line shafts)
-    rects = [r for r in rects
-             if max(r['w'], r['h']) > 0
-             and (min(r['w'], r['h']) / max(r['w'], r['h'])) >= rect_aspect_min]
-
-    # Step 4b: rect relative-area filter (drop annotation text blocks,
-    # measured against the largest surviving rect — typically the board)
-    if rects:
-        max_rect_area = max(r['w'] * r['h'] for r in rects)
-        rects = [r for r in rects if (r['w'] * r['h']) >= rect_rel_area_min * max_rect_area]
-
-    # Step 4c: circle-circle overlap dedup (collapse offset-duplicate rings)
-    circles = _dedup_overlapping_circles(circles)
-
-    # Step 4d: circle-rect overlap rejection (drop rect-corner misfits).
-    # The largest rect is treated as the outer board/boundary — real holes
-    # are legitimately drawn INSIDE it, so it's excluded from this check.
-    # Only the smaller "cut-out" rects are considered: a circle centred on
-    # top of one of those is almost certainly that rect's hole-contour
-    # misclassified as round, not a separate real hole.
-    if len(rects) > 1:
-        rects_sorted_desc = sorted(rects, key=lambda r: r['w'] * r['h'], reverse=True)
-        cutout_rects = rects_sorted_desc[1:]
-    else:
-        cutout_rects = []
-    circles = [c for c in circles if not _circle_overlaps_any_rect(c, cutout_rects, circle_rect_overlap_frac)]
-
-    # Step 4e: circle relative-radius filter (drop text-character circles,
-    # measured against the largest surviving circle)
-    if circles:
-        max_r = max(c['r'] for c in circles)
-        circles = [c for c in circles if c['r'] >= circle_rel_radius_min * max_r]
-
-    circles_final = circles
-    rects_final   = rects
-    final_shapes  = list(rects_final) + list(circles_final)
-    return final_shapes, circles_final, rects_final
+    return entities
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# STEP 11 — CLEAN DXF EXPORT (one entity per shape, true detected position)
+# STEP 10 — DXF EXPORT (true centerline entities)
 # ════════════════════════════════════════════════════════════════════════════
 
-def build_clean_dxf(final_shapes, img_w, img_h, out_path):
+def build_centerline_dxf(entities, img_w, img_h, out_path):
     """
-    Write a DXF containing only true closed shapes:
-      - CIRCLE entities for circles
-      - Closed LWPOLYLINE (rectangle) entities for rects
-    Coordinates are the shapes' measured (cx, cy) — identical to their
-    position in the Canny/cleaned-mask image (origin top-left, Y-down,
-    same convention as `analysis.coordSystem`). No additional offset or
-    re-centering is applied.
+    Write DXF with:
+      - CIRCLE entities for circle fits
+      - LWPOLYLINE entities (with 90° orthogonal segments) for all polylines
+    Coordinates are pixel-space (origin top-left, Y-down from image).
+    The DXF Y axis is flipped so that the geometry looks correct in CAD
+    (Y increases upward in DXF convention).
     """
-    if not HAS_DXF or not final_shapes:
+    if not HAS_DXF or not entities:
         return None, 0, 0
 
     doc = ezdxf.new(dxfversion="R2018")
@@ -704,79 +485,80 @@ def build_clean_dxf(final_shapes, img_w, img_h, out_path):
     doc.header["$LIMMAX"]   = (float(img_w), float(img_h))
 
     msp = doc.modelspace()
-    doc.layers.new("SHAPES",  dxfattribs={"color": 7,  "linetype": "CONTINUOUS"})
-    doc.layers.new("CIRCLES", dxfattribs={"color": 1,  "linetype": "CONTINUOUS"})
-    doc.layers.new("RECTS",   dxfattribs={"color": 3,  "linetype": "CONTINUOUS"})
+    doc.layers.new("CENTERLINES", dxfattribs={"color": 7,  "linetype": "CONTINUOUS"})
+    doc.layers.new("CIRCLES",     dxfattribs={"color": 1,  "linetype": "CONTINUOUS"})
+
+    def flip_y(y):
+        return float(img_h) - float(y)
 
     entity_count = 0
 
-    for s in final_shapes:
-        if s['type'] == 'circle':
+    for e in entities:
+        if e['type'] == 'circle':
+            cx = float(e['cx'])
+            cy = flip_y(e['cy'])
+            r  = float(e['r'])
             msp.add_circle(
-                (s['cx'], s['cy'], 0.0),
-                s['r'],
-                dxfattribs={"layer": "CIRCLES", "color": 256}
+                (cx, cy, 0.0), r,
+                dxfattribs={"layer": "CIRCLES", "color": 1}
             )
             entity_count += 1
 
-        elif s['type'] == 'rect':
-            x0, y0 = s['cx'] - s['w'] / 2.0, s['cy'] - s['h'] / 2.0
-            x1, y1 = s['cx'] + s['w'] / 2.0, s['cy'] + s['h'] / 2.0
-            pts = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+        elif e['type'] == 'polyline':
+            pts_dxf = [(float(p[0]), flip_y(p[1])) for p in e['pts']]
+            if len(pts_dxf) < 2:
+                continue
             poly = msp.add_lwpolyline(
-                pts, format="xy",
-                dxfattribs={"layer": "RECTS", "color": 256}
+                pts_dxf, format="xy",
+                dxfattribs={"layer": "CENTERLINES", "color": 7}
             )
-            poly.close(True)
+            if e.get('closed') and len(pts_dxf) >= 3:
+                poly.close(True)
             entity_count += 1
 
     doc.saveas(str(out_path))
-    file_size = out_path.stat().st_size
+    file_size = out_path.stat().st_size if out_path.exists() else 0
     return doc, entity_count, file_size
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# STEP 12 — PNG PREVIEW (side-by-side comparison)
+# PNG PREVIEW
 # ════════════════════════════════════════════════════════════════════════════
 
-def build_comparison_png(edges, final_shapes, img_w, img_h, out_path):
+def build_comparison_png(edges_display, entities, img_w, img_h, out_path):
     if not HAS_CV or not np:
         return False
-
     try:
         left = np.zeros((img_h, img_w, 3), dtype=np.uint8)
         left[:] = (15, 12, 10)
-        left[edges > 0] = (255, 255, 255)
+        left[edges_display > 0] = (255, 255, 255)
 
         right = np.zeros((img_h, img_w, 3), dtype=np.uint8)
         right[:] = (15, 12, 10)
 
-        for s in final_shapes:
-            cx_px = int(round(s['cx']))
-            cy_px = int(round(s['cy']))
-
-            if s['type'] == 'circle':
-                r_px = int(round(s['r']))
+        n_circ = 0
+        n_poly = 0
+        for e in entities:
+            if e['type'] == 'circle':
+                cx_px = int(round(e['cx']))
+                cy_px = int(round(e['cy']))
+                r_px  = int(round(e['r']))
                 cv2.circle(right, (cx_px, cy_px), r_px, (80, 80, 220), 2, cv2.LINE_AA)
-            elif s['type'] == 'rect':
-                x0 = int(round(s['cx'] - s['w'] / 2.0))
-                y0 = int(round(s['cy'] - s['h'] / 2.0))
-                x1 = int(round(s['cx'] + s['w'] / 2.0))
-                y1 = int(round(s['cy'] + s['h'] / 2.0))
-                cv2.rectangle(right, (x0, y0), (x1, y1), (80, 200, 80), 2, cv2.LINE_AA)
+                n_circ += 1
+            elif e['type'] == 'polyline':
+                pts_draw = [(int(round(p[0])), int(round(p[1]))) for p in e['pts']]
+                for k in range(len(pts_draw) - 1):
+                    cv2.line(right, pts_draw[k], pts_draw[k + 1], (80, 200, 80), 2, cv2.LINE_AA)
+                if e.get('closed') and len(pts_draw) >= 3:
+                    cv2.line(right, pts_draw[-1], pts_draw[0], (80, 200, 80), 2, cv2.LINE_AA)
+                n_poly += 1
 
-        font   = cv2.FONT_HERSHEY_SIMPLEX
-        n_circ = sum(1 for s in final_shapes if s['type'] == 'circle')
-        n_rect = sum(1 for s in final_shapes if s['type'] == 'rect')
-        cv2.putText(left,  "Canny Edge Detection",
-                    (10, 22), font, 0.55, (180, 180, 180), 1, cv2.LINE_AA)
-        cv2.putText(right,
-                    f"Final Shapes: {n_rect} rect(s) + {n_circ} circle(s)",
-                    (10, 22), font, 0.55, (180, 180, 180), 1, cv2.LINE_AA)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        cv2.putText(left, "Canny Skeleton (200px filter)", (10, 22), font, 0.55, (180, 180, 180), 1, cv2.LINE_AA)
+        cv2.putText(right, f"Centerlines: {n_poly} polyline(s) + {n_circ} circle(s)", (10, 22), font, 0.55, (180, 180, 180), 1, cv2.LINE_AA)
 
         sep   = np.full((img_h, 4, 3), 40, dtype=np.uint8)
         panel = np.concatenate([left, sep, right], axis=1)
-
         ok = cv2.imwrite(str(out_path), panel)
         return bool(ok and out_path.exists())
     except Exception as e:
@@ -785,31 +567,27 @@ def build_comparison_png(edges, final_shapes, img_w, img_h, out_path):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# STEP 13 — PDF EXPORT
+# PDF EXPORT
 # ════════════════════════════════════════════════════════════════════════════
 
 def export_pdf(edges, out_path, orig_bgr=None):
     if not HAS_RL:
         return False
-
     import tempfile, os as _os
     from reportlab.lib.pagesizes import A4, landscape
     from reportlab.pdfgen import canvas as rl_canvas
     from reportlab.lib.utils import ImageReader
-
     try:
         page_w, page_h = landscape(A4)
         c = rl_canvas.Canvas(str(out_path), pagesize=(page_w, page_h))
-
         margin = 30
         col_w  = (page_w - margin * 3) / 2
         col_h  = page_h - margin * 2 - 40
-
         c.setFillColorRGB(0.04, 0.05, 0.06)
         c.rect(0, page_h - 36, page_w, 36, fill=1, stroke=0)
         c.setFillColorRGB(0.9, 0.91, 0.93)
         c.setFont("Helvetica-Bold", 13)
-        c.drawString(margin, page_h - 24, "SheetForge — Hierarchy-Aware Shape Fitting Preview")
+        c.drawString(margin, page_h - 24, "SheetForge v12 — True Centerline DXF Preview")
         c.setFont("Helvetica", 9)
         c.setFillColorRGB(0.5, 0.55, 0.6)
         from datetime import datetime
@@ -823,7 +601,6 @@ def export_pdf(edges, out_path, orig_bgr=None):
             return ImageReader(tmp.name), tmp.name
 
         tmp_files = []
-
         left_x = margin
         if orig_bgr is not None:
             reader, tname = _arr_to_reader(orig_bgr)
@@ -837,18 +614,15 @@ def export_pdf(edges, out_path, orig_bgr=None):
         edges_bgr = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
         reader, tname = _arr_to_reader(edges_bgr)
         tmp_files.append(tname)
-        _draw_panel(c, reader, right_x, margin, col_w, col_h, "Canny Edge Detection")
-
+        _draw_panel(c, reader, right_x, margin, col_w, col_h, "Skeleton Centerline (200px filter)")
         c.setFillColorRGB(0.3, 0.35, 0.4)
         c.setFont("Helvetica", 8)
         c.drawCentredString(page_w / 2, 12,
-                            "SheetForge v10  •  Hierarchy-Aware Offset-Pair Averaging  •  Clean DXF")
+                            "SheetForge v12  •  Algebraic LS Centerline  •  90° Snap  •  Intersection Trim")
         c.save()
-
         for f in tmp_files:
             try: _os.unlink(f)
             except Exception: pass
-
         return True
     except Exception as e:
         sys.stderr.write(f"PDF export error: {e}\n{traceback.format_exc()}\n")
@@ -858,7 +632,6 @@ def export_pdf(edges, out_path, orig_bgr=None):
 def _draw_panel(c, img_reader, x, y, w, h, title):
     title_h = 22
     img_h   = h - title_h
-
     c.setFillColorRGB(0.08, 0.1, 0.13)
     c.roundRect(x, y, w, h, 6, fill=1, stroke=0)
     c.setFillColorRGB(0.12, 0.15, 0.2)
@@ -866,7 +639,6 @@ def _draw_panel(c, img_reader, x, y, w, h, title):
     c.setFillColorRGB(0.55, 0.65, 0.85)
     c.setFont("Helvetica-Bold", 9)
     c.drawCentredString(x + w / 2, y + img_h + 7, title)
-
     pad = 8
     c.drawImage(img_reader, x + pad, y + title_h + pad,
                 width=w - pad * 2, height=img_h - pad * 2,
@@ -884,118 +656,111 @@ def main():
         try: opts = json.loads(sys.argv[2])
         except Exception: pass
 
-    blur_ksize     = int(opts.get("blurKsize",    5))
-    canny_low      = int(opts.get("cannyLow",    20))
-    canny_high     = int(opts.get("cannyHigh",   80))
-    epsilon_factor = float(opts.get("epsilonFactor", 0.5))
-    min_blob_area  = int(opts.get("minBlobArea", 50))    # px-area: kills isolated dots/specks
-    min_shape_area = opts.get("minShapeArea", None)       # px-area: absolute noise filter
-    if min_shape_area is not None:
-        min_shape_area = float(min_shape_area)
-    rect_aspect_min       = float(opts.get("rectAspectMin", 0.15))     # drop thin dimension lines
-    rect_rel_area_min     = float(opts.get("rectRelAreaMin", 0.01))    # drop annotation text blocks
-    circle_rel_radius_min = float(opts.get("circleRelRadiusMin", 0.4)) # drop text-glyph circles
-    circle_rect_overlap_frac = float(opts.get("circleRectOverlapFrac", 0.5))  # drop circles sitting on rects
+    blur_ksize        = int(opts.get("blurKsize",    5))
+    canny_low         = int(opts.get("cannyLow",    20))
+    canny_high        = int(opts.get("cannyHigh",   80))
+    min_blob_area     = int(opts.get("minBlobArea", 50))
+    # v12: minimum Canny blob area — removes all edge fragments < 200px
+    canny_min_area    = int(opts.get("cannyMinArea", 200))
+    circle_rms_tol    = float(opts.get("circleRmsTol", 0.10))
+    snap_radius       = float(opts.get("snapRadius", 15.0))
 
     steps = []
 
-    # ── STEP 1: Load ──────────────────────────────────────────────────────
+    # STEP 1: Load
     t0 = now_ms()
     bgr, gray, dpi, img_w, img_h = load_image(image_path)
     steps.append(step_record("CV-1: Load Image", f"{img_w}×{img_h}px  DPI={dpi:.0f}", t0))
 
-    # ── STEP 2: Median Blur ───────────────────────────────────────────────
+    # STEP 2: Median Blur
     t0 = now_ms()
     blurred = median_blur(gray, ksize=blur_ksize)
     steps.append(step_record(f"CV-2: Median Blur (ksize={blur_ksize})", "Noise reduced", t0))
 
-    # ── STEP 3: Adaptive Threshold ───────────────────────────────────────
+    # STEP 3: Adaptive Threshold
     t0 = now_ms()
     binary   = adaptive_threshold_binarize(blurred)
     white_px = int(np.count_nonzero(binary))
     steps.append(step_record("CV-3: Adaptive Threshold", f"{white_px} white px", t0))
 
-    # ── STEP 4: Morph Open ───────────────────────────────────────────────
+    # STEP 4: Morph Open
     t0 = now_ms()
     opened    = morph_clean(binary)
     opened_px = int(np.count_nonzero(opened))
     steps.append(step_record("CV-4: MORPH_OPEN", f"{white_px - opened_px} spur px removed", t0))
 
-    # ── STEP 5: Connected-Component Speckle Removal ──────────────────────
+    # STEP 5: Connected-Component Speckle Removal on binary mask
     t0 = now_ms()
     cleaned, removed_blobs, removed_px = remove_small_blobs(opened, min_blob_area)
     steps.append(step_record(
-        f"CV-5: Connected-Component Filter (minBlobArea={min_blob_area}px)",
-        f"{removed_blobs} speckle blob(s) removed ({removed_px}px) — 100% dot-free mask", t0))
+        f"CV-5: Blob Filter (minBlobArea={min_blob_area}px)",
+        f"{removed_blobs} speckle blob(s) removed ({removed_px}px)", t0))
 
-    # ── STEP 6: Canny → dot cleanup → skeletonize → bold 4px centerline ────
+    # STEP 6a: Canny edge detection
     t0 = now_ms()
     edges_raw = canny_edges(cleaned, canny_low, canny_high)
-    edges_dotclean, edge_dot_blobs, edge_dot_px = clean_edge_preview(edges_raw, min_blob_area=3)
-    # Skeletonize the Canny output to a true 1-px centreline, then thicken to
-    # 4 px so the preview / PDF shows a bold, unambiguous single stroke rather
-    # than a faint double-edge ring.
-    edges_skel  = skeletonize_mask(edges_dotclean)
-    edges       = thicken_to_centerline(edges_skel, thickness_px=4)
-    edge_px     = int(np.count_nonzero(edges))
-    steps.append(step_record(
-        f"CV-6: Canny (lo={canny_low}, hi={canny_high}) + dot cleanup + skeletonize + 4px bold centerline",
-        f"{edge_px} edge px  |  {edge_dot_blobs} stray dot(s) removed  |  intensity=255 single-line strokes", t0))
 
-    # ── STEP 6b: Skeletonize cleaned mask → 4px centerline for contours ──
-    # Running findContours on a double-edge stroke produces inner+outer
-    # contour pairs that need expensive hierarchy pairing.  Skeletonizing the
-    # cleaned mask first collapses each stroke to a single centreline so every
-    # shape yields exactly ONE contour — geometry is directly the centreline.
-    t0_skel = now_ms()
-    cleaned_skel = skeletonize_mask(cleaned)
-    cleaned_for_contours = thicken_to_centerline(cleaned_skel, thickness_px=4)
+    # STEP 6b: Remove ALL Canny blobs < 200px (the key new filter)
+    edges_200, removed_edge_blobs, removed_edge_px = remove_small_blobs(edges_raw, canny_min_area)
     steps.append(step_record(
-        "CV-6b: Skeletonize + 4px thicken of cleaned mask (single-line strokes for contour extraction)",
-        f"double-edge rings collapsed to bold centrelines — one contour per shape", t0_skel))
+        f"CV-6: Canny (lo={canny_low}, hi={canny_high}) + {canny_min_area}px area filter",
+        f"{removed_edge_blobs} edge blob(s) removed ({removed_edge_px}px) — "
+        f"{int(np.count_nonzero(edges_200))} edge px remain", t0))
 
-    # ── STEP 7: Contour + hierarchy extraction on SKELETONIZED MASK ───────
+    # STEP 6c: Skeletonize filtered Canny to true 1-px centerline
     t0 = now_ms()
-    simplified_contours, parents, children = extract_contours_with_hierarchy(
-        cleaned_for_contours, epsilon_factor)
-    total_pts = sum(len(c) for c in simplified_contours)
+    skeleton = skeletonize_mask(edges_200)
+    skel_px  = int(np.count_nonzero(skeleton))
     steps.append(step_record(
-        f"CV-7: findContours(RETR_TREE) on skeletonized mask + approxPolyDP (ε={epsilon_factor})",
-        f"{len(simplified_contours)} contours  |  {total_pts} vertices", t0))
+        "CV-6c: Skeletonize (Zhang-Suen) → 1-px centerline",
+        f"{skel_px} skeleton px  — single centerline per edge guaranteed", t0))
 
-    # ── STEP 8-10: classify, pair, dedup, filter ───────────────────────────
+    # Build display edge image (thickened for visibility)
+    edges_display = thicken_to_centerline(skeleton, thickness_px=4)
+
+    # STEP 7: Contour extraction on 1-px skeleton
     t0 = now_ms()
-    final_shapes, circles_f, rects_f = build_clean_shapes(
-        simplified_contours, parents, children, img_w, img_h, min_shape_area,
-        rect_aspect_min=rect_aspect_min,
-        rect_rel_area_min=rect_rel_area_min,
-        circle_rel_radius_min=circle_rel_radius_min,
-        circle_rect_overlap_frac=circle_rect_overlap_frac)
-    n_circles = len(circles_f)
-    n_rects   = len(rects_f)
+    raw_contours = extract_centerline_contours(skeleton, min_contour_len=10)
+    total_pts = sum(len(c) for c in raw_contours)
     steps.append(step_record(
-        "LS-8/9/10: LS classification + hierarchy offset-pair averaging + residual dedup + area filter",
-        f"{len(simplified_contours)} raw contours → {n_rects} rect(s) + {n_circles} circle(s)  "
-        f"(true measured positions, no re-centering)",
-        t0))
+        "CV-7: Contour extraction on skeleton (RETR_LIST, CHAIN_APPROX_NONE)",
+        f"{len(raw_contours)} contours  |  {total_pts} vertices", t0))
 
-    # ── Output dir ────────────────────────────────────────────────────────
+    # STEP 8: Algebraic LS fitting — circle or orthogonal polyline
+    t0 = now_ms()
+    entities = classify_and_fit_contours(
+        raw_contours,
+        circle_rms_tol=circle_rms_tol,
+        min_pts_circle=16,
+    )
+    n_circ = sum(1 for e in entities if e['type'] == 'circle')
+    n_poly = sum(1 for e in entities if e['type'] == 'polyline')
+    steps.append(step_record(
+        f"LS-8: Algebraic LS fit (Kasa circle, 90° orthogonal polyline)",
+        f"{len(raw_contours)} contours → {n_circ} circle(s) + {n_poly} polyline(s)  "
+        f"[circle RMS tol={circle_rms_tol}]", t0))
+
+    # STEP 9: Intersection trimming
+    t0 = now_ms()
+    entities = trim_endpoints_to_intersections(entities, snap_radius=snap_radius)
+    steps.append(step_record(
+        f"GEO-9: Intersection trimming (snap_radius={snap_radius}px)",
+        f"Polyline endpoints trimmed to nearest intersecting segment", t0))
+
+    # Output dir
     server_out_dir = Path(__file__).parent / "uploads" / "output"
     server_out_dir.mkdir(parents=True, exist_ok=True)
-
     ts_str   = int(time.time())
     dxf_name = f"design_{ts_str}.dxf"
     pdf_name = f"design_{ts_str}.pdf"
     png_name = f"preview_{ts_str}.png"
-
     dxf_path = server_out_dir / dxf_name
     pdf_path = server_out_dir / pdf_name
     png_path = server_out_dir / png_name
 
-    # ── STEP 11: Clean DXF export ─────────────────────────────────────────
+    # STEP 10: Centerline DXF export
     t0 = now_ms()
-    _, entity_count, dxf_size = build_clean_dxf(final_shapes, img_w, img_h, dxf_path)
-
+    _, entity_count, dxf_size = build_centerline_dxf(entities, img_w, img_h, dxf_path)
     dxf_content_str = ""
     if dxf_size and dxf_size > 0:
         try:
@@ -1003,53 +768,49 @@ def main():
                 dxf_content_str = f.read(200_000)
         except Exception:
             pass
-
     steps.append(step_record(
-        "DXF-11: Clean export (CIRCLE + closed LWPOLYLINE, one entity per shape, true position)",
+        "DXF-10: Centerline DXF export (CIRCLE + LWPOLYLINE, 90° snapped, intersection-trimmed)",
         f"{entity_count} entities  |  {dxf_size // 1024 if dxf_size else 0} KB", t0))
 
-    # ── STEP 12: PNG comparison preview ───────────────────────────────────
+    # STEP 11: PNG comparison preview
     t0 = now_ms()
-    png_ok   = build_comparison_png(edges, final_shapes, img_w, img_h, png_path)
+    png_ok   = build_comparison_png(edges_display, entities, img_w, img_h, png_path)
     png_size = png_path.stat().st_size if png_ok and png_path.exists() else 0
     steps.append(step_record(
-        "PNG-12: Side-by-side comparison preview (Canny vs final shapes)",
+        "PNG-11: Side-by-side preview (skeleton vs centerline entities)",
         f"{png_size // 1024 if png_size else 0} KB" if png_ok else "FAILED", t0))
 
-    # ── STEP 13: PDF export ───────────────────────────────────────────────
+    # STEP 12: PDF export
     t0 = now_ms()
-    pdf_ok = export_pdf(edges, pdf_path, orig_bgr=bgr)
-    steps.append(step_record("PDF-13: Export edge preview", "OK" if pdf_ok else "FAILED", t0))
+    pdf_ok = export_pdf(edges_display, pdf_path, orig_bgr=bgr)
+    steps.append(step_record("PDF-12: Export centerline preview", "OK" if pdf_ok else "FAILED", t0))
 
-    # ── Analysis summary ──────────────────────────────────────────────────
-    n_circ_final = sum(1 for s in final_shapes if s['type'] == 'circle')
-    n_rect_final = sum(1 for s in final_shapes if s['type'] == 'rect')
     analysis = {
-        "width"          : float(img_w),
-        "height"         : float(img_h),
-        "dpi"            : dpi,
-        "edgePixels"     : edge_px,
-        "edges"          : entity_count,
-        "contours"       : len(simplified_contours),
-        "mergedContours" : len(final_shapes),
-        "closedContours" : len(final_shapes),
-        "totalVertices"  : total_pts,
-        "blurKsize"      : blur_ksize,
-        "cannyLow"       : canny_low,
-        "cannyHigh"      : canny_high,
-        "epsilonFactor"  : epsilon_factor,
-        "minBlobArea"    : min_blob_area,
-        "speckleBlobsRemoved": removed_blobs,
-        "imgW"           : img_w,
-        "imgH"           : img_h,
-        "scaleMmPerDu"   : round(25.4 / dpi, 4),
-        "coordSystem"    : "origin=top-left px, Y-down (image convention), no offset/re-centering",
-        "circlesDetected": n_circ_final,
-        "rectsDetected"  : n_rect_final,
-        "shapeSummary"   : (
-            f"{n_rect_final} rectangle(s), {n_circ_final} circle(s)"
-            f" — speckle-free mask, hierarchy offset-pairs averaged to centreline,"
-            f" true measured positions"
+        "width"            : float(img_w),
+        "height"           : float(img_h),
+        "dpi"              : dpi,
+        "edgePixels"       : skel_px,
+        "edges"            : entity_count,
+        "contours"         : len(raw_contours),
+        "mergedContours"   : len(entities),
+        "closedContours"   : sum(1 for e in entities if e.get('closed')),
+        "totalVertices"    : total_pts,
+        "blurKsize"        : blur_ksize,
+        "cannyLow"         : canny_low,
+        "cannyHigh"        : canny_high,
+        "cannyMinArea"     : canny_min_area,
+        "circleRmsTol"     : circle_rms_tol,
+        "snapRadius"       : snap_radius,
+        "minBlobArea"      : min_blob_area,
+        "imgW"             : img_w,
+        "imgH"             : img_h,
+        "scaleMmPerDu"     : round(25.4 / dpi, 4),
+        "coordSystem"      : "DXF Y-flipped (Y-up), origin=bottom-left",
+        "circlesDetected"  : n_circ,
+        "polylinesDetected": n_poly,
+        "shapeSummary"     : (
+            f"{n_poly} polyline(s) + {n_circ} circle(s) — "
+            f"true 1-px skeleton, algebraic LS fit, 90° snap, intersection-trimmed"
         ),
     }
 
