@@ -114,7 +114,7 @@ def adaptive_threshold_binarize(blurred):
         blurred, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY_INV,
-        blockSize=15, C=4,
+        blockSize=5, C=1,
     )
 
 def morph_clean(binary):
