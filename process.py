@@ -110,12 +110,12 @@ def load_image(image_path):
     bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
     if bgr is None or bgr.size == 0:
         raise ValueError(f"cv2.imread returned None for: {image_path}")
-    dpi = 96.0
+    dpi = 1200.0
     if HAS_PIL:
         try:
             pil  = Image.open(str(image_path))
-            xdpi = pil.info.get("dpi", (96, 96))
-            dpi  = float(xdpi[0]) if xdpi and xdpi[0] > 1 else 96.0
+            xdpi = pil.info.get("dpi", (1200, 1200))
+            dpi  = float(xdpi[0]) if xdpi and xdpi[0] > 1 else 1200.0
         except Exception:
             pass
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
