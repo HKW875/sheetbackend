@@ -1080,6 +1080,7 @@ def main():
     # ── Analysis summary ──────────────────────────────────────────────────
     n_circ_final = sum(1 for s in final_shapes if s['type'] == 'circle')
     n_rect_final = sum(1 for s in final_shapes if s['type'] == 'rect')
+    n_poly_final = sum(1 for s in final_shapes if s['type'] == 'poly')
     analysis = {
         "width"          : float(img_w),
         "height"         : float(img_h),
