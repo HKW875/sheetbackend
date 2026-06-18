@@ -691,7 +691,7 @@ def build_clean_shapes(simplified_contours, parents, children, img_w, img_h,
 
     # Step 4b: rect relative-area filter (drop annotation text blocks,
     # measured against the largest surviving rect — typically the board)
-        if rects:
+    if rects:
         max_rect_area = max(r['w'] * r['h'] for r in rects)
         rects = [r for r in rects if (r['w'] * r['h']) >= rect_rel_area_min * max_rect_area]
     # For polys, filter against largest poly area
