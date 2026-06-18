@@ -732,8 +732,149 @@ def build_clean_shapes(simplified_contours, parents, children, img_w, img_h,
     rects_final   = rects
     polys_final   = polys
     final_shapes  = list(rects_final) + list(circles_final) + list(polys_final)
-    return final_shapes, circles_final, rects_final, polys_final                     
+    return final_shapes, circles_final, rects_final, polys_final     
+                         
+# ════════════════════════════════════════════════════════════════════════════
+# STEP 10.5 — RECTILINEAR GEOMETRIC PRIMITIVE FITTING
+# ════════════════════════════════════════════════════════════════════════════
 
+def fit_rectilinear_to_polygon(poly_shape, original_contour, 
+                                approx_eps_factor=0.003, 
+                                orientation_ratio=1.2):
+    """
+    Fits exact rectilinear (horizontal/vertical) line segments to a polygon.
+    
+    Algorithm:
+    1. Run approxPolyDP with small epsilon to get corner candidates
+    2. Identify true corners where segment orientation changes (H↔V)
+    3. Connect consecutive corners with exact horizontal or vertical lines
+    4. Return the rectilinear polygon replacing the original
+    
+    Args:
+        poly_shape: dict with 'points' (original polygon vertices)
+        original_contour: numpy array of original contour points (Nx2)
+        approx_eps_factor: epsilon as fraction of arc length (default 0.003 = 0.3%)
+        orientation_ratio: ratio threshold for H vs V classification (default 1.2)
+    
+    Returns:
+        Updated poly_shape dict with rectilinear 'points' and metadata
+    """
+    # Get original contour points
+    if isinstance(original_contour, list):
+        original_contour = np.array(original_contour, dtype=np.float32)
+    if original_contour.ndim == 3:
+        original_contour = original_contour.reshape(-1, 2)
+    
+    # Step 1: approxPolyDP to get corner candidates
+    arc_len = cv2.arcLength(original_contour.reshape(-1, 1, 2), True)
+    epsilon = approx_eps_factor * arc_len
+    approx = cv2.approxPolyDP(original_contour.reshape(-1, 1, 2), epsilon, True)
+    vertices = np.array([pt[0] for pt in approx], dtype=np.float32)
+    
+    # Step 2: Identify true corners (H↔V transitions)
+    def get_orientation(p1, p2):
+        dx = abs(p2[0] - p1[0])
+        dy = abs(p2[1] - p1[1])
+        if dx == 0 and dy == 0: return 'none'
+        if dx > dy * orientation_ratio: return 'horizontal'
+        if dy > dx * orientation_ratio: return 'vertical'
+        return 'diagonal'
+    
+    n = len(vertices)
+    corner_indices = []
+    for i in range(n):
+        prev = vertices[(i-1) % n]
+        curr = vertices[i]
+        next_p = vertices[(i+1) % n]
+        orient_in = get_orientation(prev, curr)
+        orient_out = get_orientation(curr, next_p)
+        if orient_in != orient_out and orient_in != 'none' and orient_out != 'none':
+            corner_indices.append(i)
+    
+    # Step 3: Build rectilinear polygon connecting corners
+    rectilinear_points = []
+    n_corners = len(corner_indices)
+    
+    for i in range(n_corners):
+        c1_idx = corner_indices[i]
+        c2_idx = corner_indices[(i+1) % n_corners]
+        p1 = vertices[c1_idx]
+        p2 = vertices[c2_idx]
+        
+        dx = abs(p2[0] - p1[0])
+        dy = abs(p2[1] - p1[1])
+        
+        if dx > dy:
+            # Horizontal segment: force same y as p1
+            rectilinear_points.append([float(p1[0]), float(p1[1])])
+            rectilinear_points.append([float(p2[0]), float(p1[1])])
+        else:
+            # Vertical segment: force same x as p1
+            rectilinear_points.append([float(p1[0]), float(p1[1])])
+            rectilinear_points.append([float(p1[0]), float(p2[1])])
+    
+    # Remove duplicates
+    rectilinear_points = np.array(rectilinear_points, dtype=np.float32)
+    mask = np.ones(len(rectilinear_points), dtype=bool)
+    for i in range(1, len(rectilinear_points)):
+        if np.allclose(rectilinear_points[i], rectilinear_points[i-1], atol=1.0):
+            mask[i] = False
+    rectilinear_points = rectilinear_points[mask]
+    
+    # Update the shape dict
+    poly_shape['points'] = rectilinear_points.tolist()
+    poly_shape['area'] = float(cv2.contourArea(
+        np.array(rectilinear_points, dtype=np.float32).reshape(-1, 1, 2)))
+    poly_shape['w'] = float(rectilinear_points[:,0].max() - rectilinear_points[:,0].min())
+    poly_shape['h'] = float(rectilinear_points[:,1].max() - rectilinear_points[:,1].min())
+    poly_shape['cx'] = float(rectilinear_points[:,0].mean())
+    poly_shape['cy'] = float(rectilinear_points[:,1].mean())
+    poly_shape['rectilinear'] = True
+    poly_shape['n_corners'] = n_corners
+    poly_shape['n_vertices'] = len(rectilinear_points)
+    
+    return poly_shape
+
+
+def apply_rectilinear_fitting(final_shapes, simplified_contours):
+    """
+    Apply rectilinear geometric primitive fitting to all polygon shapes.
+    Circles and rectangles are passed through unchanged.
+    """
+    fitted_shapes = []
+    
+    for shape in final_shapes:
+        if shape['type'] == 'poly':
+            # Find the corresponding original contour by matching center
+            best_contour = None
+            best_score = 0
+            
+            for cnt in simplified_contours:
+                cnt_pts = np.array([pt[0] for pt in cnt], dtype=np.float32)
+                if len(cnt_pts) < 3:
+                    continue
+                
+                cnt_cx = (cnt_pts[:,0].min() + cnt_pts[:,0].max()) / 2
+                cnt_cy = (cnt_pts[:,1].min() + cnt_pts[:,1].max()) / 2
+                shape_cx = shape.get('cx', 0)
+                shape_cy = shape.get('cy', 0)
+                
+                dist = math.hypot(cnt_cx - shape_cx, cnt_cy - shape_cy)
+                if dist < 50:  # Within 50px
+                    score = len(cnt_pts)
+                    if score > best_score:
+                        best_score = score
+                        best_contour = cnt_pts
+            
+            if best_contour is not None and len(best_contour) > 10:
+                fitted = fit_rectilinear_to_polygon(shape.copy(), best_contour)
+                fitted_shapes.append(fitted)
+            else:
+                fitted_shapes.append(shape)
+        else:
+            fitted_shapes.append(shape)
+    
+    return fitted_shapes
 
 # ════════════════════════════════════════════════════════════════════════════
 # STEP 11 — CLEAN DXF EXPORT (one entity per shape, true detected position)
@@ -1018,7 +1159,7 @@ def main():
         f"{len(simplified_contours)} contours  |  {total_pts} vertices", t0))
 
     # ── STEP 8-10: classify, pair, dedup, filter ───────────────────────────
-        # ── STEP 8-10: classify, pair, dedup, filter ───────────────────────────
+    # ── STEP 8-10: classify, pair, dedup, filter ───────────────────────────
     t0 = now_ms()
     final_shapes, circles_f, rects_f, polys_f = build_clean_shapes(
         simplified_contours, parents, children, img_w, img_h, min_shape_area,
@@ -1034,7 +1175,15 @@ def main():
         f"{len(simplified_contours)} raw contours → {n_rects} rect(s) + {n_circles} circle(s)  "
         f"(true measured positions, no re-centering, hard floor={HARD_MIN_SHAPE_AREA_PX:.0f}px²)",
         t0))
-
+  
+    # ── STEP 10.5: Rectilinear Geometric Primitive Fitting ───────────────
+    t0 = now_ms()
+    final_shapes = apply_rectilinear_fitting(final_shapes, simplified_contours)
+    n_rectilinear = sum(1 for s in final_shapes if s.get('rectilinear'))
+    steps.append(step_record(
+        "GEO-10.5: Rectilinear Primitive Fitting",
+        f"{n_rectilinear} polygon(s) converted to exact H/V segments", t0))
+  
     # ── Output dir ────────────────────────────────────────────────────────
     server_out_dir = Path(__file__).parent / "uploads" / "output"
     server_out_dir.mkdir(parents=True, exist_ok=True)
