@@ -681,7 +681,7 @@ def build_clean_shapes(simplified_contours, parents, children, img_w, img_h,
     polys   = [p for p in polys   if p['area']                   >= min_shape_area]
 
     # Step 4a: rect aspect-ratio filter (drop thin dimension-line shafts)
-        rects = [r for r in rects
+    rects = [r for r in rects
              if max(r['w'], r['h']) > 0
              and (min(r['w'], r['h']) / max(r['w'], r['h'])) >= rect_aspect_min]
     # For polys, use bounding box aspect as proxy
