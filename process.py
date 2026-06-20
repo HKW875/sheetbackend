@@ -746,189 +746,6 @@ def build_clean_shapes(simplified_contours, parents, children, img_w, img_h,
 # STEP 10.5 — RECTILINEAR GEOMETRIC PRIMITIVE FITTING
 # ════════════════════════════════════════════════════════════════════════════
 
-class _UnionFind:
-    """Plain union-find / disjoint-set, used to cluster nearby segment
-    endpoints into shared corner vertices and to group duplicate parallel
-    segments together."""
-    def __init__(self, n):
-        self.parent = list(range(n))
-
-    def find(self, x):
-        while self.parent[x] != x:
-            self.parent[x] = self.parent[self.parent[x]]
-            x = self.parent[x]
-        return x
-
-    def union(self, a, b):
-        ra, rb = self.find(a), self.find(b)
-        if ra != rb:
-            self.parent[ra] = rb
-
-
-def _segment_endpoints(seg):
-    """Returns ((x1, y1), (x2, y2)) for an H or V segment dict."""
-    if seg['type'] == 'H':
-        y = seg['coord']
-        return (seg['start'], y), (seg['end'], y)
-    else:
-        x = seg['coord']
-        return (x, seg['start']), (x, seg['end'])
-
-
-def _dedup_parallel_segments(segments, shape_cx, shape_cy,
-                              dup_proximity=18.0, dup_overlap_frac=0.35):
-    """
-    Finds groups of same-axis segments (H-with-H or V-with-V) that run
-    close together AND overlap along their length — these are duplicate
-    inner/outer stroke edges of the same wall (the classic double-edge
-    artifact). Within each duplicate group, keeps only the segment
-    FARTHEST from the shape's centroid (the true outer boundary) and
-    drops the rest (the inner duplicate edge(s)).
-
-    Segments that are simply parallel but far apart (legitimately
-    separate walls/features of the design) are left untouched, since
-    they won't satisfy both the proximity AND overlap conditions.
-    """
-    if not segments:
-        return segments
-
-    def _overlap_frac(a_s, a_e, b_s, b_e):
-        lo = max(a_s, b_s)
-        hi = min(a_e, b_e)
-        if hi <= lo:
-            return 0.0
-        overlap = hi - lo
-        shorter = min(a_e - a_s, b_e - b_s)
-        return overlap / shorter if shorter > 1e-6 else 0.0
-
-    keep = set(range(len(segments)))
-
-    for axis, ref_coord in (('H', shape_cy), ('V', shape_cx)):
-        idx_group = [i for i, s in enumerate(segments) if s['type'] == axis]
-        if len(idx_group) < 2:
-            continue
-
-        uf = _UnionFind(len(idx_group))
-        for a in range(len(idx_group)):
-            for b in range(a + 1, len(idx_group)):
-                ia, ib = idx_group[a], idx_group[b]
-                sa, sb = segments[ia], segments[ib]
-                if abs(sa['coord'] - sb['coord']) > dup_proximity:
-                    continue
-                if _overlap_frac(sa['start'], sa['end'], sb['start'], sb['end']) < dup_overlap_frac:
-                    continue
-                uf.union(a, b)
-
-        clusters = {}
-        for a, real_i in enumerate(idx_group):
-            clusters.setdefault(uf.find(a), []).append(real_i)
-
-        for members in clusters.values():
-            if len(members) <= 1:
-                continue
-            # Keep whichever segment's coord is farthest from the shape's
-            # centroid on this axis (the OUTER edge); drop the inner one(s).
-            outer = max(members, key=lambda i: abs(segments[i]['coord'] - ref_coord))
-            for i in members:
-                if i != outer:
-                    keep.discard(i)
-
-    return [s for i, s in enumerate(segments) if i in keep]
-
-
-def _connect_and_prune_segments(segments, snap_tol=10.0, max_iterations=25):
-    """
-    Snaps nearby segment endpoints together so that adjoining rectilinear
-    segments share an EXACT corner coordinate (making each pair of
-    neighbouring 2-point polylines geometrically CONNECTED in the DXF,
-    while still remaining separate, individually selectable/editable
-    entities), then iteratively prunes any segment that is NOT connected
-    to another segment on BOTH of its ends (dangling stubs / stray
-    fragments left over from noisy contour fitting).
-
-    Pruning is iterative: removing a dangling segment can drop its
-    neighbour's other end to degree 1 too, so the snap+prune pass repeats
-    until the segment set is stable (this naturally keeps closed loops /
-    junctions intact, since every vertex on a real loop already has
-    degree >= 2, and only trims tree-like dangling appendages).
-    """
-    work = [dict(s) for s in segments]
-
-    for _ in range(max_iterations):
-        n = len(work)
-        if n == 0:
-            return work
-
-        endpoints = []  # (seg_idx, which_end, x, y)
-        for i, seg in enumerate(work):
-            p1, p2 = _segment_endpoints(seg)
-            endpoints.append((i, 0, p1[0], p1[1]))
-            endpoints.append((i, 1, p2[0], p2[1]))
-
-        m = len(endpoints)
-        uf = _UnionFind(m)
-        for a in range(m):
-            for b in range(a + 1, m):
-                if endpoints[a][0] == endpoints[b][0]:
-                    continue  # never merge a segment's own two endpoints
-                dx = endpoints[a][2] - endpoints[b][2]
-                dy = endpoints[a][3] - endpoints[b][3]
-                if math.hypot(dx, dy) <= snap_tol:
-                    uf.union(a, b)
-
-        clusters = {}
-        for a in range(m):
-            clusters.setdefault(uf.find(a), []).append(a)
-
-        canonical = {}
-        seg_count = {}
-        for root, members in clusters.items():
-            xs = [endpoints[a][2] for a in members]
-            ys = [endpoints[a][3] for a in members]
-            canonical[root] = (sum(xs) / len(xs), sum(ys) / len(ys))
-            # degree = number of DISTINCT segments whose endpoint lands here
-            seg_count[root] = len(set(endpoints[a][0] for a in members))
-
-        end_root = [uf.find(a) for a in range(m)]
-
-        keep_idx = [i for i in range(n)
-                    if seg_count[end_root[2 * i]] >= 2 and seg_count[end_root[2 * i + 1]] >= 2]
-
-        if len(keep_idx) == n:
-            # Stable: every remaining segment is connected on both ends.
-            # Apply the snapped corner coordinates and return.
-            final = []
-            for i in keep_idx:
-                seg = work[i]
-                r0, r1 = end_root[2 * i], end_root[2 * i + 1]
-                p1, p2 = canonical[r0], canonical[r1]
-                # Store the EXACT snapped corner points. These are the
-                # source of truth for export: using them directly (rather
-                # than re-deriving a single shared coord by averaging a
-                # segment's own two ends) guarantees this segment's
-                # endpoint is IDENTICAL, bit-for-bit, to its neighbour's
-                # endpoint at the same corner -- true connectivity, even
-                # if tiny corner-detection noise means the segment isn't
-                # perfectly axis-aligned to the sub-pixel.
-                seg['p1'], seg['p2'] = p1, p2
-                # Keep legacy coord/start/end populated too (best-effort,
-                # for any other code path / preview that still reads them).
-                if seg['type'] == 'H':
-                    seg['coord'] = (p1[1] + p2[1]) / 2.0
-                    seg['start'], seg['end'] = (p1[0], p2[0]) if p1[0] <= p2[0] else (p2[0], p1[0])
-                else:
-                    seg['coord'] = (p1[0] + p2[0]) / 2.0
-                    seg['start'], seg['end'] = (p1[1], p2[1]) if p1[1] <= p2[1] else (p2[1], p1[1])
-                final.append(seg)
-            return final
-
-        # Some segments were dangling -- drop them and re-cluster, since
-        # removing them may have orphaned a neighbour's other endpoint.
-        work = [work[i] for i in keep_idx]
-
-    return work
-
-
 def fit_rectilinear_to_polygon(poly_shape, original_contour, 
                                 approx_eps_factor=0.003, 
                                 orientation_ratio=1.2):
@@ -1054,18 +871,6 @@ def apply_rectilinear_fitting(final_shapes, simplified_contours):
     FIXED v10.2: Apply rectilinear geometric primitive fitting to all polygon shapes.
     Returns shapes with 'segments' list containing separate H/V line segments.
     Circles and rectangles are passed through unchanged.
-
-    v10.3: After the raw H/V segments are extracted, two cleanup passes run
-    on each shape's segment set before it's handed to the DXF exporter:
-      1. _dedup_parallel_segments  — collapses duplicate close/overlapping
-         parallel edges (inner/outer double-edge artifacts), keeping only
-         the outer one.
-      2. _connect_and_prune_segments — snaps adjoining segment endpoints to
-         a shared corner coordinate (so neighbouring polylines are
-         geometrically CONNECTED) and removes any segment left dangling
-         (not connected to another segment on both ends).
-    Each segment is still exported as its own 2-point LWPOLYLINE, so every
-    line remains individually selectable/editable in the DXF.
     """
     fitted_shapes = []
     
@@ -1094,17 +899,7 @@ def apply_rectilinear_fitting(final_shapes, simplified_contours):
             
             if best_contour is not None and len(best_contour) > 10:
                 fitted, segments = fit_rectilinear_to_polygon(shape.copy(), best_contour)
-
-                # Clean up the raw H/V segments: drop redundant inner
-                # parallel duplicates, then snap+connect remaining
-                # segments and prune anything left unconnected.
-                shape_cx = fitted.get('cx', shape.get('cx', 0))
-                shape_cy = fitted.get('cy', shape.get('cy', 0))
-                segments = _dedup_parallel_segments(segments, shape_cx, shape_cy)
-                segments = _connect_and_prune_segments(segments)
-
-                fitted['segments']   = segments
-                fitted['n_segments'] = len(segments)
+                fitted['segments'] = segments
                 fitted_shapes.append(fitted)
             else:
                 fitted_shapes.append(shape)
@@ -1121,15 +916,6 @@ def build_clean_dxf(final_shapes, img_w, img_h, out_path):
     """
     FIXED v10.2: Exports each rectilinear segment as a separate 2-point LWPOLYLINE.
     Circles remain as CIRCLE entities. Each line segment is individually editable.
-
-    v10.3: poly shapes arrive here AFTER _dedup_parallel_segments and
-    _connect_and_prune_segments have already run (see
-    apply_rectilinear_fitting) — so every segment's endpoints already
-    coincide exactly with its neighbours' endpoints (CONNECTED corners),
-    duplicate inner parallel edges have already been dropped, and any
-    segment that wasn't connected to another segment on both ends has
-    already been removed. This function just exports what's left, one
-    2-point LWPOLYLINE per segment, unchanged.
     """
     if not HAS_DXF or not final_shapes:
         return None, 0, 0
@@ -1161,30 +947,24 @@ def build_clean_dxf(final_shapes, img_w, img_h, out_path):
 
         elif s['type'] == 'poly':
             # FIXED v10.2: Export each segment as a separate 2-point LWPOLYLINE
-            # v10.3: segments carry exact snapped 'p1'/'p2' corner points
-            # (see _connect_and_prune_segments) so neighbouring segments
-            # share an identical coordinate at every joint -- use those
-            # directly when present rather than reconstructing from
-            # coord/start/end, which can introduce a tiny sub-pixel gap.
             segments = s.get('segments', [])
             if segments:
                 for seg in segments:
-                    if 'p1' in seg and 'p2' in seg:
-                        pts = [seg['p1'], seg['p2']]
-                    elif seg['type'] == 'H':
+                    if seg['type'] == 'H':
                         # Horizontal line: (x1, y) -> (x2, y)
                         y = seg['coord']
                         x1 = seg['start']
                         x2 = seg['end']
                         pts = [(x1, y), (x2, y)]
+                        layer = "H_LINES"
                     else:
                         # Vertical line: (x, y1) -> (x, y2)
                         x = seg['coord']
                         y1 = seg['start']
                         y2 = seg['end']
                         pts = [(x, y1), (x, y2)]
-                    layer = "H_LINES" if seg['type'] == 'H' else "V_LINES"
-
+                        layer = "V_LINES"
+                    
                     line = msp.add_lwpolyline(
                         pts, format="xy",
                         dxfattribs={"layer": layer, "color": 256}
@@ -1458,12 +1238,10 @@ def main():
     # ── STEP 10.5: Rectilinear Geometric Primitive Fitting ───────────────
     t0 = now_ms()
     final_shapes = apply_rectilinear_fitting(final_shapes, simplified_contours)
-    n_rectilinear  = sum(1 for s in final_shapes if s.get('rectilinear'))
-    n_segments_tot = sum(len(s.get('segments', [])) for s in final_shapes if s.get('rectilinear'))
+    n_rectilinear = sum(1 for s in final_shapes if s.get('rectilinear'))
     steps.append(step_record(
         "GEO-10.5: Rectilinear Primitive Fitting",
-        f"{n_rectilinear} polygon(s) -> {n_segments_tot} connected H/V segment(s) "
-        f"(duplicate parallel edges removed, unconnected stubs pruned)", t0))
+        f"{n_rectilinear} polygon(s) converted to exact H/V segments", t0))
   
     # ── Output dir ────────────────────────────────────────────────────────
     server_out_dir = Path(__file__).parent / "uploads" / "output"
