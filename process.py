@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SheetForge — CV Pipeline  v10  (Hierarchy-Aware Shape Fitting)
+SheetForge — CV Pipeline  v10.1  (FIXED Rectilinear Fitting)
 ================================================================
 Receives: image_path, options_json (from node child_process)
 Outputs:  JSON on stdout  { steps, analysis, dwg, dxfContent, pdfAvailable }
@@ -394,12 +394,20 @@ def _average_shapes(a, b):
                 'area': math.pi * r * r}
     
     elif a['type'] == 'poly':
-        # Average the point sets by using the outer one (larger area)
-        # or interpolate between corresponding points
-        # For simplicity, use the one with more points (more detailed)
-        if len(a['points']) >= len(b['points']):
-            return a
-        return b
+        # FIX v10.1: Actually merge both polygons by combining point sets
+        # rather than arbitrarily picking the larger one
+        all_pts = np.array(a['points'] + b['points'], dtype=np.float32)
+        cx = (all_pts[:,0].min() + all_pts[:,0].max()) / 2.0
+        cy = (all_pts[:,1].min() + all_pts[:,1].max()) / 2.0
+        w = all_pts[:,0].max() - all_pts[:,0].min()
+        h = all_pts[:,1].max() - all_pts[:,1].min()
+        return {
+            'type': 'poly',
+            'points': all_pts.tolist(),
+            'area': cv2.contourArea(np.array(all_pts, dtype=np.float32).reshape(-1, 1, 2)),
+            'w': float(w), 'h': float(h),
+            'cx': float(cx), 'cy': float(cy),
+        }
     
     else:  # rect
         cx = (a['cx'] + b['cx']) / 2.0
@@ -792,7 +800,7 @@ def fit_rectilinear_to_polygon(poly_shape, original_contour,
         if tol is None:
             # auto: 2% of range or 20px minimum (needs to exceed stroke width ~10-35px)
             span = max(coords_sorted) - min(coords_sorted) if len(coords_sorted) > 1 else 1
-            tol = max(40.0, 0.025 * span)  # must exceed stroke width (~35px typical)
+            tol = max(8.0, 0.008 * span)  # FIXED v10.1: tighter tolerance preserves distinct edges
         clusters = []
         grp = [coords_sorted[0]]
         for c in coords_sorted[1:]:
@@ -889,7 +897,8 @@ def fit_rectilinear_to_polygon(poly_shape, original_contour,
         return filtered if len(filtered) >= 4 else pts
 
     clean = remove_tiny(clean, 5.0)
-    clean = remove_border_pts(clean, 10.0)
+    # FIX v10.1: REMOVED remove_border_pts() — it incorrectly clipped valid
+    # corners using absolute image coordinates instead of shape-relative coords
     clean = remove_collinear(clean)
 
     # Final deduplication: if the polygon revisits the same grid lines,
@@ -1145,7 +1154,7 @@ def export_pdf(edges, out_path, orig_bgr=None):
         c.setFillColorRGB(0.3, 0.35, 0.4)
         c.setFont("Helvetica", 8)
         c.drawCentredString(page_w / 2, 12,
-                            "SheetForge v10  •  Hierarchy-Aware Offset-Pair Averaging  •  Clean DXF")
+                            "SheetForge v10.1  •  Fixed Rectilinear Fitting  •  Clean DXF")
         c.save()
 
         for f in tmp_files:
