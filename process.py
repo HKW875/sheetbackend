@@ -750,173 +750,172 @@ def fit_rectilinear_to_polygon(poly_shape, original_contour,
                                 approx_eps_factor=0.003, 
                                 orientation_ratio=1.2):
     """
-    FIXED v10.3: Returns a SINGLE connected rectilinear polygon.
-    No snapping to artificial grid. No multiple parallel segments.
-    All edges are pure horizontal or vertical and connect at corners.
-
-    Algorithm:
-    1. Extract corners from contour using approxPolyDP
-    2. Classify each edge as H or V based on dominant direction
-    3. Iteratively adjust coordinates so H edges share y, V edges share x
-    4. Remove collinear points to minimize vertices
-    5. Return single polygon as list of (x,y) vertices
+    FIXED v10.2: Extracts separate horizontal and vertical line segments.
+    NO snapping to artificial grid. Each segment is a separate 2-point line.
+    Diagonal segments are forced to their dominant axis (H or V).
+    Collinear fragments are merged into continuous line segments.
+    
+    Returns: (updated_poly_shape, list_of_segments)
+    Each segment: {'type': 'H', 'coord': y, 'start': x1, 'end': x2}
+               or {'type': 'V', 'coord': x, 'start': y1, 'end': y2}
     """
     if isinstance(original_contour, list):
         original_contour = np.array(original_contour, dtype=np.float32)
     if original_contour.ndim == 3:
         original_contour = original_contour.reshape(-1, 2)
-
+    
     # Step 1: Get corners using approxPolyDP with tight epsilon
     arc_len = cv2.arcLength(original_contour.reshape(-1, 1, 2), True)
     epsilon = max(0.0005 * arc_len, 0.5)
     approx = cv2.approxPolyDP(original_contour.reshape(-1, 1, 2), epsilon, True)
     vertices = np.array([pt[0] for pt in approx], dtype=np.float32)
-
+    
     if len(vertices) < 4:
         poly_shape['rectilinear'] = False
-        return poly_shape
-
-    # Step 2: Classify each edge as H or V
+        return poly_shape, []
+    
+    # Step 2: Extract orthogonal edge segments from corner-to-corner edges
+    raw_segments = []
     n = len(vertices)
-    edge_types = []
     for i in range(n):
         p1 = vertices[i]
         p2 = vertices[(i + 1) % n]
         dx = abs(p2[0] - p1[0])
         dy = abs(p2[1] - p1[1])
-        if dx > dy:
-            edge_types.append('H')
-        else:
-            edge_types.append('V')
-
-    # Step 3: Iteratively rectilinearize - force shared coordinates
-    pts = vertices.copy()
-    for iteration in range(10):
-        new_pts = pts.copy()
-        changed = False
-
-        for i in range(n):
-            p1 = pts[i]
-            p2 = pts[(i + 1) % n]
-
-            if edge_types[i] == 'H':
-                # Force same y for both endpoints
-                avg_y = (p1[1] + p2[1]) / 2.0
-                if abs(new_pts[i, 1] - avg_y) > 0.5 or abs(new_pts[(i+1)%n, 1] - avg_y) > 0.5:
-                    changed = True
-                new_pts[i, 1] = avg_y
-                new_pts[(i+1)%n, 1] = avg_y
+        length = math.hypot(dx, dy)
+        
+        if length < 15:  # Skip very short noise segments
+            continue
+        
+        if dx > dy * 1.3:  # Clearly horizontal
+            y_avg = (p1[1] + p2[1]) / 2.0
+            x1 = min(p1[0], p2[0])
+            x2 = max(p1[0], p2[0])
+            raw_segments.append({'type': 'H', 'coord': float(y_avg), 'start': float(x1), 'end': float(x2)})
+        elif dy > dx * 1.3:  # Clearly vertical
+            x_avg = (p1[0] + p2[0]) / 2.0
+            y1 = min(p1[1], p2[1])
+            y2 = max(p1[1], p2[1])
+            raw_segments.append({'type': 'V', 'coord': float(x_avg), 'start': float(y1), 'end': float(y2)})
+        elif max(dx, dy) > 80:  # Long diagonal - force to dominant axis
+            if dx > dy:
+                y_avg = (p1[1] + p2[1]) / 2.0
+                x1 = min(p1[0], p2[0])
+                x2 = max(p1[0], p2[0])
+                raw_segments.append({'type': 'H', 'coord': float(y_avg), 'start': float(x1), 'end': float(x2)})
             else:
-                # Force same x for both endpoints
-                avg_x = (p1[0] + p2[0]) / 2.0
-                if abs(new_pts[i, 0] - avg_x) > 0.5 or abs(new_pts[(i+1)%n, 0] - avg_x) > 0.5:
-                    changed = True
-                new_pts[i, 0] = avg_x
-                new_pts[(i+1)%n, 0] = avg_x
-
-        pts = new_pts
-        if not changed:
-            break
-
-    # Step 4: Remove collinear points (points where both neighbors are on same axis)
-    def remove_collinear(pts_arr):
-        if len(pts_arr) < 4:
-            return pts_arr
-        result = []
-        m = len(pts_arr)
-        for i in range(m):
-            prev = pts_arr[(i-1) % m]
-            curr = pts_arr[i]
-            nxt = pts_arr[(i+1) % m]
-            # Check if curr is collinear with prev and nxt
-            # Collinear if same x (vertical line) or same y (horizontal line)
-            same_x = abs(curr[0] - prev[0]) < 1.0 and abs(curr[0] - nxt[0]) < 1.0
-            same_y = abs(curr[1] - prev[1]) < 1.0 and abs(curr[1] - nxt[1]) < 1.0
-            if not (same_x or same_y):
-                result.append(curr)
-        return np.array(result, dtype=np.float32) if result else pts_arr
-
-    # Step 5: Remove duplicate consecutive points
-    clean = []
-    for i in range(len(pts)):
-        if not clean or np.hypot(pts[i,0] - clean[-1][0], pts[i,1] - clean[-1][1]) > 2.0:
-            clean.append(pts[i])
-
-    # Remove last if same as first
-    if len(clean) > 1 and np.hypot(clean[0][0] - clean[-1][0], clean[0][1] - clean[-1][1]) < 2.0:
-        clean = clean[:-1]
-
-    clean_arr = np.array(clean, dtype=np.float32)
-    clean_arr = remove_collinear(clean_arr)
-
-    # Final dedup after collinear removal
-    final_clean = []
-    for i in range(len(clean_arr)):
-        if not final_clean or np.hypot(clean_arr[i,0] - final_clean[-1][0], clean_arr[i,1] - final_clean[-1][1]) > 2.0:
-            final_clean.append(clean_arr[i])
-    if len(final_clean) > 1 and np.hypot(final_clean[0][0] - final_clean[-1][0], final_clean[0][1] - final_clean[-1][1]) < 2.0:
-        final_clean = final_clean[:-1]
-
-    final_arr = np.array(final_clean, dtype=np.float32)
-
-    # Update poly_shape
-    poly_shape['points'] = final_arr.tolist()
-    poly_shape['area'] = float(cv2.contourArea(np.array(final_arr, dtype=np.float32).reshape(-1, 1, 2)))
-    poly_shape['w'] = float(final_arr[:,0].max() - final_arr[:,0].min())
-    poly_shape['h'] = float(final_arr[:,1].max() - final_arr[:,1].min())
-    poly_shape['cx'] = float((final_arr[:,0].max() + final_arr[:,0].min()) / 2)
-    poly_shape['cy'] = float((final_arr[:,1].max() + final_arr[:,1].min()) / 2)
+                x_avg = (p1[0] + p2[0]) / 2.0
+                y1 = min(p1[1], p2[1])
+                y2 = max(p1[1], p2[1])
+                raw_segments.append({'type': 'V', 'coord': float(x_avg), 'start': float(y1), 'end': float(y2)})
+    
+    # Step 3: Merge collinear segments that share the same axis
+    def merge_segments(segments):
+        from collections import defaultdict
+        h_segs = [s for s in segments if s['type'] == 'H']
+        v_segs = [s for s in segments if s['type'] == 'V']
+        merged = []
+        
+        # Merge H: group by coord (within 8px), merge start/end ranges
+        h_groups = defaultdict(list)
+        for seg in h_segs:
+            key = round(seg['coord'] / 8) * 8
+            h_groups[key].append(seg)
+        
+        for key, group in h_groups.items():
+            avg_y = sum(s['coord'] for s in group) / len(group)
+            ranges = [(s['start'], s['end']) for s in group]
+            ranges = sorted(ranges, key=lambda r: r[0])
+            cur_s, cur_e = ranges[0]
+            for s, e in ranges[1:]:
+                if s <= cur_e + 20:  # Merge if close
+                    cur_e = max(cur_e, e)
+                else:
+                    merged.append({'type': 'H', 'coord': float(avg_y), 'start': float(cur_s), 'end': float(cur_e)})
+                    cur_s, cur_e = s, e
+            merged.append({'type': 'H', 'coord': float(avg_y), 'start': float(cur_s), 'end': float(cur_e)})
+        
+        # Merge V: group by coord (within 8px), merge start/end ranges
+        v_groups = defaultdict(list)
+        for seg in v_segs:
+            key = round(seg['coord'] / 8) * 8
+            v_groups[key].append(seg)
+        
+        for key, group in v_groups.items():
+            avg_x = sum(s['coord'] for s in group) / len(group)
+            ranges = [(s['start'], s['end']) for s in group]
+            ranges = sorted(ranges, key=lambda r: r[0])
+            cur_s, cur_e = ranges[0]
+            for s, e in ranges[1:]:
+                if s <= cur_e + 20:
+                    cur_e = max(cur_e, e)
+                else:
+                    merged.append({'type': 'V', 'coord': float(avg_x), 'start': float(cur_s), 'end': float(cur_e)})
+                    cur_s, cur_e = s, e
+            merged.append({'type': 'V', 'coord': float(avg_x), 'start': float(cur_s), 'end': float(cur_e)})
+        
+        return merged
+    
+    final_segments = merge_segments(raw_segments)
+    
+    # Update poly_shape with segment info
     poly_shape['rectilinear'] = True
-    poly_shape['n_vertices'] = len(final_arr)
-
-    return poly_shape
+    poly_shape['segments'] = final_segments
+    poly_shape['n_segments'] = len(final_segments)
+    
+    return poly_shape, final_segments
 
 
 def apply_rectilinear_fitting(final_shapes, simplified_contours):
     """
-    FIXED v10.3: Apply rectilinear fitting to return a single connected polygon.
+    FIXED v10.2: Apply rectilinear geometric primitive fitting to all polygon shapes.
+    Returns shapes with 'segments' list containing separate H/V line segments.
     Circles and rectangles are passed through unchanged.
     """
     fitted_shapes = []
-
+    
     for shape in final_shapes:
         if shape['type'] == 'poly':
             # Find the corresponding original contour by matching center
             best_contour = None
             best_score = 0
-
+            
             for cnt in simplified_contours:
                 cnt_pts = np.array([pt[0] for pt in cnt], dtype=np.float32)
                 if len(cnt_pts) < 3:
                     continue
-
+                
                 cnt_cx = (cnt_pts[:,0].min() + cnt_pts[:,0].max()) / 2
                 cnt_cy = (cnt_pts[:,1].min() + cnt_pts[:,1].max()) / 2
                 shape_cx = shape.get('cx', 0)
                 shape_cy = shape.get('cy', 0)
-
+                
                 dist = math.hypot(cnt_cx - shape_cx, cnt_cy - shape_cy)
-                if dist < 50:
+                if dist < 50:  # Within 50px
                     score = len(cnt_pts)
                     if score > best_score:
                         best_score = score
                         best_contour = cnt_pts
-
+            
             if best_contour is not None and len(best_contour) > 10:
-                fitted = fit_rectilinear_to_polygon(shape.copy(), best_contour)
+                fitted, segments = fit_rectilinear_to_polygon(shape.copy(), best_contour)
+                fitted['segments'] = segments
                 fitted_shapes.append(fitted)
             else:
                 fitted_shapes.append(shape)
         else:
             fitted_shapes.append(shape)
-
+    
     return fitted_shapes
 
+# ════════════════════════════════════════════════════════════════════════════
+# STEP 11 — CLEAN DXF EXPORT (one entity per shape, true detected position)
+# ════════════════════════════════════════════════════════════════════════════
 
 def build_clean_dxf(final_shapes, img_w, img_h, out_path):
     """
-    FIXED v10.3: Exports each shape as a single closed LWPOLYLINE.
-    Polygons are one connected entity with all H/V edges meeting at corners.
+    FIXED v10.2: Exports each rectilinear segment as a separate 2-point LWPOLYLINE.
+    Circles remain as CIRCLE entities. Each line segment is individually editable.
     """
     if not HAS_DXF or not final_shapes:
         return None, 0, 0
@@ -932,6 +931,8 @@ def build_clean_dxf(final_shapes, img_w, img_h, out_path):
     doc.layers.new("SHAPES",  dxfattribs={"color": 7,  "linetype": "CONTINUOUS"})
     doc.layers.new("CIRCLES", dxfattribs={"color": 1,  "linetype": "CONTINUOUS"})
     doc.layers.new("RECTS",   dxfattribs={"color": 3,  "linetype": "CONTINUOUS"})
+    doc.layers.new("H_LINES", dxfattribs={"color": 5,  "linetype": "CONTINUOUS"})
+    doc.layers.new("V_LINES", dxfattribs={"color": 6,  "linetype": "CONTINUOUS"})
 
     entity_count = 0
 
@@ -945,14 +946,40 @@ def build_clean_dxf(final_shapes, img_w, img_h, out_path):
             entity_count += 1
 
         elif s['type'] == 'poly':
-            # Export as single closed LWPOLYLINE with all vertices
-            pts = [(p[0], p[1]) for p in s['points']]
-            poly = msp.add_lwpolyline(
-                pts, format="xy",
-                dxfattribs={"layer": "SHAPES", "color": 256}
-            )
-            poly.close(True)
-            entity_count += 1
+            # FIXED v10.2: Export each segment as a separate 2-point LWPOLYLINE
+            segments = s.get('segments', [])
+            if segments:
+                for seg in segments:
+                    if seg['type'] == 'H':
+                        # Horizontal line: (x1, y) -> (x2, y)
+                        y = seg['coord']
+                        x1 = seg['start']
+                        x2 = seg['end']
+                        pts = [(x1, y), (x2, y)]
+                        layer = "H_LINES"
+                    else:
+                        # Vertical line: (x, y1) -> (x, y2)
+                        x = seg['coord']
+                        y1 = seg['start']
+                        y2 = seg['end']
+                        pts = [(x, y1), (x, y2)]
+                        layer = "V_LINES"
+                    
+                    line = msp.add_lwpolyline(
+                        pts, format="xy",
+                        dxfattribs={"layer": layer, "color": 256}
+                    )
+                    # Don't close - these are open line segments
+                    entity_count += 1
+            else:
+                # Fallback: export as single polygon if no segments
+                pts = [(p[0], p[1]) for p in s['points']]
+                poly = msp.add_lwpolyline(
+                    pts, format="xy",
+                    dxfattribs={"layer": "SHAPES", "color": 256}
+                )
+                poly.close(True)
+                entity_count += 1
 
         elif s['type'] == 'rect':
             x0, y0 = s['cx'] - s['w'] / 2.0, s['cy'] - s['h'] / 2.0
@@ -969,6 +996,10 @@ def build_clean_dxf(final_shapes, img_w, img_h, out_path):
     file_size = out_path.stat().st_size
     return doc, entity_count, file_size
 
+
+# ════════════════════════════════════════════════════════════════════════════
+# STEP 12 — PNG PREVIEW (side-by-side comparison)
+# ════════════════════════════════════════════════════════════════════════════
 
 def build_comparison_png(edges, final_shapes, img_w, img_h, out_path):
     if not HAS_CV or not np:
@@ -991,10 +1022,43 @@ def build_comparison_png(edges, final_shapes, img_w, img_h, out_path):
                 cv2.circle(right, (cx_px, cy_px), r_px, (80, 80, 220), 2, cv2.LINE_AA)
 
             elif s['type'] == 'poly':
-                # Draw polygon as single closed shape
+                # Draw polygon using all vertices
                 pts = np.array([[int(p[0]), int(p[1])] for p in s['points']], dtype=np.int32)
                 cv2.polylines(right, [pts], True, (80, 200, 80), 2, cv2.LINE_AA)
+              
+            elif s['type'] == 'poly':
+                # Draw each segment individually
+                segments = s.get('segments', [])
+                if segments:
+                    for seg in segments:
+                        if seg['type'] == 'H':
+                            y = int(round(seg['coord']))
+                            x1 = int(round(seg['start']))
+                            x2 = int(round(seg['end']))
+                            cv2.line(right, (x1, y), (x2, y), (80, 200, 80), 2, cv2.LINE_AA)
+                        else:
+                            x = int(round(seg['coord']))
+                            y1 = int(round(seg['start']))
+                            y2 = int(round(seg['end']))
+                            cv2.line(right, (x, y1), (x, y2), (80, 200, 80), 2, cv2.LINE_AA)
+                else:
+                    # Fallback
+                    pts = np.array([[int(p[0]), int(p[1])] for p in s['points']], dtype=np.int32)
+                    cv2.polylines(right, [pts], True, (80, 200, 80), 2, cv2.LINE_AA)
 
+        sep   = np.full((img_h, 4, 3), 40, dtype=np.uint8)
+        panel = np.concatenate([left, sep, right], axis=1)
+
+        ok = cv2.imwrite(str(out_path), panel)
+        return bool(ok and out_path.exists())
+    except Exception as e:
+        sys.stderr.write(f"PNG preview error: {e}\n")
+        return False
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# STEP 13 — PDF EXPORT
+# ════════════════════════════════════════════════════════════════════════════
 
 def export_pdf(edges, out_path, orig_bgr=None):
     if not HAS_RL:
