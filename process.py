@@ -744,82 +744,172 @@ def fit_rectilinear_to_polygon(poly_shape, original_contour,
     """
     Fits exact rectilinear (horizontal/vertical) line segments to a polygon.
     
-    Algorithm:
-    1. Run approxPolyDP with small epsilon to get corner candidates
-    2. Identify true corners where segment orientation changes (H↔V)
-    3. Connect consecutive corners with exact horizontal or vertical lines
-    4. Return the rectilinear polygon replacing the original
-    
-    Args:
-        poly_shape: dict with 'points' (original polygon vertices)
-        original_contour: numpy array of original contour points (Nx2)
-        approx_eps_factor: epsilon as fraction of arc length (default 0.003 = 0.3%)
-        orientation_ratio: ratio threshold for H vs V classification (default 1.2)
-    
-    Returns:
-        Updated poly_shape dict with rectilinear 'points' and metadata
+    Algorithm v15:
+    1. Run approxPolyDP with small epsilon to get many corner candidates
+    2. Cluster X coords (vertical edges) and Y coords (horizontal edges) to a grid
+    3. Snap every vertex to the nearest grid line
+    4. Walk the snapped vertices and deduplicate collinear points
+    5. Return the clean orthogonal polygon
     """
-    # Get original contour points
     if isinstance(original_contour, list):
         original_contour = np.array(original_contour, dtype=np.float32)
     if original_contour.ndim == 3:
         original_contour = original_contour.reshape(-1, 2)
     
-    # Step 1: approxPolyDP to get corner candidates
+    # Step 1: Dense approxPolyDP for corner candidates
     arc_len = cv2.arcLength(original_contour.reshape(-1, 1, 2), True)
-    epsilon = approx_eps_factor * arc_len
+    # Use a very tight epsilon to preserve all corner details
+    epsilon = max(0.001 * arc_len, 1.0)
     approx = cv2.approxPolyDP(original_contour.reshape(-1, 1, 2), epsilon, True)
     vertices = np.array([pt[0] for pt in approx], dtype=np.float32)
     
-    # Step 2: Identify true corners (H↔V transitions)
-    def get_orientation(p1, p2):
-        dx = abs(p2[0] - p1[0])
-        dy = abs(p2[1] - p1[1])
-        if dx == 0 and dy == 0: return 'none'
-        if dx > dy * orientation_ratio: return 'horizontal'
-        if dy > dx * orientation_ratio: return 'vertical'
-        return 'diagonal'
+    if len(vertices) < 4:
+        # fallback: use original points
+        poly_shape['rectilinear'] = False
+        return poly_shape
     
+    # Step 2: For each segment decide if it's horizontal or vertical
+    # and record the "dominant" coordinate of that segment
+    h_coords = []  # y-values of horizontal segments
+    v_coords = []  # x-values of vertical segments
     n = len(vertices)
-    corner_indices = []
+    
     for i in range(n):
-        prev = vertices[(i-1) % n]
-        curr = vertices[i]
-        next_p = vertices[(i+1) % n]
-        orient_in = get_orientation(prev, curr)
-        orient_out = get_orientation(curr, next_p)
-        if orient_in != orient_out and orient_in != 'none' and orient_out != 'none':
-            corner_indices.append(i)
-    
-    # Step 3: Build rectilinear polygon connecting corners
-    rectilinear_points = []
-    n_corners = len(corner_indices)
-    
-    for i in range(n_corners):
-        c1_idx = corner_indices[i]
-        c2_idx = corner_indices[(i+1) % n_corners]
-        p1 = vertices[c1_idx]
-        p2 = vertices[c2_idx]
-        
+        p1 = vertices[i]
+        p2 = vertices[(i + 1) % n]
         dx = abs(p2[0] - p1[0])
         dy = abs(p2[1] - p1[1])
-        
-        if dx > dy:
-            # Horizontal segment: force same y as p1
-            rectilinear_points.append([float(p1[0]), float(p1[1])])
-            rectilinear_points.append([float(p2[0]), float(p1[1])])
-        else:
-            # Vertical segment: force same x as p1
-            rectilinear_points.append([float(p1[0]), float(p1[1])])
-            rectilinear_points.append([float(p1[0]), float(p2[1])])
+        if dx > dy:  # horizontal: record average y
+            h_coords.append(float((p1[1] + p2[1]) / 2))
+        else:  # vertical: record average x
+            v_coords.append(float((p1[0] + p2[0]) / 2))
     
-    # Remove duplicates
-    rectilinear_points = np.array(rectilinear_points, dtype=np.float32)
-    mask = np.ones(len(rectilinear_points), dtype=bool)
-    for i in range(1, len(rectilinear_points)):
-        if np.allclose(rectilinear_points[i], rectilinear_points[i-1], atol=1.0):
-            mask[i] = False
-    rectilinear_points = rectilinear_points[mask]
+    # Step 3: Cluster coordinates to find the grid lines
+    def cluster_coords(coords, tol=None):
+        if not coords:
+            return []
+        coords_sorted = sorted(set(coords))
+        if tol is None:
+            # auto: 2% of range or 20px minimum (needs to exceed stroke width ~10-35px)
+            span = max(coords_sorted) - min(coords_sorted) if len(coords_sorted) > 1 else 1
+            tol = max(40.0, 0.025 * span)  # must exceed stroke width (~35px typical)
+        clusters = []
+        grp = [coords_sorted[0]]
+        for c in coords_sorted[1:]:
+            if c - grp[-1] <= tol:
+                grp.append(c)
+            else:
+                clusters.append(float(np.median(grp)))
+                grp = [c]
+        clusters.append(float(np.median(grp)))
+        return clusters
+    
+    h_grid_raw = cluster_coords(h_coords)  # canonical Y values
+    v_grid_raw = cluster_coords(v_coords)  # canonical X values
+    # Filter out near-zero grid lines (image border artifacts)
+    margin_px = 8.0
+    h_grid = [g for g in h_grid_raw if g > margin_px]
+    v_grid = [g for g in v_grid_raw if g > margin_px]
+    # If filtering left us with too few grid lines, restore
+    if len(h_grid) < 2: h_grid = h_grid_raw
+    if len(v_grid) < 2: v_grid = v_grid_raw
+    
+    if not h_grid or not v_grid:
+        poly_shape['rectilinear'] = False
+        return poly_shape
+    
+    # Step 4: Snap each vertex to nearest grid line
+    def snap(val, grid):
+        return min(grid, key=lambda g: abs(g - val))
+    
+    snapped = []
+    for v in vertices:
+        sx = snap(float(v[0]), v_grid)
+        sy = snap(float(v[1]), h_grid)
+        snapped.append([sx, sy])
+    
+    # Step 5: Remove consecutive duplicates and collinear points
+    def remove_dups(pts):
+        result = []
+        for p in pts:
+            if not result or (abs(p[0]-result[-1][0]) > 0.5 or abs(p[1]-result[-1][1]) > 0.5):
+                result.append(p)
+        # Also close: remove last if same as first
+        if len(result) > 1 and result[0] == result[-1]:
+            result = result[:-1]
+        return result
+    
+    def remove_collinear(pts):
+        """Remove points that are collinear with their neighbors (on same H or V line)."""
+        if len(pts) < 3:
+            return pts
+        result = []
+        n = len(pts)
+        for i in range(n):
+            prev = pts[(i-1) % n]
+            curr = pts[i]
+            nxt  = pts[(i+1) % n]
+            # Collinear if same x (vertical) or same y (horizontal) as both neighbors
+            same_x = abs(curr[0] - prev[0]) < 1 and abs(curr[0] - nxt[0]) < 1
+            same_y = abs(curr[1] - prev[1]) < 1 and abs(curr[1] - nxt[1]) < 1
+            if not (same_x or same_y):
+                result.append(curr)
+        return result if result else pts
+    
+    clean = remove_dups(snapped)
+    clean = remove_collinear(clean)
+    clean = remove_dups(clean)  # second pass
+
+    # Remove vertices that create very short segments (< 5px) — border artifacts
+    def remove_tiny(pts, min_len=5.0):
+        if len(pts) < 3:
+            return pts
+        result = [pts[0]]
+        for p in pts[1:]:
+            prev = result[-1]
+            if abs(p[0]-prev[0]) > min_len or abs(p[1]-prev[1]) > min_len:
+                result.append(p)
+        return result
+
+    # Remove vertices near image corners / borders (border-tracing artifacts)
+    def remove_border_pts(pts, margin=10.0):
+        if len(pts) < 4:
+            return pts
+        # Find overall bounding box
+        xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+        bb_minX, bb_maxX = min(xs), max(xs)
+        bb_minY, bb_maxY = min(ys), max(ys)
+        # A point is a border artifact if it's within margin of the FULL image bounds
+        # but not within margin of the shape's own bbox extremes
+        # Simple heuristic: discard points that are <margin from (0,0)
+        def is_border(p):
+            # Point is a border artifact if it's in the extreme corner region
+            return (p[0] < margin or p[1] < margin) and (p[0] < margin * 5 and p[1] < margin * 5)
+        filtered = [p for p in pts if not is_border(p)]
+        return filtered if len(filtered) >= 4 else pts
+
+    clean = remove_tiny(clean, 5.0)
+    clean = remove_border_pts(clean, 10.0)
+    clean = remove_collinear(clean)
+
+    # Final deduplication: if the polygon revisits the same grid lines,
+    # keep only unique (x,y) grid intersections
+    seen = set()
+    deduped = []
+    for p in clean:
+        key = (round(p[0]), round(p[1]))
+        if key not in seen:
+            seen.add(key)
+            deduped.append(p)
+    if len(deduped) >= 4:
+        clean = deduped
+        clean = remove_collinear(clean)
+    
+    if len(clean) < 4:
+        poly_shape['rectilinear'] = False
+        return poly_shape
+    
+    rectilinear_points = np.array(clean, dtype=np.float32)
     
     # Update the shape dict
     poly_shape['points'] = rectilinear_points.tolist()
@@ -827,10 +917,10 @@ def fit_rectilinear_to_polygon(poly_shape, original_contour,
         np.array(rectilinear_points, dtype=np.float32).reshape(-1, 1, 2)))
     poly_shape['w'] = float(rectilinear_points[:,0].max() - rectilinear_points[:,0].min())
     poly_shape['h'] = float(rectilinear_points[:,1].max() - rectilinear_points[:,1].min())
-    poly_shape['cx'] = float(rectilinear_points[:,0].mean())
-    poly_shape['cy'] = float(rectilinear_points[:,1].mean())
+    poly_shape['cx'] = float((rectilinear_points[:,0].max() + rectilinear_points[:,0].min()) / 2)
+    poly_shape['cy'] = float((rectilinear_points[:,1].max() + rectilinear_points[:,1].min()) / 2)
     poly_shape['rectilinear'] = True
-    poly_shape['n_corners'] = n_corners
+    poly_shape['n_corners'] = len(clean)
     poly_shape['n_vertices'] = len(rectilinear_points)
     
     return poly_shape
@@ -1105,9 +1195,9 @@ def main():
     min_shape_area = opts.get("minShapeArea", None)       # px-area: absolute noise filter
     if min_shape_area is not None:
         min_shape_area = float(min_shape_area)
-    rect_aspect_min       = float(opts.get("rectAspectMin", 0.15))     # drop thin dimension lines
-    rect_rel_area_min     = float(opts.get("rectRelAreaMin", 0.01))    # drop annotation text blocks
-    circle_rel_radius_min = float(opts.get("circleRelRadiusMin", 0.4)) # drop text-glyph circles
+    rect_aspect_min       = float(opts.get("rectAspectMin", 0.10))     # drop thin dimension lines
+    rect_rel_area_min     = float(opts.get("rectRelAreaMin", 0.001))   # drop annotation text blocks (lowered: 0.1% of max, not 1%)
+    circle_rel_radius_min = float(opts.get("circleRelRadiusMin", 0.2)) # drop text-glyph circles (lowered)
     circle_rect_overlap_frac = float(opts.get("circleRectOverlapFrac", 0.5))  # drop circles sitting on rects
 
     steps = []
