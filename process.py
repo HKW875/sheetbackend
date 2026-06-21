@@ -351,13 +351,7 @@ def _classify_contour(pts_xy, min_pts_for_circle=12, circle_rms_tol=0.12):
                 }
         except Exception:
             pass
-    # Improved rect check: few vertices OR points cluster on 4 sides (axis-aligned)
-    if len(pts_xy) <= rect_max_vertices or _is_rect_like(pts_xy):
-        cx_b, cy_b, w_b, h_b = _fit_rect_algebraic(pts_xy)
-        # Additional check: aspect not too extreme for "real" rects
-        if min(w_b, h_b) / max(w_b, h_b) >= 0.08:  # lowered from implicit tight filter
-            return {'type': 'rect', 'cx': cx_b, 'cy': cy_b, 'w': w_b, 'h': h_b, 'area': w_b * h_b}
-          
+
     # For complex shapes with many vertices, keep as polygon instead of bounding box
     if len(pts_xy) > 8:
         return {
@@ -377,16 +371,7 @@ def _classify_contour(pts_xy, min_pts_for_circle=12, circle_rms_tol=0.12):
         'area': w_b * h_b,
     }
 
-def _is_rect_like(pts_xy, tol=0.05):
-    """Check if points mostly lie on horizontal/vertical sides."""
-    x, y = pts_xy[:,0], pts_xy[:,1]
-    x_sorted, y_sorted = np.sort(x), np.sort(y)
-    # Rough: variance in x/y projections or count near min/max
-    if np.std(x) < tol * (x.max() - x.min()) or np.std(y) < tol * (y.max() - y.min()):
-        return False  # too circular
-    # More points near 4 extremes
-    return True  # or implement side clustering if needed
-  
+
 # ════════════════════════════════════════════════════════════════════════════
 # STEP 9 — HIERARCHY-BASED OFFSET-PAIR AVERAGING
 # ════════════════════════════════════════════════════════════════════════════
@@ -702,6 +687,8 @@ def build_clean_shapes(simplified_contours, parents, children, img_w, img_h,
     paired = pair_by_hierarchy(classified, parents, children)
     paired = [s for s in paired if s is not None]
 
+    # === NEW: 190px² area filter ===
+    paired = [s for s in paired if s['area'] >= 190.0]
 
     # Step 2: residual proximity dedup, per type
     circles = [s for s in paired if s['type'] == 'circle']
@@ -719,8 +706,7 @@ def build_clean_shapes(simplified_contours, parents, children, img_w, img_h,
     # door_lock circles, ~136,000px² for oven_top rects) but well above the
     # 20-80px speckle fragments this allows through MORPH/CC filtering.
     if min_shape_area is None:
-        # Scale-invariant: 0.005% of image area (was 0.008%)
-        min_shape_area = max(HARD_MIN_SHAPE_AREA_PX, 0.00005 * img_w * img_h)
+        min_shape_area = max(HARD_MIN_SHAPE_AREA_PX * 5.0, 0.00008 * img_w * img_h)
 
     circles = [c for c in circles if (math.pi * c['r'] * c['r']) >= min_shape_area]
     rects   = [r for r in rects   if (r['w'] * r['h'])           >= min_shape_area]
@@ -1188,6 +1174,11 @@ def build_comparison_png(edges, final_shapes, img_w, img_h, out_path):
             if s['type'] == 'circle':
                 r_px = int(round(s['r']))
                 cv2.circle(right, (cx_px, cy_px), r_px, (80, 80, 220), 2, cv2.LINE_AA)
+
+            elif s['type'] == 'poly':
+                # Draw polygon using all vertices
+                pts = np.array([[int(p[0]), int(p[1])] for p in s['points']], dtype=np.int32)
+                cv2.polylines(right, [pts], True, (80, 200, 80), 2, cv2.LINE_AA)
               
             elif s['type'] == 'poly':
                 # Draw each segment individually
@@ -1319,7 +1310,7 @@ def main():
         try: opts = json.loads(sys.argv[2])
         except Exception: pass
 
-    blur_ksize     = int(opts.get("blurKsize",    5))    # ksize=21 tested — degrades results, see notes
+    blur_ksize     = int(opts.get("blurKsize",    7))    # ksize=21 tested — degrades results, see notes
     canny_low      = int(opts.get("cannyLow",    20))
     canny_high     = int(opts.get("cannyHigh",   80))
     epsilon_factor = float(opts.get("epsilonFactor", 0.5))
