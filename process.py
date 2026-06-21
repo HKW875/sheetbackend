@@ -924,6 +924,184 @@ def _snap_segment_corners(merged_segments, tol=60.0):
     return h_segs + v_segs
 
 
+def remove_unclosed_parallel_duplicates(final_shapes, dedup_tol=25.0, dedup_slack=20.0, closure_eps=0.5):
+    """
+    v12 — Final global, cross-shape duplicate-edge cleanup.
+
+    _dedup_parallel_segments and _snap_segment_corners both run PER poly
+    shape — each shape is only ever clustered/snapped against its OWN
+    segments. When the CV trace reports a duplicate of a real edge as part
+    of a DIFFERENT contour than the one its twin ended up belonging to
+    (e.g. a small stray contour that never got hierarchy-paired with the
+    main outline), that duplicate never gets a chance to cluster with its
+    twin in Step 3, and never finds a perpendicular neighbour close enough
+    to snap to in Step 4 — so it survives, untouched, as a short,
+    disconnected, parallel "ghost" of an edge that's already represented
+    correctly elsewhere in the drawing.
+
+    This pass re-clusters every H/V segment from every shape together
+    (the same Union-Find logic as _dedup_parallel_segments, just applied
+    globally instead of per-shape) and collapses every resulting cluster
+    down to EXACTLY ONE surviving segment:
+      - A cluster of size 1 (no duplicate anywhere) is left untouched —
+        deleting a genuinely unique open segment would silently punch a
+        real hole in the outline instead of removing a duplicate.
+      - A cluster of size > 1 is merged into one line. Each endpoint is
+        first classified CLOSED if it exactly coincides (within
+        `closure_eps`) with an endpoint of some perpendicular segment
+        anywhere in the drawing — i.e. it already is part of a real,
+        validated corner. The merge prefers CLOSED endpoint values over
+        open ones (so an already-correctly-snapped corner is never
+        loosened back open by averaging it with a sloppier duplicate), and
+        only falls back to the median across the cluster where no member
+        has a closed value on that side. If one member of the cluster is
+        fully closed on both ends, it is kept exactly as-is and every other
+        member is simply discarded as a redundant ghost.
+
+    This guarantees every edge ends up represented exactly once — never
+    zero times — which a naive "delete any unclosed duplicate" rule does
+    not: if both copies of an edge happen to be unclosed, deleting both
+    would leave a gap.
+
+    Mutates each shape's 'segments' list in place.
+    Returns (final_shapes, n_removed).
+    """
+    pool = []
+    for si, shape in enumerate(final_shapes):
+        if shape.get('type') != 'poly':
+            continue
+        for li, s in enumerate(shape.get('segments', [])):
+            pool.append({'shape': si, 'local': li, 'type': s['type'],
+                        'coord': s['coord'], 'start': s['start'], 'end': s['end']})
+
+    if not pool:
+        return final_shapes, 0
+
+    h_pool = [p for p in pool if p['type'] == 'H']
+    v_pool = [p for p in pool if p['type'] == 'V']
+
+    h_endpoints_all = [(p['start'], p['coord']) for p in h_pool] + [(p['end'], p['coord']) for p in h_pool]
+    v_endpoints_all = [(p['coord'], p['start']) for p in v_pool] + [(p['coord'], p['end']) for p in v_pool]
+
+    def is_closed(x, y, opposite_endpoints):
+        for ox, oy in opposite_endpoints:
+            if abs(ox - x) <= closure_eps and abs(oy - y) <= closure_eps:
+                return True
+        return False
+
+    for p in h_pool:
+        p['start_closed'] = is_closed(p['start'], p['coord'], v_endpoints_all)
+        p['end_closed'] = is_closed(p['end'], p['coord'], v_endpoints_all)
+    for p in v_pool:
+        p['start_closed'] = is_closed(p['coord'], p['start'], h_endpoints_all)
+        p['end_closed'] = is_closed(p['coord'], p['end'], h_endpoints_all)
+
+    def cluster(segs):
+        n = len(segs)
+        parent = list(range(n))
+
+        def find(a):
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            return a
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        for i, j in combinations(range(n), 2):
+            if abs(segs[i]['coord'] - segs[j]['coord']) <= dedup_tol:
+                overlap = min(segs[i]['end'], segs[j]['end']) - max(segs[i]['start'], segs[j]['start'])
+                if overlap > -dedup_slack:
+                    union(i, j)
+
+        groups = {}
+        for i in range(n):
+            groups.setdefault(find(i), []).append(i)
+        return groups
+
+    med = lambda a: sorted(a)[len(a) // 2] if len(a) % 2 else \
+        (sorted(a)[len(a)//2 - 1] + sorted(a)[len(a)//2]) / 2.0
+
+    removed_keys = set()
+    updates = {}  # (shape, local) -> replacement {'coord','start','end'}
+
+    def resolve(segs, groups):
+        for idxs in groups.values():
+            if len(idxs) == 1:
+                continue  # unique segment, no duplicate anywhere -- leave it alone
+
+            members = [segs[i] for i in idxs]
+            fully_closed = [m for m in members if m['start_closed'] and m['end_closed']]
+
+            if fully_closed:
+                survivor = max(fully_closed, key=lambda m: m['end'] - m['start'])
+                new_coord, new_start, new_end = survivor['coord'], survivor['start'], survivor['end']
+            else:
+                survivor = max(members, key=lambda m: (m['start_closed'] + m['end_closed'], m['end'] - m['start']))
+                closed_starts = [m['start'] for m in members if m['start_closed']]
+                closed_ends = [m['end'] for m in members if m['end_closed']]
+                new_start = closed_starts[0] if closed_starts else med([m['start'] for m in members])
+                new_end = closed_ends[0] if closed_ends else med([m['end'] for m in members])
+                new_coord = med([m['coord'] for m in members])
+
+            survivor_key = (survivor['shape'], survivor['local'])
+            for m in members:
+                key = (m['shape'], m['local'])
+                if key != survivor_key:
+                    removed_keys.add(key)
+            updates[survivor_key] = {'coord': new_coord, 'start': new_start, 'end': new_end}
+
+    resolve(h_pool, cluster(h_pool))
+    resolve(v_pool, cluster(v_pool))
+
+    survivors = []  # flat list of dicts (mutated in place), one per surviving segment
+    for si, shape in enumerate(final_shapes):
+        if shape.get('type') != 'poly':
+            continue
+        for li, s in enumerate(shape.get('segments', [])):
+            key = (si, li)
+            if key in removed_keys:
+                continue
+            d = {'shape': si, 'local': li, 'type': s['type'],
+                 'coord': s['coord'], 'start': s['start'], 'end': s['end']}
+            if key in updates:
+                u = updates[key]
+                d['coord'], d['start'], d['end'] = u['coord'], u['start'], u['end']
+            survivors.append(d)
+
+    n_removed = len(removed_keys)
+    if n_removed == 0:
+        return final_shapes, 0
+
+    # Merging a non-fully-closed cluster can move a line's coordinate to a
+    # new median value that no longer exactly meets the perpendicular
+    # neighbour its OLD value used to touch (see e.g. the bottom-left edge
+    # in sheetforge_edit.dxf: two open duplicates at y=502.5 and y=519.25
+    # merge to y=510.875, which then needs its adjoining verticals re-snapped
+    # to that new value). One more extend-to-intersect pass over the
+    # consolidated global segment list fixes that residual gap.
+    _snap_segment_corners(survivors, tol=max(dedup_tol, dedup_slack))
+
+    by_key = {(d['shape'], d['local']): d for d in survivors}
+    for si, shape in enumerate(final_shapes):
+        if shape.get('type') != 'poly':
+            continue
+        new_segs = []
+        for li, s in enumerate(shape.get('segments', [])):
+            key = (si, li)
+            if key in removed_keys:
+                continue
+            d = by_key[key]
+            new_segs.append({'type': d['type'], 'coord': d['coord'], 'start': d['start'], 'end': d['end']})
+        shape['segments'] = new_segs
+        shape['n_segments'] = len(new_segs)
+
+    return final_shapes, n_removed
+
+
 def fit_rectilinear_to_polygon(poly_shape, original_contour, 
                                 approx_eps_factor=0.003, 
                                 orientation_ratio=1.2,
@@ -1325,6 +1503,12 @@ def main():
     dedup_tol         = float(opts.get("dedupTol", 15.0))       # max px gap between duplicate parallel edges
     dedup_slack        = float(opts.get("dedupSlack", 20.0))     # negative-overlap slack for near-touching spans
     corner_snap_tol    = float(opts.get("cornerSnapTol", 60.0))  # max px distance to snap a corner pair
+    # Cross-shape ghosts are compared against an already-merged (median'd)
+    # representative line rather than a raw trace, so the residual gap is
+    # typically a bit larger than the within-shape case — give this pass a
+    # more generous default tolerance than dedup_tol.
+    final_dedup_tol    = float(opts.get("finalDedupTol", 30.0))
+    final_dedup_slack  = float(opts.get("finalDedupSlack", 20.0))
 
     steps = []
 
@@ -1404,7 +1588,21 @@ def main():
         "GEO-10.5: Rectilinear Primitive Fitting (dedup + extend-to-intersect corner snap)",
         f"{n_rectilinear} polygon(s) → {n_raw_total} raw traces collapsed to {n_final_total} "
         f"connected H/V segments", t0))
-  
+
+    # ── STEP 10.6: Global cross-shape duplicate-edge cleanup ──────────────
+    # Catches duplicate traces that escaped Step 10.5 because they ended up
+    # attached to a different (often stray, unpaired) contour than their
+    # twin, so they were never clustered or corner-snapped against it.
+    # Re-clusters every H/V segment from every shape together and collapses
+    # each resulting cluster to exactly one surviving line, preferring
+    # already-closed (corner-snapped) endpoint values over open ones.
+    t0 = now_ms()
+    final_shapes, n_removed = remove_unclosed_parallel_duplicates(
+        final_shapes, dedup_tol=final_dedup_tol, dedup_slack=final_dedup_slack)
+    steps.append(step_record(
+        "GEO-10.6: Global Duplicate-Edge Cleanup (cross-shape merge of unclosed ghosts)",
+        f"{n_removed} redundant duplicate segment(s) collapsed across all shapes", t0))
+
     # ── Output dir ────────────────────────────────────────────────────────
     server_out_dir = Path(__file__).parent / "uploads" / "output"
     server_out_dir.mkdir(parents=True, exist_ok=True)
