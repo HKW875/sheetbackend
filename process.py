@@ -327,119 +327,6 @@ def _fit_rect_algebraic(pts_xy):
     h    = float(y.max() - y.min())
     return cx, cy, w, h
 
-# ════════════════════════════════════════════════════════════════════════════
-# NEW: Rectangle detection from approxPolyDP points using minAreaRect
-# ════════════════════════════════════════════════════════════════════════════
-# INSERT THIS ENTIRE BLOCK HERE, BEFORE _classify_contour()
-
-def detect_rectangle_from_poly_points_v2(pts_xy, 
-                                            rect_angle_tol_deg=20.0, 
-                                            rect_aspect_min=0.15,
-                                            rect_area_min=190.0,
-                                            corner_angle_tol_deg=35.0,
-                                            min_corner_score=0.6):
-    """
-    v2: Detect rectangles from approxPolyDP points using cv2.minAreaRect().
-    More robust for hand-drawn sketches with wobbly edges.
-    
-    Returns rect dict or None.
-    """
-    if len(pts_xy) < 4:
-        return None
-    
-    pts_cv = np.array(pts_xy, dtype=np.float32).reshape(-1, 1, 2)
-    
-    # Method 1: cv2.minAreaRect
-    min_rect = cv2.minAreaRect(pts_cv)
-    (cx, cy), (w, h), angle = min_rect
-    
-    if w < h:
-        w, h = h, w
-        angle += 90.0
-    angle = ((angle + 90) % 180) - 90
-    
-    if abs(angle) > rect_angle_tol_deg:
-        return None
-    
-    aspect = min(w, h) / max(w, h) if max(w, h) > 0 else 0
-    if aspect < rect_aspect_min:
-        return None
-    
-    area = w * h
-    if area < rect_area_min:
-        return None
-    
-    # Method 2: Fill ratio
-    x_min, x_max = pts_xy[:, 0].min(), pts_xy[:, 0].max()
-    y_min, y_max = pts_xy[:, 1].min(), pts_xy[:, 1].max()
-    bbox_area = (x_max - x_min) * (y_max - y_min)
-    
-    if bbox_area > 0:
-        area_ratio = area / bbox_area
-        if area_ratio < 0.6:
-            return None
-    
-    # Method 3: Corner angle analysis (find best 4 corners)
-    n = len(pts_xy)
-    if n >= 8:
-        corner_scores = []
-        for i in range(n):
-            p_prev = pts_xy[(i - 2) % n]
-            p_curr = pts_xy[i]
-            p_next = pts_xy[(i + 2) % n]
-            
-            v1 = p_prev - p_curr
-            v2 = p_next - p_curr
-            
-            len1 = np.linalg.norm(v1)
-            len2 = np.linalg.norm(v2)
-            if len1 < 1e-6 or len2 < 1e-6:
-                corner_scores.append(180.0)
-                continue
-            
-            v1_norm = v1 / len1
-            v2_norm = v2 / len2
-            
-            dot = np.clip(np.dot(v1_norm, v2_norm), -1.0, 1.0)
-            corner_angle = math.degrees(math.acos(dot))
-            deviation = abs(corner_angle - 90.0)
-            corner_scores.append(deviation)
-        
-        best_corners = sorted(corner_scores)[:4]
-        n_good_corners = sum(1 for d in best_corners if d < corner_angle_tol_deg)
-        
-        if n_good_corners < 3:
-            return None
-    
-    # Method 4: Edge proximity check
-    cx_aa = (x_min + x_max) / 2.0
-    cy_aa = (y_min + y_max) / 2.0
-    w_aa = x_max - x_min
-    h_aa = y_max - y_min
-    
-    edge_margin = max(w_aa, h_aa) * 0.15
-    n_edge_points = 0
-    for px, py in pts_xy:
-        near_left = abs(px - x_min) < edge_margin
-        near_right = abs(px - x_max) < edge_margin
-        near_top = abs(py - y_min) < edge_margin
-        near_bottom = abs(py - y_max) < edge_margin
-        if near_left or near_right or near_top or near_bottom:
-            n_edge_points += 1
-    
-    edge_ratio = n_edge_points / len(pts_xy) if len(pts_xy) > 0 else 0
-    if edge_ratio < min_corner_score:
-        return None
-    
-    return {
-        'type': 'rect',
-        'cx': float(cx_aa),
-        'cy': float(cy_aa),
-        'w': float(w_aa),
-        'h': float(h_aa),
-        'area': float(w_aa * h_aa),
-    }
-
 def _classify_contour(pts_xy, min_pts_for_circle=12, circle_rms_tol=0.12):
     x, y = pts_xy[:, 0], pts_xy[:, 1]
     w = float(x.max() - x.min())
@@ -464,16 +351,7 @@ def _classify_contour(pts_xy, min_pts_for_circle=12, circle_rms_tol=0.12):
                 }
         except Exception:
             pass
-    # ═══════════════════════════════════════════════════════════════════════
-    # NEW: Try rectangle detection from poly points (v2 — robust for hand-drawn)
-    # ═══════════════════════════════════════════════════════════════════════
-    if len(pts_xy) >= 8:  # Only for shapes with many points (not simple 4-corner rects)
-        rect = detect_rectangle_from_poly_points_v2(pts_xy)
-        if rect:
-            return rect  # Returns {'type': 'rect', 'cx': ..., 'cy': ..., 'w': ..., 'h': ...}
 
-
-  
     # For complex shapes with many vertices, keep as polygon instead of bounding box
     if len(pts_xy) > 8:
         return {
@@ -1137,77 +1015,6 @@ def fit_rectilinear_to_polygon(poly_shape, original_contour,
 
     return poly_shape, final_segments
 
-def detect_rectangle_from_segments(poly_shape, tol=10.0):
-    """
-    Analyzes H/V segments of a rectilinear-fitted polygon to detect if
-    they form a closed rectangle (2H + 2V with matching spans).
-    """
-    segments = poly_shape.get('segments', [])
-    if not segments:
-        return poly_shape
-    
-    h_segs = [s for s in segments if s['type'] == 'H']
-    v_segs = [s for s in segments if s['type'] == 'V']
-    
-    if len(h_segs) != 2 or len(v_segs) != 2:
-        return poly_shape
-    
-    h1, h2 = h_segs
-    h_span_match = (abs(h1['start'] - h2['start']) <= tol and 
-                    abs(h1['end'] - h2['end']) <= tol)
-    if not h_span_match:
-        return poly_shape
-    
-    v1, v2 = v_segs
-    v_span_match = (abs(v1['start'] - v2['start']) <= tol and 
-                    abs(v1['end'] - v2['end']) <= tol)
-    if not v_span_match:
-        return poly_shape
-    
-    h_y_coords = sorted([h1['coord'], h2['coord']])
-    v_y_range = sorted([v1['start'], v1['end']])
-    h_y_match = (abs(h_y_coords[0] - v_y_range[0]) <= tol and 
-                 abs(h_y_coords[1] - v_y_range[1]) <= tol)
-    if not h_y_match:
-        return poly_shape
-    
-    h_x_range = sorted([h1['start'], h1['end']])
-    v_x_coords = sorted([v1['coord'], v2['coord']])
-    v_x_match = (abs(v_x_coords[0] - h_x_range[0]) <= tol and 
-                 abs(v_x_coords[1] - h_x_range[1]) <= tol)
-    if not v_x_match:
-        return poly_shape
-    
-    x_min = min(h1['start'], h2['start'])
-    x_max = max(h1['end'], h2['end'])
-    y_min = min(h1['coord'], h2['coord'])
-    y_max = max(h1['coord'], h2['coord'])
-    
-    return {
-        'type': 'rect',
-        'cx': float((x_min + x_max) / 2.0),
-        'cy': float((y_min + y_max) / 2.0),
-        'w': float(x_max - x_min),
-        'h': float(y_max - y_min),
-        'area': float((x_max - x_min) * (y_max - y_min)),
-        'was_poly': True,
-    }
-
-
-def convert_polys_to_rects(final_shapes, tol=15.0):
-    """
-    Post-processing: scan all shapes and convert polygons whose rectilinear
-    segments form a closed rectangle into rect entities.
-    """
-    converted = []
-    for shape in final_shapes:
-        if shape['type'] == 'poly' and shape.get('rectilinear'):
-            rect_candidate = detect_rectangle_from_segments(shape, tol=tol)
-            converted.append(rect_candidate)
-        else:
-            converted.append(shape)
-    return converted
-
 
 def apply_rectilinear_fitting(final_shapes, simplified_contours,
                                dedup_tol=15.0, dedup_slack=20.0, corner_snap_tol=60.0):
@@ -1248,9 +1055,6 @@ def apply_rectilinear_fitting(final_shapes, simplified_contours,
                     dedup_tol=dedup_tol, dedup_slack=dedup_slack, corner_snap_tol=corner_snap_tol)
                 fitted['segments'] = segments
                 fitted_shapes.append(fitted)
-                rect = detect_rectangle_from_segments(fitted, tol=15.0)
-            if rect['type'] == 'rect':
-                fitted_shapes.append(rect)
             else:
                 fitted_shapes.append(shape)
         else:
@@ -1509,7 +1313,7 @@ def main():
     blur_ksize     = int(opts.get("blurKsize",    7))    # ksize=21 tested — degrades results, see notes
     canny_low      = int(opts.get("cannyLow",    20))
     canny_high     = int(opts.get("cannyHigh",   80))
-    epsilon_factor = float(opts.get("epsilonFactor", 1.75))
+    epsilon_factor = float(opts.get("epsilonFactor", 0.5))
     min_blob_area  = int(opts.get("minBlobArea", 20))    # ← changed from 50; user-requested <20px
     min_shape_area = opts.get("minShapeArea", None)       # px-area: absolute noise filter
     if min_shape_area is not None:
@@ -1613,13 +1417,6 @@ def main():
     dxf_path = server_out_dir / dxf_name
     pdf_path = server_out_dir / pdf_name
     png_path = server_out_dir / png_name
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # NEW STEP 10.6: Convert remaining polys to rects if segments form rectangles
-    # ═══════════════════════════════════════════════════════════════════════
-    final_shapes = convert_polys_to_rects(final_shapes, tol=15.0)
-
-    n_rectilinear = sum(1 for s in final_shapes if s.get('rectilinear'))
 
     # ── STEP 11: Clean DXF export ─────────────────────────────────────────
     t0 = now_ms()
