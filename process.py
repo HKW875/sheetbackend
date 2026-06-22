@@ -327,56 +327,50 @@ def _fit_rect_algebraic(pts_xy):
     h    = float(y.max() - y.min())
     return cx, cy, w, h
 
-
-# In _classify_contour, check aspect ratio BEFORE vertex count:
-def _classify_contour(pts_xy):
-    if len(pts_xy) < 3:
-        return None
-
+def _classify_contour(pts_xy, min_pts_for_circle=12, circle_rms_tol=0.12):
     x, y = pts_xy[:, 0], pts_xy[:, 1]
     w = float(x.max() - x.min())
     h = float(y.max() - y.min())
-    aspect = min(w, h) / max(w, h) if max(w, h) > 0 else 0
+    if w < 1e-6 or h < 1e-6:
+        return None
 
-    # Strong rect heuristic (the one you were trying to add)
-    if aspect > 0.3 and len(pts_xy) > 4:
-        edge_points = 0
-        for px, py in pts_xy:
-            near_edge = (abs(px - x.min()) < w*0.1 or abs(px - x.max()) < w*0.1 or
-                        abs(py - y.min()) < h*0.1 or abs(py - y.max()) < h*0.1)
-            if near_edge:
-                edge_points += 1
-        if edge_points / len(pts_xy) > 0.7:
-            cx, cy, rw, rh = _fit_rect_algebraic(pts_xy)
-            return {
-                'type': 'rect',
-                'cx': cx, 'cy': cy, 'w': rw, 'h': rh,
-                'area': rw * rh
-            }
+    aspect = min(w, h) / max(w, h)
 
-    # Default: try circle fit
-    try:
-        cx, cy, r, rms = _fit_circle_algebraic(pts_xy, outlier_trim_passes=1)
-        if r > 2.0 and rms < r * 0.15:  # reasonable circle
-            return {
-                'type': 'circle',
-                'cx': cx, 'cy': cy, 'r': r,
-                'err': rms,
-                'area': math.pi * r * r
-            }
-    except:
-        pass
+    # Try circle fit first
+    if aspect > 0.60 and len(pts_xy) >= min_pts_for_circle:
+        try:
+            cx, cy, r, rms = _fit_circle_algebraic(pts_xy, outlier_trim_passes=1)
+            rel_err = rms / (r + 1e-9)
+            if rel_err < circle_rms_tol:
+                return {
+                    'type': 'circle',
+                    'cx': float(cx), 'cy': float(cy), 'r': float(r),
+                    'err': float(rel_err),
+                    'area': math.pi * r * r,
+                    'w': w, 'h': h,
+                }
+        except Exception:
+            pass
 
-    # Fallback: treat as polygon/rect
-    cx = (float(x.min()) + float(x.max())) / 2.0
-    cy = (float(y.min()) + float(y.max())) / 2.0
+    # For complex shapes with many vertices, keep as polygon instead of bounding box
+    if len(pts_xy) > 8:
+        return {
+            'type': 'poly',
+            'points': pts_xy.tolist(),  # Keep all approxPolyDP vertices
+            'area': cv2.contourArea(np.array(pts_xy, dtype=np.float32).reshape(-1, 1, 2)),
+            'w': w, 'h': h,
+            'cx': (x.min() + x.max()) / 2.0,
+            'cy': (y.min() + y.max()) / 2.0,
+        }
+
+    # Simple rectangle fallback for truly simple 4-corner shapes
+    cx_b, cy_b, w_b, h_b = _fit_rect_algebraic(pts_xy)
     return {
-        'type': 'poly',  # or 'rect'
-        'points': pts_xy.tolist(),
-        'cx': cx, 'cy': cy,
-        'w': w, 'h': h,
-        'area': cv2.contourArea(pts_xy.reshape(-1, 1, 2)) if len(pts_xy) >= 3 else 0
+        'type': 'rect',
+        'cx': cx_b, 'cy': cy_b, 'w': w_b, 'h': h_b,
+        'area': w_b * h_b,
     }
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # STEP 9 — HIERARCHY-BASED OFFSET-PAIR AVERAGING
@@ -692,6 +686,9 @@ def build_clean_shapes(simplified_contours, parents, children, img_w, img_h,
     # Step 1: hierarchy-based offset-pair averaging
     paired = pair_by_hierarchy(classified, parents, children)
     paired = [s for s in paired if s is not None]
+
+    # === NEW: 190px² area filter ===
+    paired = [s for s in paired if s['area'] >= 190.0]
 
     # Step 2: residual proximity dedup, per type
     circles = [s for s in paired if s['type'] == 'circle']
@@ -1316,7 +1313,7 @@ def main():
     blur_ksize     = int(opts.get("blurKsize",    7))    # ksize=21 tested — degrades results, see notes
     canny_low      = int(opts.get("cannyLow",    20))
     canny_high     = int(opts.get("cannyHigh",   80))
-    epsilon_factor = float(opts.get("epsilonFactor", 0.05))
+    epsilon_factor = float(opts.get("epsilonFactor", 0.5))
     min_blob_area  = int(opts.get("minBlobArea", 20))    # ← changed from 50; user-requested <20px
     min_shape_area = opts.get("minShapeArea", None)       # px-area: absolute noise filter
     if min_shape_area is not None:
