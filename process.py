@@ -330,21 +330,53 @@ def _fit_rect_algebraic(pts_xy):
 
 # In _classify_contour, check aspect ratio BEFORE vertex count:
 def _classify_contour(pts_xy):
+    if len(pts_xy) < 3:
+        return None
+
     x, y = pts_xy[:, 0], pts_xy[:, 1]
-    w, h = float(x.max() - x.min()), float(y.max() - y.min())
-    aspect = min(w, h) / max(w, h)
-    
-    # If aspect is close to 1 and bounding box fills most of points, it's a rect
-    if aspect > 0.3 and len(pts_xy) > 4:  # Lower threshold
-        # Check if points mostly lie near edges of bounding box
+    w = float(x.max() - x.min())
+    h = float(y.max() - y.min())
+    aspect = min(w, h) / max(w, h) if max(w, h) > 0 else 0
+
+    # Strong rect heuristic (the one you were trying to add)
+    if aspect > 0.3 and len(pts_xy) > 4:
         edge_points = 0
         for px, py in pts_xy:
             near_edge = (abs(px - x.min()) < w*0.1 or abs(px - x.max()) < w*0.1 or
                         abs(py - y.min()) < h*0.1 or abs(py - y.max()) < h*0.1)
             if near_edge:
                 edge_points += 1
-        if edge_points / len(pts_xy) > 0.7:  # 70% of points on edges
-            return _fit_rect_algebraic(pts_xy)  # Force rectangle
+        if edge_points / len(pts_xy) > 0.7:
+            cx, cy, rw, rh = _fit_rect_algebraic(pts_xy)
+            return {
+                'type': 'rect',
+                'cx': cx, 'cy': cy, 'w': rw, 'h': rh,
+                'area': rw * rh
+            }
+
+    # Default: try circle fit
+    try:
+        cx, cy, r, rms = _fit_circle_algebraic(pts_xy, outlier_trim_passes=1)
+        if r > 2.0 and rms < r * 0.15:  # reasonable circle
+            return {
+                'type': 'circle',
+                'cx': cx, 'cy': cy, 'r': r,
+                'err': rms,
+                'area': math.pi * r * r
+            }
+    except:
+        pass
+
+    # Fallback: treat as polygon/rect
+    cx = (float(x.min()) + float(x.max())) / 2.0
+    cy = (float(y.min()) + float(y.max())) / 2.0
+    return {
+        'type': 'poly',  # or 'rect'
+        'points': pts_xy.tolist(),
+        'cx': cx, 'cy': cy,
+        'w': w, 'h': h,
+        'area': cv2.contourArea(pts_xy.reshape(-1, 1, 2)) if len(pts_xy) >= 3 else 0
+    }
 
 # ════════════════════════════════════════════════════════════════════════════
 # STEP 9 — HIERARCHY-BASED OFFSET-PAIR AVERAGING
