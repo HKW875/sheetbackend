@@ -1313,7 +1313,7 @@ def main():
     blur_ksize     = int(opts.get("blurKsize",    7))    # ksize=21 tested — degrades results, see notes
     canny_low      = int(opts.get("cannyLow",    20))
     canny_high     = int(opts.get("cannyHigh",   80))
-    epsilon_factor = float(opts.get("epsilonFactor", 0.5))
+    epsilon_factor = float(opts.get("epsilonFactor", 1.75))
     min_blob_area  = int(opts.get("minBlobArea", 20))    # ← changed from 50; user-requested <20px
     min_shape_area = opts.get("minShapeArea", None)       # px-area: absolute noise filter
     if min_shape_area is not None:
