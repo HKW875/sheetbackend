@@ -1,83 +1,89 @@
 #!/usr/bin/env python3
 """
-SheetForge — CV Pipeline  v12  (Adaptive Neural-Style Preprocessing + Rect Angle Detector)
+SheetForge — CV Pipeline  v11  (Dedup + Extend-to-Intersect Corner Snap)
 ================================================================
 Receives: image_path, options_json (from node child_process)
 Outputs:  JSON on stdout  { steps, analysis, dwg, dxfContent, pdfAvailable }
 
-WHAT CHANGED IN v12 AND WHY
+WHAT CHANGED IN v11 AND WHY
 -----------------------------
-Six targeted changes over v11:
+v10.2's rectilinear fitting still left two problems visible in exported
+DXFs: (1) the same physical edge was frequently exported as 2-4 near-
+parallel duplicate lines a few px apart (its Step-3 merge used a hard
+round(coord/8)*8 grid bucket, which both over-merges edges that round into
+the same bucket and under-merges real duplicates that straddle a bucket
+boundary), and (2) there was no stage at all that made adjacent H/V
+segments actually terminate at the same point, so corners were left with
+small gaps instead of a closed chain.
+  FIX: _dedup_parallel_segments() replaces the grid-bucket merge with a
+  proper Union-Find cluster over every pair of same-orientation segments,
+  requiring BOTH a close constant-coordinate AND an overlapping span before
+  merging (so two different edges that coincidentally sit at a similar
+  height/x, like the two steps of a notch, are never merged) — then takes
+  the MEDIAN coordinate/extent per cluster instead of a grid snap.
+  _snap_segment_corners() is an entirely new stage: it nearest-neighbour
+  matches every open H endpoint to an open V endpoint and overwrites both
+  with their exact intersection point, literally extending/trimming each
+  line until it meets its neighbour and stopping there. Together these
+  collapse duplicate strokes down to one line per side and connect every
+  corner into a single closed rectilinear chain.
 
-  1. MORPH_OPEN REMOVED — MORPH_CLOSE ONLY
-     cv2.MORPH_OPEN was silently eroding thin corners and short spurs on
-     lighter/noisier hand-drawn inputs, destroying real geometry before
-     contour extraction ever saw it. Speckle removal is owned entirely by
-     the connected-component filter (Step 5), which makes exact decisions
-     on blob area without any erosion side-effects. MORPH_CLOSE is kept
-     (fills 1px gaps, keeps stroke as one connected blob). Applies in both
-     morph_clean() and the aggressive-pass inside remove_small_blobs().
+WHAT CHANGED FROM v9.1 AND WHY
+-------------------------------
+v9.1 produced excellent results on clean scans (door_lock) but broke down
+on noisier images (oven_top) for three root causes:
 
-  2. EPSILON_FACTOR 0.5 → 0.03
-     The approxPolyDP simplification factor was far too aggressive: at 0.5
-     it was collapsing real polygon vertices away, making multi-sided cuts
-     look like rectangles. At 0.03 it preserves fine corner detail while
-     still removing trivially-collinear duplicate points.
+  1. SPECKLE / 1px DOTS
+     A 3x3 MORPH_OPEN alone does not reliably remove every isolated
+     1-2px speckle.  Any speckle that survives becomes its own tiny
+     contour, OR — worse — gets 8-connected to a real shape's contour
+     and silently drags that shape's bounding box (and therefore its
+     centre/size) off in some direction.  This is the single biggest
+     cause of "offset" rectangles/circles.
+     FIX: cv2.connectedComponentsWithStats() removes EVERY connected
+     blob below an area threshold, by construction — not "mostly",
+     100% — regardless of where it sits on the page.
 
-  3. HARD AREA FILTER 190px² → 145px²
-     The post-hierarchy-pair area floor was dropping some small genuine
-     features (bolt holes near the edge of a part). 145px² sits comfortably
-     above real speckle (≤20px²) while letting more real shapes through.
+  2. DOUBLE-EDGE "OFFSET" DUPLICATES
+     Running findContours on the *Canny* output means every drawn
+     line produces TWO parallel contours (its inner edge and its
+     outer edge).  v9.1 tried to fix this after the fact by comparing
+     every shape to every other shape and discarding "the larger one"
+     — fragile, and biased (it always keeps the inner edge, which is
+     not the true centreline of the drawn stroke).
+     FIX: findContours now runs on the *cleaned binary mask* (the
+     stroke itself, not its Canny silhouette) with RETR_TREE.  A
+     stroke drawn as a closed ring produces an outer contour and an
+     inner ("hole") contour that are PARENT/CHILD in the hierarchy.
+     We pair them explicitly using that hierarchy relationship and
+     AVERAGE their geometry — giving the true stroke centreline,
+     with no offset and exactly one entity per shape.
 
-  4. DUPLICATE POLY DRAWING BLOCK REMOVED
-     build_comparison_png() had a dead (unreachable) second `elif s['type']
-     == 'poly':` block — an identical branch that could never execute
-     because Python short-circuits at the first matching elif. Removed.
-
-  5. RECTANGLE DETECTOR: 4-8 VERTICES + ~90° ANGLE TEST
-     The old classifier forced any contour with ≤8 points into a 'rect'
-     regardless of whether its angles were actually right-angles. L-shaped
-     notches, hexagons, and other multi-vertex shapes were being silently
-     crushed into wrong bounding-box rectangles. The new _is_rectangle_like()
-     helper checks that ≥70% of the interior angles are within 25° of 90°
-     (OR near 180° — forgiving near-collinear approxPolyDP artefact points
-     along a straight edge). Only contours that pass that test are classified
-     as 'rect'; everything else stays as 'poly' with its real vertices intact.
-
-  6. ADAPTIVE NEURAL-STYLE OPENCV PREPROCESSING PIPELINE (new Steps 1.5–2.5)
-     Three new enhancement stages run before median blur / thresholding:
-       a. CLAHE (Step 1.5) — contrast-limited adaptive histogram equalisation
-          on 8×8 tiles. Evens out faint/shadowed regions of the scan so
-          downstream stages see every stroke at comparable brightness.
-       b. Bilateral Denoise (Step 2) — edge-preserving noise reduction.
-          Blurs flat noisy areas (background grain, JPEG block artefacts)
-          without softening genuine stroke edges.
-       c. Unsharp Mask (Step 2.5) — boosts high-frequency edge contrast
-          just before thresholding. Faint pencil strokes that would have
-          broken into dashes now survive as continuous lines.
-     Steps 3-5 are now a CLOSED ADAPTIVE LOOP (adaptive_binarize_and_clean):
-     measures foreground density + surviving blob count after each
-     threshold/morph/clean pass, and automatically retunes blockSize, C,
-     and minBlobArea if the result is outside the sane range (0.3%-8%
-     density, ≤60 blobs). Converges in 1 pass for clean scans; retries
-     up to 4× for difficult inputs. The attempt with the lowest "badness"
-     score is always kept even if perfect convergence is never reached.
+  3. FORCED "MASTER CX" RE-CENTERING
+     v9.1 snapped every shape's cx to a single master_cx (taken from
+     the largest rectangle). That is a door-lock-specific assumption
+     (one tall part, everything aligned on its vertical axis). For a
+     2-D layout like oven_top (4 corner cut-outs + 1 centre hole) this
+     actively MOVES every shape away from its true detected position,
+     producing exactly the "not well spaced" / offset symptom reported.
+     FIX: master-axis re-centering is removed entirely. Every shape's
+     (cx, cy) is the value measured directly from the image — DXF
+     geometry now matches the Canny image pixel-for-pixel.
 
 Pipeline:
-  1.   Load image
-  1.5  CLAHE adaptive contrast enhancement
-  2.   Bilateral edge-preserving denoise + median blur
-  2.5  Unsharp-mask edge sharpening
-  3-5. Adaptive closed-loop: threshold + MORPH_CLOSE + CC speckle filter
-  6.   Canny (visualisation / PDF preview only)
-  7.   Contour + Hierarchy (RETR_TREE on cleaned mask)
-  8.   Shape Classification (Kasa circle LS + angle-aware rect detector)
-  9.   Hierarchy Pairing (inner/outer → averaged centreline)
-  10.  Residual Dedup + Filter
-  10.5 Rectilinear Geometric Primitive Fitting (dedup + corner snap)
-  11.  DXF Export
-  12.  PNG Preview
-  13.  PDF Export
+  1.  Load image
+  2.  Median Blur                (salt-and-pepper pre-clean)
+  3.  Adaptive Threshold         (binarise, strokes = WHITE)
+  4.  Morph Open                 (remove small attached spurs)
+  5.  Connected-Component Filter (remove EVERY blob < minBlobArea — 100% dot removal)
+  6.  Canny Edge Detection       (visualisation / PDF preview only)
+  7.  Contour + Hierarchy        (cv2.findContours RETR_TREE on the CLEANED MASK)
+  8.  Shape Classification       (algebraic LS: Kasa circle fit w/ outlier trim + rect bbox)
+  9.  Hierarchy Pairing          (outer/inner stroke-edge pairs -> averaged centreline shape)
+  10. Residual Dedup + Filter    (proximity-average safety net, absolute-area noise filter)
+  11. DXF Export — CLEAN         (one CIRCLE or closed LWPOLYLINE per true shape, true cx/cy)
+  12. PNG Preview                (side-by-side: Canny vs final shapes)
+  13. PDF Export                 (reportlab)
 """
 
 import sys, os, json, time, traceback, math
@@ -134,53 +140,6 @@ def load_image(image_path):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# STEP 1.5-2.5 — ADAPTIVE CONTRAST / DENOISE / SHARPEN
-# ════════════════════════════════════════════════════════════════════════════
-
-def enhance_contrast_clahe(gray, clip_limit=2.5, tile_grid_size=(8, 8)):
-    """
-    Adaptive contrast enhancement (CLAHE — Contrast Limited Adaptive
-    Histogram Equalisation). Unlike a single global histogram equalisation,
-    CLAHE operates on local tiles and clips each tile's histogram before
-    redistributing it, so it boosts contrast in faint/unevenly-lit regions
-    of a scan or phone photo (a corner of the page caught in shadow, a
-    light pencil stroke) WITHOUT blowing out regions that already have
-    strong contrast or amplifying flat-noise into visible speckle. This
-    runs first, before any blur/denoise/threshold stage, so every
-    downstream stage sees a more evenly-lit, higher-contrast image.
-    """
-    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
-    return clahe.apply(gray)
-
-def denoise_edge_preserving(gray, d=7, sigma_color=50, sigma_space=50):
-    """
-    Edge-preserving denoise (bilateral filter). Knocks down sensor/scan
-    grain and JPEG-style noise while keeping real stroke edges sharp —
-    a plain Gaussian blur would soften genuine corners along with noise;
-    bilateral filtering only blurs across pixels that are also spatially
-    AND tonally close, so it smooths flat noisy regions but leaves a
-    pencil-stroke-to-background edge crisp. Runs ahead of the median blur,
-    which still handles any remaining salt-and-pepper outliers.
-    """
-    return cv2.bilateralFilter(gray, d, sigma_color, sigma_space)
-
-def sharpen_unsharp_mask(gray, amount=1.5, blur_ksize=5, blur_sigma=1.0):
-    """
-    Unsharp-mask edge sharpening: subtract a Gaussian-blurred copy of the
-    image from the (weighted) original to boost high-frequency edge
-    contrast right before binarisation. This is what lets faint pencil
-    strokes — already evened-out by CLAHE and cleaned by the bilateral
-    filter — survive adaptiveThreshold as a continuous line instead of
-    breaking into dashes.
-    """
-    if blur_ksize % 2 == 0:
-        blur_ksize += 1
-    blurred = cv2.GaussianBlur(gray, (blur_ksize, blur_ksize), blur_sigma)
-    sharpened = cv2.addWeighted(gray, 1.0 + amount, blurred, -amount, 0)
-    return sharpened
-
-
-# ════════════════════════════════════════════════════════════════════════════
 # STEPS 2-5 — DENOISE / BINARISE / SPECKLE REMOVAL
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -188,34 +147,29 @@ def median_blur(gray, ksize=5):
     if ksize % 2 == 0: ksize += 1
     return cv2.medianBlur(gray, ksize)
 
-def adaptive_threshold_binarize(blurred, block_size=15, c_val=4):
-    if block_size % 2 == 0:
-        block_size += 1
-    block_size = max(3, block_size)
+def adaptive_threshold_binarize(blurred):
     return cv2.adaptiveThreshold(
         blurred, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY_INV,
-        blockSize=block_size, C=c_val,
+        blockSize=15, C=4,
     )
 
 def morph_clean(binary):
     """
-    Single-stage morphological cleanup: MORPH_CLOSE only (3x3 ellipse).
-
-    MORPH_OPEN was removed — on noisier / lighter hand-drawn strokes the
-    open stage was eroding away legitimate thin corners and short spurs
-    before contour extraction ever saw them, which is a worse failure mode
-    than the speckle it was meant to catch (speckle removal is now owned
-    entirely by the exact connected-component filter in Step 5, which does
-    not erode real geometry). MORPH_CLOSE alone still fills tiny 1px
-    gaps/holes inside real strokes — keeping each stroke as ONE connected
-    component so it survives connected-component filtering as a single
-    blob, and giving findContours cleaner ring hierarchies for offset-pair
-    averaging — without removing or eroding any real geometry.
+    Two-stage morphological cleanup:
+      1. MORPH_OPEN (3x3 cross) — erodes away thin spurs/single-pixel
+         protrusions attached to real strokes.
+      2. MORPH_CLOSE (3x3 ellipse) — fills tiny 1px gaps/holes inside real
+         strokes (helps keep a stroke as ONE connected component so it
+         survives connected-component filtering as a single blob, and
+         gives findContours cleaner ring hierarchies for offset-pair
+         averaging).
     """
+    open_kernel  = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
     close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+    opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  open_kernel,  iterations=1)
+    closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, close_kernel, iterations=1)
     return closed
 
 def _remove_small_blobs_once(binary, min_area):
@@ -246,114 +200,25 @@ def remove_small_blobs(binary, min_area, aggressive=True):
     because its source scan simply had no speckle to begin with.
 
     When `aggressive=True` (default), a second pass is run: after the
-    first pass, a light MORPH_CLOSE (3x3 ellipse) is applied to the
-    surviving mask and a second connected-component pass re-checks it
-    against `min_area`. MORPH_OPEN (erosion-based) is no longer used
-    anywhere in this pipeline — every actual blob-removal decision here is
-    still made by the exact connected-component filter, never by erosion,
-    so no real geometry can be eaten away. This compounds cleanup beyond a
-    single pass while a stable mask (no further small blobs) exits early.
+    first pass, a light MORPH_OPEN (3x3 ellipse) erodes away any thin
+    remnants left clinging to surviving blobs (e.g. a speckle that was
+    8-connected to a real stroke and barely pushed it over `min_area`),
+    and a second connected-component pass removes anything that erosion
+    now drops below `min_area`. This compounds cleanup beyond a single
+    pass while a stable mask (no further small blobs) exits early.
     """
     cleaned, removed_blobs, removed_px = _remove_small_blobs_once(binary, min_area)
 
     if aggressive:
-        close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        reclosed = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, close_kernel, iterations=1)
-        cleaned2, rb2, rp2 = _remove_small_blobs_once(reclosed, min_area)
+        erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        eroded = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, erode_kernel, iterations=1)
+        cleaned2, rb2, rp2 = _remove_small_blobs_once(eroded, min_area)
         if rb2 > 0:
             cleaned = cleaned2
             removed_blobs += rb2
             removed_px += rp2
 
     return cleaned, removed_blobs, removed_px
-
-
-def adaptive_binarize_and_clean(sharpened, min_blob_area, max_iterations=4):
-    """
-    STEPS 3-5, CLOSED LOOP: runs adaptiveThreshold -> MORPH_CLOSE ->
-    connected-component speckle filtering, then measures how "sane" the
-    resulting mask is and — if it isn't — automatically retunes
-    adaptiveThreshold's blockSize/C and the blob-area floor and reruns,
-    instead of trusting one fixed set of parameters to work for every
-    input image.
-
-    Quality signal: foreground pixel DENSITY (stroke px / total px) and
-    surviving BLOB COUNT after speckle filtering. A clean hand-drawn
-    sketch on a sheet typically has strokes covering roughly 0.3%-8% of
-    the frame in a modest, stable number of blobs once real speckle is
-    gone:
-      - density too LOW  -> threshold was too strict, faint/legitimate
-        strokes were lost as background. Loosen it (lower C / smaller
-        blockSize pulls more grey pixels into "foreground").
-      - density too HIGH, or still many small blobs -> threshold (or the
-        blob-area floor) was too loose, background grain/shadow was
-        captured as foreground. Tighten both.
-    The loop stops as soon as the mask lands in the sane range, so most
-    clean scans converge in a single pass — and it is hard-capped at
-    `max_iterations` so a pathological image can never hang the pipeline;
-    whichever iteration produced the best (closest-to-sane) result is kept
-    even if true convergence was never reached.
-
-    Returns: cleaned, binary, removed_blobs, removed_px, history,
-             final_block_size, final_c, final_blob_floor
-    """
-    img_area    = float(sharpened.shape[0] * sharpened.shape[1])
-    block_size  = 15
-    c_val       = 4
-    blob_floor  = float(min_blob_area)
-
-    history = []
-    best         = None
-    best_badness = None
-
-    for it in range(max(1, max_iterations)):
-        binary = adaptive_threshold_binarize(sharpened, block_size=block_size, c_val=c_val)
-        closed = morph_clean(binary)
-        cleaned, removed_blobs, removed_px = remove_small_blobs(closed, blob_floor, aggressive=True)
-
-        fg_px       = int(np.count_nonzero(cleaned))
-        density     = fg_px / img_area
-        n_labels, _ = cv2.connectedComponents(cleaned, connectivity=8)
-        n_blobs     = n_labels - 1
-
-        # "Badness" = 0 when fully inside the sane window, otherwise how
-        # far outside it we are (used only to pick the least-bad attempt
-        # if every iteration falls short of the convergence test).
-        if density < 0.003:
-            density_badness = (0.003 - density) / 0.003
-        elif density > 0.08:
-            density_badness = (density - 0.08) / 0.08
-        else:
-            density_badness = 0.0
-        blob_badness = max(0.0, (n_blobs - 60) / 60.0)
-        badness = density_badness + blob_badness
-
-        history.append({
-            "iteration": it, "blockSize": block_size, "C": c_val,
-            "minBlobArea": round(blob_floor, 1),
-            "density": round(density, 5), "blobs": n_blobs,
-            "badness": round(badness, 4),
-        })
-
-        if best is None or badness < best_badness:
-            best = (cleaned, binary, removed_blobs, removed_px, block_size, c_val, blob_floor)
-            best_badness = badness
-
-        converged = (0.003 <= density <= 0.08) and (n_blobs <= 60)
-        if converged or it == max_iterations - 1:
-            break
-
-        if density < 0.003:
-            c_val      = max(1, c_val - 2)
-            block_size = max(7, block_size - 2)
-        else:
-            c_val      = c_val + 2
-            block_size = block_size + 2
-            blob_floor = blob_floor * 1.5
-
-    cleaned, binary, removed_blobs, removed_px, final_block, final_c, final_floor = best
-    return cleaned, binary, removed_blobs, removed_px, history, final_block, final_c, final_floor
-
 
 def canny_edges(cleaned, low_threshold=20, high_threshold=80):
     return cv2.Canny(cleaned, low_threshold, high_threshold)
@@ -376,7 +241,7 @@ def clean_edge_preview(edges, min_blob_area=3):
 # STEP 7 — CONTOUR + HIERARCHY EXTRACTION (on the CLEANED BINARY MASK)
 # ════════════════════════════════════════════════════════════════════════════
 
-def extract_contours_with_hierarchy(cleaned_mask, epsilon_factor=0.03):
+def extract_contours_with_hierarchy(cleaned_mask, epsilon_factor=0.5):
     """
     Find contours of the cleaned stroke mask using RETR_TREE so that the
     inner/outer edge of every drawn ring (rectangle outline, circle outline)
@@ -462,51 +327,6 @@ def _fit_rect_algebraic(pts_xy):
     h    = float(y.max() - y.min())
     return cx, cy, w, h
 
-def _is_rectangle_like(pts_xy, angle_tol_deg=25.0, min_fraction_near_90=0.7):
-    """
-    True if a (closed) contour's vertices form a rectangle-like shape —
-    i.e. MOST interior corner angles cluster around 90°. This deliberately
-    does NOT require exactly 4 vertices: approxPolyDP frequently splits one
-    true 90° corner of a hand-drawn or slightly noisy rectangle into two
-    nearby points (or leaves an extra near-collinear point along a long
-    edge), so a real rectangle can legitimately come through with 4-8
-    vertices. What it must NOT have is a genuinely different polygon shape
-    (an L-bracket, notch, hexagon, etc.) masquerading as a rectangle just
-    because it happens to have <=8 points — those have several angles far
-    from 90° and are correctly rejected here so they stay classified as
-    'poly' instead of being collapsed into a wrong bounding-box rectangle.
-    """
-    n = len(pts_xy)
-    if n < 4 or n > 8:
-        return False
-
-    near_90 = 0
-    counted = 0
-    for i in range(n):
-        p_prev = pts_xy[(i - 1) % n]
-        p_curr = pts_xy[i]
-        p_next = pts_xy[(i + 1) % n]
-        v1 = p_prev - p_curr
-        v2 = p_next - p_curr
-        n1 = math.hypot(v1[0], v1[1])
-        n2 = math.hypot(v2[0], v2[1])
-        if n1 < 1e-6 or n2 < 1e-6:
-            continue  # degenerate/duplicate vertex — skip, don't count against it
-        cos_a = (v1[0] * v2[0] + v1[1] * v2[1]) / (n1 * n2)
-        cos_a = max(-1.0, min(1.0, cos_a))
-        angle_deg = math.degrees(math.acos(cos_a))
-        counted += 1
-        # Accept angles near 90° (a true corner) OR near 180° (a spurious
-        # near-collinear extra point sitting along an otherwise-straight
-        # edge — common approxPolyDP artefact, not a real corner).
-        if abs(angle_deg - 90.0) <= angle_tol_deg or angle_deg >= (180.0 - angle_tol_deg):
-            near_90 += 1
-
-    if counted == 0:
-        return False
-    return (near_90 / counted) >= min_fraction_near_90
-
-
 def _classify_contour(pts_xy, min_pts_for_circle=12, circle_rms_tol=0.12):
     x, y = pts_xy[:, 0], pts_xy[:, 1]
     w = float(x.max() - x.min())
@@ -532,32 +352,23 @@ def _classify_contour(pts_xy, min_pts_for_circle=12, circle_rms_tol=0.12):
         except Exception:
             pass
 
-    # Rectangle detector: 4-8 vertices is enough for a real rectangle —
-    # approxPolyDP can legitimately split one true 90° corner into two
-    # close points, or leave an extra near-collinear point on a long edge,
-    # without the shape being anything other than a rectangle. So instead
-    # of requiring exactly 4 points, we check the actual corner geometry
-    # via `_is_rectangle_like` (interior angles clustering around 90°).
-    if _is_rectangle_like(pts_xy):
-        cx_b, cy_b, w_b, h_b = _fit_rect_algebraic(pts_xy)
+    # For complex shapes with many vertices, keep as polygon instead of bounding box
+    if len(pts_xy) > 8:
         return {
-            'type': 'rect',
-            'cx': cx_b, 'cy': cy_b, 'w': w_b, 'h': h_b,
-            'area': w_b * h_b,
+            'type': 'poly',
+            'points': pts_xy.tolist(),  # Keep all approxPolyDP vertices
+            'area': cv2.contourArea(np.array(pts_xy, dtype=np.float32).reshape(-1, 1, 2)),
+            'w': w, 'h': h,
+            'cx': (x.min() + x.max()) / 2.0,
+            'cy': (y.min() + y.max()) / 2.0,
         }
 
-    # Everything else — true complex/many-vertex shapes, and any 4-8 vertex
-    # contour whose angles DON'T cluster around 90° (so it isn't actually
-    # rectangular: L-brackets, notches, hexagons, etc.) — is kept as a
-    # polygon with its real vertices, instead of being forced into a
-    # bounding-box rectangle that would misrepresent its true shape.
+    # Simple rectangle fallback for truly simple 4-corner shapes
+    cx_b, cy_b, w_b, h_b = _fit_rect_algebraic(pts_xy)
     return {
-        'type': 'poly',
-        'points': pts_xy.tolist(),  # Keep all approxPolyDP vertices
-        'area': cv2.contourArea(np.array(pts_xy, dtype=np.float32).reshape(-1, 1, 2)),
-        'w': w, 'h': h,
-        'cx': (x.min() + x.max()) / 2.0,
-        'cy': (y.min() + y.max()) / 2.0,
+        'type': 'rect',
+        'cx': cx_b, 'cy': cy_b, 'w': w_b, 'h': h_b,
+        'area': w_b * h_b,
     }
 
 
@@ -876,8 +687,8 @@ def build_clean_shapes(simplified_contours, parents, children, img_w, img_h,
     paired = pair_by_hierarchy(classified, parents, children)
     paired = [s for s in paired if s is not None]
 
-    # === NEW: 145px² area filter ===
-    paired = [s for s in paired if s['area'] >= 145.0]
+    # === NEW: 190px² area filter ===
+    paired = [s for s in paired if s['area'] >= 190.0]
 
     # Step 2: residual proximity dedup, per type
     circles = [s for s in paired if s['type'] == 'circle']
@@ -1368,6 +1179,26 @@ def build_comparison_png(edges, final_shapes, img_w, img_h, out_path):
                 # Draw polygon using all vertices
                 pts = np.array([[int(p[0]), int(p[1])] for p in s['points']], dtype=np.int32)
                 cv2.polylines(right, [pts], True, (80, 200, 80), 2, cv2.LINE_AA)
+              
+            elif s['type'] == 'poly':
+                # Draw each segment individually
+                segments = s.get('segments', [])
+                if segments:
+                    for seg in segments:
+                        if seg['type'] == 'H':
+                            y = int(round(seg['coord']))
+                            x1 = int(round(seg['start']))
+                            x2 = int(round(seg['end']))
+                            cv2.line(right, (x1, y), (x2, y), (80, 200, 80), 2, cv2.LINE_AA)
+                        else:
+                            x = int(round(seg['coord']))
+                            y1 = int(round(seg['start']))
+                            y2 = int(round(seg['end']))
+                            cv2.line(right, (x, y1), (x, y2), (80, 200, 80), 2, cv2.LINE_AA)
+                else:
+                    # Fallback
+                    pts = np.array([[int(p[0]), int(p[1])] for p in s['points']], dtype=np.int32)
+                    cv2.polylines(right, [pts], True, (80, 200, 80), 2, cv2.LINE_AA)
 
         sep   = np.full((img_h, 4, 3), 40, dtype=np.uint8)
         panel = np.concatenate([left, sep, right], axis=1)
@@ -1482,7 +1313,7 @@ def main():
     blur_ksize     = int(opts.get("blurKsize",    7))    # ksize=21 tested — degrades results, see notes
     canny_low      = int(opts.get("cannyLow",    20))
     canny_high     = int(opts.get("cannyHigh",   80))
-    epsilon_factor = float(opts.get("epsilonFactor", 0.03))
+    epsilon_factor = float(opts.get("epsilonFactor", 0.5))
     min_blob_area  = int(opts.get("minBlobArea", 20))    # ← changed from 50; user-requested <20px
     min_shape_area = opts.get("minShapeArea", None)       # px-area: absolute noise filter
     if min_shape_area is not None:
@@ -1502,44 +1333,30 @@ def main():
     bgr, gray, dpi, img_w, img_h = load_image(image_path)
     steps.append(step_record("CV-1: Load Image", f"{img_w}×{img_h}px  DPI={dpi:.0f}", t0))
 
-    # ── STEP 1.5: Adaptive Contrast Enhancement (CLAHE) ─────────────────────
+    # ── STEP 2: Median Blur ───────────────────────────────────────────────
     t0 = now_ms()
-    contrast_enhanced = enhance_contrast_clahe(gray)
-    steps.append(step_record("CV-1.5: Adaptive Contrast Enhancement (CLAHE)",
-                              "Local contrast normalised — faint strokes evened out", t0))
+    blurred = median_blur(gray, ksize=blur_ksize)
+    steps.append(step_record(f"CV-2: Median Blur (ksize={blur_ksize})", "Noise reduced", t0))
 
-    # ── STEP 2: Edge-Preserving Denoise + Median Blur ───────────────────────
+    # ── STEP 3: Adaptive Threshold ───────────────────────────────────────
     t0 = now_ms()
-    denoised = denoise_edge_preserving(contrast_enhanced)
-    blurred  = median_blur(denoised, ksize=blur_ksize)
-    steps.append(step_record(f"CV-2: Bilateral Denoise + Median Blur (ksize={blur_ksize})",
-                              "Grain/salt-and-pepper noise reduced, edges preserved", t0))
-
-    # ── STEP 2.5: Unsharp-Mask Edge Sharpening ──────────────────────────────
-    t0 = now_ms()
-    sharpened = sharpen_unsharp_mask(blurred)
-    steps.append(step_record("CV-2.5: Unsharp Mask Sharpening",
-                              "High-frequency stroke edges boosted before thresholding", t0))
-
-    # ── STEPS 3-5: Adaptive Threshold + Morph Close + Speckle Removal ──────
-    # Closed loop: automatically retunes blockSize/C/minBlobArea and reruns
-    # until the cleaned mask's foreground density + blob count settle into
-    # the sane range (or the iteration cap is hit), instead of trusting one
-    # fixed set of parameters for every image.
-    t0 = now_ms()
-    (cleaned, binary, removed_blobs, removed_px, adapt_history,
-     final_block, final_c, final_floor) = adaptive_binarize_and_clean(
-        sharpened, min_blob_area, max_iterations=4)
+    binary   = adaptive_threshold_binarize(blurred)
     white_px = int(np.count_nonzero(binary))
-    final_density = adapt_history[-1]["density"] if adapt_history else 0.0
+    steps.append(step_record("CV-3: Adaptive Threshold", f"{white_px} white px", t0))
+
+    # ── STEP 4: Morph Open + Close ───────────────────────────────────────
+    t0 = now_ms()
+    opened    = morph_clean(binary)
+    opened_px = int(np.count_nonzero(opened))
+    steps.append(step_record("CV-4: MORPH_OPEN (3x3 cross) + MORPH_CLOSE (3x3 ellipse)",
+                              f"{white_px - opened_px} net px change (spurs removed / 1px gaps filled)", t0))
+
+    # ── STEP 5: Connected-Component Speckle Removal (two-pass aggressive) ─
+    t0 = now_ms()
+    cleaned, removed_blobs, removed_px = remove_small_blobs(opened, min_blob_area, aggressive=True)
     steps.append(step_record(
-        f"CV-3/4/5: Adaptive Threshold + MORPH_CLOSE + Speckle Filter "
-        f"({len(adapt_history)} pass(es), converged blockSize={final_block} C={final_c} "
-        f"minBlobArea={final_floor:.0f}px)",
-        f"{removed_blobs} speckle blob(s) removed ({removed_px}px), "
-        f"final foreground density {final_density*100:.2f}% — adaptive convergence", t0))
-
-
+        f"CV-5: Two-pass Connected-Component Filter (minBlobArea={min_blob_area}px)",
+        f"{removed_blobs} speckle blob(s) removed ({removed_px}px) — 100% dot-free mask", t0))
 
     # ── STEP 6: Canny (visualisation only) ────────────────────────────────
     t0 = now_ms()
@@ -1557,6 +1374,7 @@ def main():
         f"CV-7: findContours(RETR_TREE) on cleaned mask + approxPolyDP (ε={epsilon_factor})",
         f"{len(simplified_contours)} contours  |  {total_pts} vertices", t0))
 
+    # ── STEP 8-10: classify, pair, dedup, filter ───────────────────────────
     # ── STEP 8-10: classify, pair, dedup, filter ───────────────────────────
     t0 = now_ms()
     final_shapes, circles_f, rects_f, polys_f = build_clean_shapes(
@@ -1634,38 +1452,32 @@ def main():
     n_rect_final = sum(1 for s in final_shapes if s['type'] == 'rect')
     n_poly_final = sum(1 for s in final_shapes if s['type'] == 'poly')
     analysis = {
-        "width"                  : float(img_w),
-        "height"                 : float(img_h),
-        "dpi"                    : dpi,
-        "edgePixels"             : edge_px,
-        "edges"                  : entity_count,
-        "contours"               : len(simplified_contours),
-        "mergedContours"         : len(final_shapes),
-        "closedContours"         : len(final_shapes),
-        "totalVertices"          : total_pts,
-        "blurKsize"              : blur_ksize,
-        "cannyLow"               : canny_low,
-        "cannyHigh"              : canny_high,
-        "epsilonFactor"          : epsilon_factor,
-        "minBlobArea"            : min_blob_area,
-        "hardMinShapeAreaPx"     : HARD_MIN_SHAPE_AREA_PX,
-        "speckleBlobsRemoved"    : removed_blobs,
-        "adaptivePipelinePasses" : len(adapt_history),
-        "adaptiveHistory"        : adapt_history,
-        "finalBlockSize"         : final_block,
-        "finalC"                 : final_c,
-        "finalBlobFloor"         : round(final_floor, 1),
-        "imgW"                   : img_w,
-        "imgH"                   : img_h,
-        "scaleMmPerDu"           : round(25.4 / dpi, 4),
-        "coordSystem"            : "origin=top-left px, Y-down (image convention), no offset/re-centering",
-        "circlesDetected"        : n_circ_final,
-        "rectsDetected"          : n_rect_final,
-        "polysDetected"          : n_poly_final,
-        "shapeSummary"           : (
+        "width"          : float(img_w),
+        "height"         : float(img_h),
+        "dpi"            : dpi,
+        "edgePixels"     : edge_px,
+        "edges"          : entity_count,
+        "contours"       : len(simplified_contours),
+        "mergedContours" : len(final_shapes),
+        "closedContours" : len(final_shapes),
+        "totalVertices"  : total_pts,
+        "blurKsize"      : blur_ksize,
+        "cannyLow"       : canny_low,
+        "cannyHigh"      : canny_high,
+        "epsilonFactor"  : epsilon_factor,
+        "minBlobArea"    : min_blob_area,
+        "hardMinShapeAreaPx": HARD_MIN_SHAPE_AREA_PX,        "speckleBlobsRemoved": removed_blobs,
+        "imgW"           : img_w,
+        "imgH"           : img_h,
+        "scaleMmPerDu"   : round(25.4 / dpi, 4),
+        "coordSystem"    : "origin=top-left px, Y-down (image convention), no offset/re-centering",
+        "circlesDetected": n_circ_final,
+        "rectsDetected"  : n_rect_final,
+        "polysDetected": n_poly_final,
+        "shapeSummary"   : (
             f"{n_rect_final} rectangle(s), {n_circ_final} circle(s), {n_poly_final} polygon(s)"
-            f" — CLAHE + bilateral denoise + unsharp sharpen + adaptive closed-loop threshold,"
-            f" speckle-free mask, hierarchy offset-pairs averaged to centreline, true measured positions"
+            f" — speckle-free mask, hierarchy offset-pairs averaged to centreline,"
+            f" true measured positions"
         ),
     }
 
