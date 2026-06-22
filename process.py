@@ -687,9 +687,6 @@ def build_clean_shapes(simplified_contours, parents, children, img_w, img_h,
     paired = pair_by_hierarchy(classified, parents, children)
     paired = [s for s in paired if s is not None]
 
-    # === NEW: 190px² area filter ===
-    paired = [s for s in paired if s['area'] >= 190.0]
-
     # Step 2: residual proximity dedup, per type
     circles = [s for s in paired if s['type'] == 'circle']
     rects   = [s for s in paired if s['type'] == 'rect']
