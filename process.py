@@ -351,7 +351,16 @@ def _classify_contour(pts_xy, min_pts_for_circle=12, circle_rms_tol=0.12):
                 }
         except Exception:
             pass
+    # ═══════════════════════════════════════════════════════════════════════
+    # NEW: Try rectangle detection from poly points (v2 — robust for hand-drawn)
+    # ═══════════════════════════════════════════════════════════════════════
+    if len(pts_xy) >= 8:  # Only for shapes with many points (not simple 4-corner rects)
+        rect = detect_rectangle_from_poly_points_v2(pts_xy)
+        if rect:
+            return rect  # Returns {'type': 'rect', 'cx': ..., 'cy': ..., 'w': ..., 'h': ...}
 
+
+  
     # For complex shapes with many vertices, keep as polygon instead of bounding box
     if len(pts_xy) > 8:
         return {
@@ -1055,6 +1064,9 @@ def apply_rectilinear_fitting(final_shapes, simplified_contours,
                     dedup_tol=dedup_tol, dedup_slack=dedup_slack, corner_snap_tol=corner_snap_tol)
                 fitted['segments'] = segments
                 fitted_shapes.append(fitted)
+                rect = detect_rectangle_from_segments(fitted, tol=15.0)
+            if rect['type'] == 'rect':
+                fitted_shapes.append(rect)
             else:
                 fitted_shapes.append(shape)
         else:
@@ -1417,6 +1429,13 @@ def main():
     dxf_path = server_out_dir / dxf_name
     pdf_path = server_out_dir / pdf_name
     png_path = server_out_dir / png_name
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # NEW STEP 10.6: Convert remaining polys to rects if segments form rectangles
+    # ═══════════════════════════════════════════════════════════════════════
+    final_shapes = convert_polys_to_rects(final_shapes, tol=15.0)
+
+    n_rectilinear = sum(1 for s in final_shapes if s.get('rectilinear'))
 
     # ── STEP 11: Clean DXF export ─────────────────────────────────────────
     t0 = now_ms()
