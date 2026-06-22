@@ -327,38 +327,6 @@ def _fit_rect_algebraic(pts_xy):
     h    = float(y.max() - y.min())
     return cx, cy, w, h
 
-def _is_rectilinear_shape(pts_xy, orthogonal_ratio=0.80):
-    """
-    Return True if the polygon defined by pts_xy is predominantly axis-aligned
-    (rectilinear rectangle or L/U/T shape).  We check what fraction of the
-    perimeter-weighted edge length is accounted for by edges that are either
-    horizontal or vertical (within 15 degrees).  A true rectangle has 100 %;
-    we accept shapes above orthogonal_ratio (default 80 %) so that slightly
-    hand-drawn or rasterisation-artefact corners still qualify.
-    """
-    n = len(pts_xy)
-    if n < 3:
-        return False
-    total_len = 0.0
-    ortho_len = 0.0
-    for i in range(n):
-        p1 = pts_xy[i]
-        p2 = pts_xy[(i + 1) % n]
-        dx = abs(p2[0] - p1[0])
-        dy = abs(p2[1] - p1[1])
-        seg_len = math.hypot(dx, dy)
-        if seg_len < 1e-6:
-            continue
-        total_len += seg_len
-        angle = math.atan2(dy, dx)  # 0..pi/2
-        # Within 15 degrees of 0 or 90 degrees
-        if angle <= math.radians(15) or angle >= math.radians(75):
-            ortho_len += seg_len
-    if total_len < 1e-6:
-        return False
-    return (ortho_len / total_len) >= orthogonal_ratio
-
-
 def _classify_contour(pts_xy, min_pts_for_circle=12, circle_rms_tol=0.12):
     x, y = pts_xy[:, 0], pts_xy[:, 1]
     w = float(x.max() - x.min())
@@ -368,7 +336,7 @@ def _classify_contour(pts_xy, min_pts_for_circle=12, circle_rms_tol=0.12):
 
     aspect = min(w, h) / max(w, h)
 
-    # ── 1. Try circle fit ──────────────────────────────────────────────────
+    # Try circle fit first
     if aspect > 0.60 and len(pts_xy) >= min_pts_for_circle:
         try:
             cx, cy, r, rms = _fit_circle_algebraic(pts_xy, outlier_trim_passes=1)
@@ -384,36 +352,18 @@ def _classify_contour(pts_xy, min_pts_for_circle=12, circle_rms_tol=0.12):
         except Exception:
             pass
 
-    # ── 2. Prioritise RECTANGLE for shapes that are clearly axis-aligned ──
-    #
-    # v12 FIX: Previously any contour with >8 approxPolyDP vertices was
-    # immediately routed to 'poly', even when those vertices simply trace the
-    # slightly-uneven rasterised edges of a perfect rectangle.  We now check
-    # whether the contour is predominantly rectilinear FIRST.  If it is, we
-    # fit a bounding-box rectangle and classify it as 'rect'.  Only truly
-    # non-rectilinear shapes (diagonals, L/U cuts with internal notches) fall
-    # through to 'poly'.
-    if _is_rectilinear_shape(pts_xy, orthogonal_ratio=0.80):
-        cx_b, cy_b, w_b, h_b = _fit_rect_algebraic(pts_xy)
-        if w_b > 1e-3 and h_b > 1e-3:
-            return {
-                'type': 'rect',
-                'cx': cx_b, 'cy': cy_b, 'w': w_b, 'h': h_b,
-                'area': w_b * h_b,
-            }
-
-    # ── 3. Complex / non-rectilinear polygon ──────────────────────────────
+    # For complex shapes with many vertices, keep as polygon instead of bounding box
     if len(pts_xy) > 8:
         return {
             'type': 'poly',
-            'points': pts_xy.tolist(),
+            'points': pts_xy.tolist(),  # Keep all approxPolyDP vertices
             'area': cv2.contourArea(np.array(pts_xy, dtype=np.float32).reshape(-1, 1, 2)),
             'w': w, 'h': h,
             'cx': (x.min() + x.max()) / 2.0,
             'cy': (y.min() + y.max()) / 2.0,
         }
 
-    # ── 4. Simple 4-corner rect fallback ──────────────────────────────────
+    # Simple rectangle fallback for truly simple 4-corner shapes
     cx_b, cy_b, w_b, h_b = _fit_rect_algebraic(pts_xy)
     return {
         'type': 'rect',
@@ -1116,78 +1066,10 @@ def apply_rectilinear_fitting(final_shapes, simplified_contours,
 # STEP 11 — CLEAN DXF EXPORT (one entity per shape, true detected position)
 # ════════════════════════════════════════════════════════════════════════════
 
-def _build_connected_chain_from_segments(segments):
-    """
-    v12: Convert a list of H/V segment dicts into an ordered list of (x, y)
-    vertices that form a single closed, connected polyline.
-
-    Strategy:
-    1. Convert every segment to a pair of endpoints: (x1,y1), (x2,y2).
-    2. Greedily walk from the first endpoint, always picking the unused endpoint
-       whose start or end is closest to the current position (nearest-neighbour
-       chain traversal), reversing segments as needed.
-    3. Return the ordered vertex list (without duplicating the closing vertex
-       — the caller passes closed=True to the LWPOLYLINE).
-
-    This produces a single connected LWPOLYLINE instead of a pile of
-    individually-exported 2-point segments, fixing the "orphaned / disconnected
-    vectors" issue reported for v11.
-    """
-    if not segments:
-        return []
-
-    # Build mutable endpoint pairs, one per segment
-    pairs = []
-    for seg in segments:
-        if seg['type'] == 'H':
-            pairs.append([(seg['start'], seg['coord']), (seg['end'], seg['coord'])])
-        else:  # 'V'
-            pairs.append([(seg['coord'], seg['start']), (seg['coord'], seg['end'])])
-
-    n = len(pairs)
-    used = [False] * n
-
-    # Start with the first segment
-    chain = list(pairs[0])
-    used[0] = True
-
-    for _ in range(n - 1):
-        tail = chain[-1]
-        best_idx, best_d, best_rev = -1, float('inf'), False
-        for j in range(n):
-            if used[j]:
-                continue
-            # Try both orientations of the candidate segment
-            for rev, (ep_a, ep_b) in [(False, (pairs[j][0], pairs[j][1])),
-                                       (True,  (pairs[j][1], pairs[j][0]))]:
-                d = math.hypot(tail[0] - ep_a[0], tail[1] - ep_a[1])
-                if d < best_d:
-                    best_d, best_idx, best_rev = d, j, rev
-
-        if best_idx == -1:
-            break
-        seg_pair = pairs[best_idx]
-        if best_rev:
-            chain.append(seg_pair[0])
-        else:
-            chain.append(seg_pair[1])
-        used[best_idx] = True
-
-    return chain
-
-
 def build_clean_dxf(final_shapes, img_w, img_h, out_path):
     """
-    v12: Exports clean, fully-connected DXF entities.
-
-    Key fixes vs v11:
-    - Rectangles (type='rect'): single closed LWPOLYLINE with 4 corners.
-    - Polygons  (type='poly'): H/V segments are chained into ONE closed
-      LWPOLYLINE (_build_connected_chain_from_segments) instead of exported as
-      individual 2-point open segments — so every shape has no orphaned vectors.
-    - Circles: standard CIRCLE entity (unchanged).
-    - Layer structure retained; individual LINE entities are also added so CAM
-      tools that can't handle LWPOLYLINE still see every edge.
+    FIXED v10.2: Exports each rectilinear segment as a separate 2-point LWPOLYLINE.
+    Circles remain as CIRCLE entities. Each line segment is individually editable.
     """
     if not HAS_DXF or not final_shapes:
         return None, 0, 0
@@ -1200,16 +1082,16 @@ def build_clean_dxf(final_shapes, img_w, img_h, out_path):
     doc.header["$LIMMAX"]   = (float(img_w), float(img_h))
 
     msp = doc.modelspace()
-    doc.layers.new("SHAPES",   dxfattribs={"color": 7,  "linetype": "CONTINUOUS"})
-    doc.layers.new("CIRCLES",  dxfattribs={"color": 1,  "linetype": "CONTINUOUS"})
-    doc.layers.new("RECTS",    dxfattribs={"color": 3,  "linetype": "CONTINUOUS"})
-    doc.layers.new("POLYS",    dxfattribs={"color": 5,  "linetype": "CONTINUOUS"})
+    doc.layers.new("SHAPES",  dxfattribs={"color": 7,  "linetype": "CONTINUOUS"})
+    doc.layers.new("CIRCLES", dxfattribs={"color": 1,  "linetype": "CONTINUOUS"})
+    doc.layers.new("RECTS",   dxfattribs={"color": 3,  "linetype": "CONTINUOUS"})
+    doc.layers.new("H_LINES", dxfattribs={"color": 5,  "linetype": "CONTINUOUS"})
+    doc.layers.new("V_LINES", dxfattribs={"color": 6,  "linetype": "CONTINUOUS"})
 
     entity_count = 0
 
     for s in final_shapes:
         if s['type'] == 'circle':
-            # ── Full circle ────────────────────────────────────────────────
             msp.add_circle(
                 (s['cx'], s['cy'], 0.0),
                 s['r'],
@@ -1217,12 +1099,45 @@ def build_clean_dxf(final_shapes, img_w, img_h, out_path):
             )
             entity_count += 1
 
+        elif s['type'] == 'poly':
+            # FIXED v10.2: Export each segment as a separate 2-point LWPOLYLINE
+            segments = s.get('segments', [])
+            if segments:
+                for seg in segments:
+                    if seg['type'] == 'H':
+                        # Horizontal line: (x1, y) -> (x2, y)
+                        y = seg['coord']
+                        x1 = seg['start']
+                        x2 = seg['end']
+                        pts = [(x1, y), (x2, y)]
+                        layer = "H_LINES"
+                    else:
+                        # Vertical line: (x, y1) -> (x, y2)
+                        x = seg['coord']
+                        y1 = seg['start']
+                        y2 = seg['end']
+                        pts = [(x, y1), (x, y2)]
+                        layer = "V_LINES"
+                    
+                    line = msp.add_lwpolyline(
+                        pts, format="xy",
+                        dxfattribs={"layer": layer, "color": 256}
+                    )
+                    # Don't close - these are open line segments
+                    entity_count += 1
+            else:
+                # Fallback: export as single polygon if no segments
+                pts = [(p[0], p[1]) for p in s['points']]
+                poly = msp.add_lwpolyline(
+                    pts, format="xy",
+                    dxfattribs={"layer": "SHAPES", "color": 256}
+                )
+                poly.close(True)
+                entity_count += 1
+
         elif s['type'] == 'rect':
-            # ── Closed rectangle as single connected LWPOLYLINE ────────────
-            x0 = s['cx'] - s['w'] / 2.0
-            y0 = s['cy'] - s['h'] / 2.0
-            x1 = s['cx'] + s['w'] / 2.0
-            y1 = s['cy'] + s['h'] / 2.0
+            x0, y0 = s['cx'] - s['w'] / 2.0, s['cy'] - s['h'] / 2.0
+            x1, y1 = s['cx'] + s['w'] / 2.0, s['cy'] + s['h'] / 2.0
             pts = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
             poly = msp.add_lwpolyline(
                 pts, format="xy",
@@ -1230,45 +1145,6 @@ def build_clean_dxf(final_shapes, img_w, img_h, out_path):
             )
             poly.close(True)
             entity_count += 1
-
-        elif s['type'] == 'poly':
-            # ── v12 FIX: chain H/V segments into ONE connected closed LWPOLYLINE
-            segments = s.get('segments', [])
-            if segments:
-                chain = _build_connected_chain_from_segments(segments)
-                if len(chain) >= 2:
-                    poly = msp.add_lwpolyline(
-                        chain, format="xy",
-                        dxfattribs={"layer": "POLYS", "color": 256}
-                    )
-                    poly.close(True)
-                    entity_count += 1
-                else:
-                    # Chain degenerate — fall back to individual LINE entities
-                    for seg in segments:
-                        if seg['type'] == 'H':
-                            msp.add_line(
-                                (seg['start'], seg['coord'], 0.0),
-                                (seg['end'],   seg['coord'], 0.0),
-                                dxfattribs={"layer": "POLYS", "color": 256}
-                            )
-                        else:
-                            msp.add_line(
-                                (seg['coord'], seg['start'], 0.0),
-                                (seg['coord'], seg['end'],   0.0),
-                                dxfattribs={"layer": "POLYS", "color": 256}
-                            )
-                        entity_count += 1
-            else:
-                # No segments — export raw polygon points as closed LWPOLYLINE
-                pts = [(float(p[0]), float(p[1])) for p in s.get('points', [])]
-                if len(pts) >= 2:
-                    poly = msp.add_lwpolyline(
-                        pts, format="xy",
-                        dxfattribs={"layer": "SHAPES", "color": 256}
-                    )
-                    poly.close(True)
-                    entity_count += 1
 
     doc.saveas(str(out_path))
     file_size = out_path.stat().st_size
@@ -1392,7 +1268,7 @@ def export_pdf(edges, out_path, orig_bgr=None):
         c.setFillColorRGB(0.3, 0.35, 0.4)
         c.setFont("Helvetica", 8)
         c.drawCentredString(page_w / 2, 12,
-                            "SheetForge v12  •  Rect-Priority Classifier + Connected LWPOLYLINE Export")
+                            "SheetForge v11  •  Dedup + Extend-to-Intersect Corner Snap  •  Clean DXF")
         c.save()
 
         for f in tmp_files:
