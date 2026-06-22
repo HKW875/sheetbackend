@@ -329,7 +329,7 @@ def _fit_rect_algebraic(pts_xy):
 
 
 # In _classify_contour, check aspect ratio BEFORE vertex count:
-def _classify_contour(pts_xy, ...):
+def _classify_contour(pts_xy):
     x, y = pts_xy[:, 0], pts_xy[:, 1]
     w, h = float(x.max() - x.min()), float(y.max() - y.min())
     aspect = min(w, h) / max(w, h)
