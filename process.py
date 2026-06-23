@@ -448,7 +448,7 @@ def detect_circles_and_rectilinear(cleaned_mask):
 
             'ellipse_ratio': float(np.mean([c['ellipse_ratio'] for c in group])),
 
-            'rms': float(min(c['rms'] for c in group]))
+            'rms': float(min(c['rms'] for c in group])
         })
 
     circles = merged
