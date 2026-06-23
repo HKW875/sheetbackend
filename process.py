@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SheetForge — CV Pipeline  v12  (Algebraic LS + Contour H/V Fitting)
+SheetForge — CV Pipeline  v13  (HoughCircles + Hierarchy Ring Merge + Circle-Priority)
 ================================================================
 Receives: image_path, options_json (from node child_process)
 Outputs:  JSON on stdout  { steps, analysis, dwg, dxfContent, pdfAvailable }
@@ -155,7 +155,8 @@ def clean_edge_preview(edges, min_blob_area=3):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# STEPS 7-8 — CONTOUR EXTRACTION + CIRCLE DETECTION (Kasa Algebraic LS)
+# STEPS 7-8 — CONTOUR EXTRACTION + CIRCLE DETECTION (v13: HoughCircles +
+#              Contour Hierarchy inner/outer merge + Circle-Priority suppression)
 # ════════════════════════════════════════════════════════════════════════════
 
 def _kasa_circle_fit(pts_xy):
@@ -169,77 +170,330 @@ def _kasa_circle_fit(pts_xy):
     r = math.sqrt(abs(res[2] + cx**2 + cy**2))
     return cx, cy, r
 
+
+def _hough_circles(cleaned_mask):
+    """
+    HoughCircles prefilter: targeted sweep to find circles the contour
+    classifier might miss (e.g. thick-stroked rings that look boxy).
+    Returns list of {'cx','cy','r'} dicts.
+
+    Conservative thresholds are used so only geometrically convincing
+    circles are returned; spurious Hough noise is filtered by:
+      - high accumulator threshold (param2)
+      - minDist large enough to separate real circles
+      - radius sanity bounds (min 20px, max 30% of image diagonal)
+      - centre must lie within the image bounds
+    """
+    blurred = cv2.GaussianBlur(cleaned_mask, (9, 9), 2)
+    h, w = blurred.shape
+    img_diag = math.hypot(w, h)
+
+    raw = cv2.HoughCircles(
+        blurred,
+        cv2.HOUGH_GRADIENT,
+        dp=1.5,
+        minDist=max(40, int(img_diag * 0.06)),   # circles must be well-separated
+        param1=120,   # Canny high threshold
+        param2=65,    # accumulator threshold — high to avoid paper-texture arcs
+        minRadius=max(20, int(img_diag * 0.01)),
+        maxRadius=int(img_diag * 0.30),
+    )
+    results = []
+    if raw is not None:
+        for cx, cy, r in raw[0]:
+            # Centre must be reasonably inside the image
+            if cx - r < -r * 0.5 or cy - r < -r * 0.5:
+                continue
+            if cx + r > w + r * 0.5 or cy + r > h + r * 0.5:
+                continue
+            results.append({'cx': float(cx), 'cy': float(cy), 'r': float(r),
+                            'rms': 0.0, 'source': 'hough'})
+    return results
+
+
+def _stroke_width_radius(cleaned_mask, cx, cy, r):
+    """
+    Estimate the stroke half-width around a circle centre at radius r
+    by sampling pixel intensity along radial directions.
+    Returns half the stroke width in pixels.
+    """
+    N = 36
+    inner_hits, outer_hits = [], []
+    for k in range(N):
+        angle = 2 * math.pi * k / N
+        cos_a, sin_a = math.cos(angle), math.sin(angle)
+        # scan outward
+        for dr in range(int(r * 0.5), int(r * 1.8)):
+            px = int(round(cx + cos_a * dr))
+            py = int(round(cy + sin_a * dr))
+            if 0 <= py < cleaned_mask.shape[0] and 0 <= px < cleaned_mask.shape[1]:
+                if cleaned_mask[py, px] > 0:
+                    if not inner_hits or dr - inner_hits[-1] > 3:
+                        inner_hits.append(dr)
+                    outer_hits.append(dr)
+    if not outer_hits:
+        return 3.0
+    return max(3.0, float(np.median(outer_hits) - np.median(inner_hits)) / 2.0)
+
+
+def _merge_circle_pool(pool):
+    """
+    Merge nearby/duplicate circles in a pool using centre-distance + radius
+    similarity. Returns deduplicated list.
+    """
+    if not pool:
+        return []
+    pool = sorted(pool, key=lambda c: c['rms'])
+    used = [False] * len(pool)
+    merged = []
+    for i in range(len(pool)):
+        if used[i]:
+            continue
+        c1 = pool[i]
+        group = [c1]
+        used[i] = True
+        for j in range(i + 1, len(pool)):
+            if used[j]:
+                continue
+            c2 = pool[j]
+            dc = math.hypot(c1['cx'] - c2['cx'], c1['cy'] - c2['cy'])
+            dr = abs(c1['r'] - c2['r']) / max(c1['r'], c2['r'], 1e-9)
+            # Generous merge: centres within 60px AND radii within 40%
+            if dc < 60 and dr < 0.40:
+                group.append(c2)
+                used[j] = True
+        merged.append({
+            'cx':  float(np.mean([c['cx']  for c in group])),
+            'cy':  float(np.mean([c['cy']  for c in group])),
+            'r':   float(np.mean([c['r']   for c in group])),
+            'rms': float(min(c['rms'] for c in group)),
+        })
+    return merged
+
+
 def detect_circles_and_rectilinear(cleaned_mask):
     """
-    Extract contours from cleaned mask, classify each as circle or rectilinear
-    using algebraic least squares fitting. NO approxPolyDP.
+    v13 — Three-stage circle detection with contour-hierarchy inner/outer
+    ring merging, then circle-priority suppression of rectilinear shapes.
+
+    Stage 1 — HoughCircles prefilter (broad, catches thick-stroked rings).
+    Stage 2 — Contour extraction with RETR_TREE hierarchy; inner/outer ring
+               pairs (child contour nested inside parent) are merged to a
+               single representative circle via Kasa algebraic LS fit on the
+               combined point cloud.
+    Stage 3 — Kasa LS fit on every remaining non-circle contour that is
+               roughly round (aspect > 0.5) — catch anything Hough missed.
+
+    Circle-priority rule: any rectilinear bbox that is substantially
+    contained inside a detected circle is dropped.
+
     Returns (circles, rectilinear_contours).
     """
-    contours, hierarchy = cv2.findContours(cleaned_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
+    # ── Stage 1: HoughCircles prefilter ─────────────────────────────────
+    hough_circles = _hough_circles(cleaned_mask)
 
-    circles = []
-    rectilinear = []
+    # ── Stage 2: Contour extraction with hierarchy ───────────────────────
+    contours, hierarchy = cv2.findContours(
+        cleaned_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE
+    )
 
-    for i, cnt in enumerate(contours):
-        if len(cnt) < 20:
-            continue
+    circle_pool = list(hough_circles)   # start with Hough hits
+    rectilinear_candidates = []
+    contour_circle_idx = set()          # contour indices classified as circle
 
-        pts = cnt.reshape(-1, 2).astype(np.float32)
-        x, y = pts[:, 0], pts[:, 1]
-        w_bbox = float(x.max() - x.min())
-        h_bbox = float(y.max() - y.min())
+    if hierarchy is not None and len(contours) > 0:
+        hier = hierarchy[0]  # shape: (N, 4) — next, prev, child, parent
 
-        if w_bbox < 10 or h_bbox < 10:
-            continue
+        # Build a lookup: for each contour, collect its children
+        children = defaultdict(list)
+        for idx in range(len(hier)):
+            parent_idx = hier[idx][3]
+            if parent_idx >= 0:
+                children[parent_idx].append(idx)
 
-        aspect = min(w_bbox, h_bbox) / max(w_bbox, h_bbox)
-
-        # Try circle fit first (Kasa algebraic LS)
-        if aspect > 0.5 and len(pts) >= 20:
+        def _try_kasa_on_pts(pts):
+            if len(pts) < 20:
+                return None
+            pts = pts.astype(np.float32)
+            x, y = pts[:, 0], pts[:, 1]
+            w_bbox = float(x.max() - x.min())
+            h_bbox = float(y.max() - y.min())
+            if w_bbox < 10 or h_bbox < 10:
+                return None
+            aspect = min(w_bbox, h_bbox) / max(w_bbox, h_bbox)
+            if aspect < 0.45:
+                return None
             try:
                 cx, cy, r = _kasa_circle_fit(pts)
                 dists = np.sqrt((x - cx)**2 + (y - cy)**2)
                 rms = np.sqrt(((dists - r)**2).mean())
                 rel_err = rms / (r + 1e-9)
-
-                # Adaptive tolerance based on radius
-                if r < 30:
-                    err_thresh = 0.10
-                elif r < 60:
-                    err_thresh = 0.10
-                else:
-                    err_thresh = 0.10
-
-                if rel_err < err_thresh and 10 < r < 200:
-                    circles.append({'cx': float(cx), 'cy': float(cy), 'r': float(r),
-                                   'rms': float(rel_err), 'pts': pts})
-                    continue
+                if rel_err < 0.14 and 8 < r < 800:
+                    return {'cx': float(cx), 'cy': float(cy), 'r': float(r),
+                            'rms': float(rel_err), 'source': 'kasa'}
             except Exception:
                 pass
+            return None
 
-        rectilinear.append({'pts': pts, 'bbox': (x.min(), y.min(), x.max(), y.max())})
+        processed = set()
 
-    # Merge duplicate circles (inner/outer edges of same stroke)
-    circles = sorted(circles, key=lambda c: c['rms'])
-    merged, used = [], [False]*len(circles)
-    for i in range(len(circles)):
-        if used[i]: continue
-        c1 = circles[i]
-        g = [c1]
-        used[i] = True
-        for j in range(i+1, len(circles)):
-            if used[j]: continue
-            c2 = circles[j]
-            dc = math.hypot(c1['cx']-c2['cx'], c1['cy']-c2['cy'])
-            dr = abs(c1['r']-c2['r']) / max(c1['r'], c2['r'], 1e-9)
-            if dc < 50 and dr < 0.35:
-                g.append(c2)
-                used[j] = True
-        merged.append({'cx': float(np.mean([c['cx'] for c in g])),
-                       'cy': float(np.mean([c['cy'] for c in g])),
-                       'r': float(np.mean([c['r'] for c in g])),
-                       'rms': float(min(c['rms'] for c in g))})
-    circles = merged
+        for i in range(len(contours)):
+            if i in processed:
+                continue
+
+            cnt_i = contours[i]
+            if len(cnt_i) < 10:
+                processed.add(i)
+                continue
+
+            # ── Try to pair with children (inner/outer ring detection) ──
+            # Combine this contour + its immediate children into one point cloud
+            child_ids = children.get(i, [])
+            combined_pts = cnt_i.reshape(-1, 2)
+            for ci in child_ids:
+                combined_pts = np.vstack([combined_pts, contours[ci].reshape(-1, 2)])
+
+            # Attempt Kasa fit on combined cloud (inner+outer ring together)
+            result = _try_kasa_on_pts(combined_pts)
+            if result is not None:
+                circle_pool.append(result)
+                contour_circle_idx.add(i)
+                for ci in child_ids:
+                    contour_circle_idx.add(ci)
+                processed.add(i)
+                for ci in child_ids:
+                    processed.add(ci)
+                continue
+
+            # ── Fallback: fit contour alone ──────────────────────────────
+            result = _try_kasa_on_pts(cnt_i.reshape(-1, 2))
+            if result is not None:
+                circle_pool.append(result)
+                contour_circle_idx.add(i)
+                processed.add(i)
+                continue
+
+            # ── Not a circle — rectilinear candidate ─────────────────────
+            pts = cnt_i.reshape(-1, 2).astype(np.float32)
+            x, y = pts[:, 0], pts[:, 1]
+            w_bbox = float(x.max() - x.min())
+            h_bbox = float(y.max() - y.min())
+            if w_bbox >= 10 and h_bbox >= 10 and len(pts) >= 20:
+                rectilinear_candidates.append({
+                    'pts': pts,
+                    'bbox': (float(x.min()), float(y.min()),
+                             float(x.max()), float(y.max())),
+                    'contour_idx': i,
+                })
+            processed.add(i)
+
+    # ── Stage 3: Merge circle pool → deduplicated circles ────────────────
+    circles = _merge_circle_pool(circle_pool)
+
+    # Sanity filter: drop circles whose centre is mostly outside the image
+    # or whose radius is implausible, then verify each remaining circle
+    # against the actual mask pixels using a Kasa residual check.
+    img_h, img_w = cleaned_mask.shape
+    img_diag = math.hypot(img_w, img_h)
+    # Max radius: cap at 12% of image width. This prevents the outer
+    # rectilinear border (whose rounded corners look like giant arcs) from
+    # being detected as a very large circle. Real circles in hand-drawn
+    # engineering sketches rarely exceed this fraction of the image.
+    max_r = min(img_w, img_h) * 0.12
+
+    sane = []
+    for c in circles:
+        cx, cy, r = c['cx'], c['cy'], c['r']
+        # Centre must be inside the image
+        if cx < 0 or cx > img_w or cy < 0 or cy > img_h:
+            continue
+        # Radius bounds
+        if r < 15 or r > max_r:
+            continue
+        # Verify: sample ring pixels and compute Kasa residual
+        # Sample points on a ring of width ±stroke around the fitted radius
+        stroke = max(8, r * 0.12)
+        N = 72
+        ring_pts = []
+        for k in range(N):
+            angle = 2 * math.pi * k / N
+            # scan inward/outward across expected stroke
+            for dr in range(int(-stroke), int(stroke) + 1, 2):
+                px = int(round(cx + math.cos(angle) * (r + dr)))
+                py = int(round(cy + math.sin(angle) * (r + dr)))
+                if 0 <= py < img_h and 0 <= px < img_w:
+                    if cleaned_mask[py, px] > 0:
+                        ring_pts.append([float(px), float(py)])
+        # Check angular coverage: at least 65% of sampled directions should hit ink
+        hit_directions = sum(
+            1 for k in range(N)
+            if any(
+                0 <= int(round(cy + math.sin(2*math.pi*k/N)*(r+dr))) < img_h and
+                0 <= int(round(cx + math.cos(2*math.pi*k/N)*(r+dr))) < img_w and
+                cleaned_mask[
+                    int(round(cy + math.sin(2*math.pi*k/N)*(r+dr))),
+                    int(round(cx + math.cos(2*math.pi*k/N)*(r+dr)))
+                ] > 0
+                for dr in range(int(-stroke), int(stroke)+1, 2)
+            )
+        )
+        if hit_directions < N * 0.60:
+            continue  # incomplete arc — likely a corner or partial arc
+        if len(ring_pts) < 20:
+            continue  # not enough ink on the ring — spurious
+        ring_pts = np.array(ring_pts, dtype=np.float32)
+        try:
+            kcx, kcy, kr = _kasa_circle_fit(ring_pts)
+            dists = np.sqrt((ring_pts[:, 0] - kcx)**2 + (ring_pts[:, 1] - kcy)**2)
+            rel_err = np.sqrt(((dists - kr)**2).mean()) / (kr + 1e-9)
+            if rel_err > 0.12:
+                continue  # ring pixels don't form a clean circle
+            # Replace Hough estimate with Kasa-refined one
+            c = {'cx': float(kcx), 'cy': float(kcy), 'r': float(kr),
+                 'rms': float(rel_err), 'source': 'hough_verified'}
+        except Exception:
+            pass
+        sane.append(c)
+    circles = _merge_circle_pool(sane)  # re-merge after refinement
+
+    # ── Circle-priority suppression of rectilinear shapes ────────────────
+    # Any rectilinear whose bounding-box centre lies within a circle AND
+    # whose bbox is substantially contained (>50% overlap) by that circle
+    # is discarded — the circle takes priority.
+    def _bbox_overlap_fraction(bbox, cx, cy, r):
+        """Fraction of bbox area covered by circle bounding square."""
+        bx0, by0, bx1, by1 = bbox
+        # Circle AABB
+        cx0, cy0, cx1, cy1 = cx - r, cy - r, cx + r, cy + r
+        ix0, iy0 = max(bx0, cx0), max(by0, cy0)
+        ix1, iy1 = min(bx1, cx1), min(by1, cy1)
+        if ix1 <= ix0 or iy1 <= iy0:
+            return 0.0
+        inter = (ix1 - ix0) * (iy1 - iy0)
+        bbox_area = max((bx1 - bx0) * (by1 - by0), 1.0)
+        return inter / bbox_area
+
+    def _point_in_circle(px, py, cx, cy, r, margin=1.3):
+        return math.hypot(px - cx, py - cy) < r * margin
+
+    rectilinear = []
+    for rc in rectilinear_candidates:
+        bx0, by0, bx1, by1 = rc['bbox']
+        bcx = (bx0 + bx1) / 2.0
+        bcy = (by0 + by1) / 2.0
+        suppressed = False
+        for c in circles:
+            # Centre of rectilinear bbox inside circle (with margin)?
+            if _point_in_circle(bcx, bcy, c['cx'], c['cy'], c['r'], margin=1.25):
+                # AND substantial overlap
+                frac = _bbox_overlap_fraction(
+                    (bx0, by0, bx1, by1), c['cx'], c['cy'], c['r']
+                )
+                if frac > 0.45:
+                    suppressed = True
+                    break
+        if not suppressed:
+            rectilinear.append(rc)
 
     return circles, rectilinear
 
@@ -584,7 +838,7 @@ def export_pdf(edges, out_path, orig_bgr=None):
         c.setFillColorRGB(0.3, 0.35, 0.4)
         c.setFont("Helvetica", 8)
         c.drawCentredString(page_w / 2, 12,
-                            "SheetForge v12  •  Algebraic LS + Contour H/V  •  Clean DXF")
+                            "SheetForge v13  •  HoughCircles + Hierarchy Ring Merge + Circle-Priority  •  Clean DXF")
         c.save()
 
         for f in tmp_files:
