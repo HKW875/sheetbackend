@@ -271,10 +271,186 @@ def _merge_circle_pool(pool):
     return merged
 
 
+def _line_segment_intersection(p1, p2, p3, p4):
+    """
+    Compute intersection of line segment (p1,p2) with line segment (p3,p4).
+    Returns (x, y) if they intersect within both segments, else None.
+    Uses parametric form with cross-product.
+    """
+    x1, y1 = p1
+    x2, y2 = p2
+    x3, y3 = p3
+    x4, y4 = p4
+
+    denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+    if abs(denom) < 1e-9:
+        return None  # parallel or collinear
+
+    t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
+    u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / denom
+
+    if 0 <= t <= 1 and 0 <= u <= 1:
+        ix = x1 + t * (x2 - x1)
+        iy = y1 + t * (y2 - y1)
+        return (ix, iy)
+    return None
+
+
+def _extend_and_trim_edges(edges, img_w, img_h, max_extend=2000):
+    """
+    Extend any edge endpoint that is not attached to another edge
+    until it intersects with another edge, then trim it at that intersection.
+
+    edges: list of dicts with 'pts' (Nx2 numpy array of points along the edge)
+    Returns: list of edges with extended/trimmed points.
+    """
+    if not edges:
+        return edges
+
+    # Convert each edge to a line segment (start, end) for intersection tests
+    segments = []
+    for e in edges:
+        pts = e['pts']
+        if len(pts) < 2:
+            segments.append(None)
+            continue
+        p_start = (float(pts[0, 0]), float(pts[0, 1]))
+        p_end = (float(pts[-1, 0]), float(pts[-1, 1]))
+        # Compute direction vector
+        dx = p_end[0] - p_start[0]
+        dy = p_end[1] - p_start[1]
+        length = math.hypot(dx, dy)
+        if length < 1e-9:
+            segments.append(None)
+            continue
+        # Normalized direction
+        ux, uy = dx / length, dy / length
+        segments.append({
+            'start': p_start,
+            'end': p_end,
+            'dir': (ux, uy),
+            'length': length,
+            'pts': pts,
+        })
+
+    # Build endpoint connectivity: for each endpoint, find if it touches another edge
+    # Two endpoints are "attached" if they are within a small tolerance
+    attach_tol = 5.0  # pixels
+
+    def _endpoints_touch(i, which_i, j, which_j):
+        """Check if endpoint which_i of edge i touches endpoint which_j of edge j."""
+        if segments[i] is None or segments[j] is None:
+            return False
+        pi = segments[i]['start'] if which_i == 'start' else segments[i]['end']
+        pj = segments[j]['start'] if which_j == 'start' else segments[j]['end']
+        return math.hypot(pi[0] - pj[0], pi[1] - pj[1]) < attach_tol
+
+    # For each endpoint, determine if it's attached to any other edge
+    n = len(edges)
+    attached = {'start': [False] * n, 'end': [False] * n}
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            for end_i in ['start', 'end']:
+                for end_j in ['start', 'end']:
+                    if _endpoints_touch(i, end_i, j, end_j):
+                        attached[end_i][i] = True
+
+    # Now extend unattached endpoints and find intersections
+    modified_edges = []
+    for i in range(n):
+        if segments[i] is None:
+            modified_edges.append(edges[i])
+            continue
+
+        seg = segments[i]
+        pts = seg['pts'].copy()
+        new_start = None
+        new_end = None
+
+        # Extend start if unattached
+        if not attached['start'][i]:
+            ux, uy = seg['dir']
+            # Extend backward from start
+            ext_x = seg['start'][0] - ux * max_extend
+            ext_y = seg['start'][1] - uy * max_extend
+            ext_end = (ext_x, ext_y)
+            best_inter = None
+            best_dist = float('inf')
+            for j in range(n):
+                if i == j or segments[j] is None:
+                    continue
+                # Check intersection with edge j's segment
+                inter = _line_segment_intersection(
+                    seg['start'], ext_end,
+                    segments[j]['start'], segments[j]['end']
+                )
+                if inter is not None:
+                    d = math.hypot(inter[0] - seg['start'][0], inter[1] - seg['start'][1])
+                    if d < best_dist and d > 1.0:  # must extend outward, not at origin
+                        best_dist = d
+                        best_inter = inter
+            if best_inter is not None:
+                new_start = best_inter
+
+        # Extend end if unattached
+        if not attached['end'][i]:
+            ux, uy = seg['dir']
+            ext_x = seg['end'][0] + ux * max_extend
+            ext_y = seg['end'][1] + uy * max_extend
+            ext_end = (ext_x, ext_y)
+            best_inter = None
+            best_dist = float('inf')
+            for j in range(n):
+                if i == j or segments[j] is None:
+                    continue
+                inter = _line_segment_intersection(
+                    seg['end'], ext_end,
+                    segments[j]['start'], segments[j]['end']
+                )
+                if inter is not None:
+                    d = math.hypot(inter[0] - seg['end'][0], inter[1] - seg['end'][1])
+                    if d < best_dist and d > 1.0:
+                        best_dist = d
+                        best_inter = inter
+            if best_inter is not None:
+                new_end = best_inter
+
+        # Rebuild the edge points
+        new_pts = []
+        if new_start is not None:
+            new_pts.append([new_start[0], new_start[1]])
+        # Add original interior points (skip first and last if replaced)
+        for k in range(len(pts)):
+            if k == 0 and new_start is not None:
+                continue
+            if k == len(pts) - 1 and new_end is not None:
+                continue
+            new_pts.append([float(pts[k, 0]), float(pts[k, 1])])
+        if new_end is not None:
+            new_pts.append([new_end[0], new_end[1]])
+
+        if len(new_pts) >= 2:
+            modified_edges.append({
+                'pts': np.array(new_pts, dtype=np.float32),
+                'bbox': edges[i].get('bbox', None),
+                'contour_idx': edges[i].get('contour_idx', -1),
+            })
+        else:
+            modified_edges.append(edges[i])
+
+    return modified_edges
+
+
 def detect_circles_and_rectilinear(cleaned_mask):
     """
-    v13 — Three-stage circle detection with contour-hierarchy inner/outer
+    v14 — Three-stage circle detection with contour-hierarchy inner/outer
     ring merging, then circle-priority suppression of rectilinear shapes.
+
+    NEW: Rectilinear edges are extended at unattached endpoints until they
+    intersect with another edge, then trimmed at that intersection point.
+    This ensures a closed, gap-free line drawing with no dangling edges.
 
     Stage 1 — HoughCircles prefilter (broad, catches thick-stroked rings).
     Stage 2 — Contour extraction with RETR_TREE hierarchy; inner/outer ring
@@ -494,6 +670,11 @@ def detect_circles_and_rectilinear(cleaned_mask):
                     break
         if not suppressed:
             rectilinear.append(rc)
+
+    # ── NEW: Extend and trim unattached rectilinear edges ───────────────
+    # Any edge endpoint not attached to another edge is extended along its
+    # direction until it intersects another edge, then trimmed there.
+    rectilinear = _extend_and_trim_edges(rectilinear, img_w, img_h)
 
     return circles, rectilinear
 
