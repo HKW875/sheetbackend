@@ -521,7 +521,7 @@ def extract_hv_edges(rectilinear_contours):
         # Top edge (horizontal)
         top_mask = y <= y_min + margin
         top_pts = pts[top_mask]
-        if len(top_pts) > 5:
+        if len(top_pts) > 2:
             y_fit = float(np.median(top_pts[:, 1]))
             x_start = float(np.min(top_pts[:, 0]))
             x_end = float(np.max(top_pts[:, 0]))
@@ -530,7 +530,7 @@ def extract_hv_edges(rectilinear_contours):
         # Bottom edge (horizontal)
         bot_mask = y >= y_max - margin
         bot_pts = pts[bot_mask]
-        if len(bot_pts) > 5:
+        if len(bot_pts) > 2:
             y_fit = float(np.median(bot_pts[:, 1]))
             x_start = float(np.min(bot_pts[:, 0]))
             x_end = float(np.max(bot_pts[:, 0]))
@@ -539,7 +539,7 @@ def extract_hv_edges(rectilinear_contours):
         # Left edge (vertical)
         left_mask = x <= x_min + margin
         left_pts = pts[left_mask]
-        if len(left_pts) > 5:
+        if len(left_pts) > 2:
             x_fit = float(np.median(left_pts[:, 0]))
             y_start = float(np.min(left_pts[:, 1]))
             y_end = float(np.max(left_pts[:, 1]))
@@ -548,14 +548,13 @@ def extract_hv_edges(rectilinear_contours):
         # Right edge (vertical)
         right_mask = x >= x_max - margin
         right_pts = pts[right_mask]
-        if len(right_pts) > 5:
+        if len(right_pts) > 2:
             x_fit = float(np.median(right_pts[:, 0]))
             y_start = float(np.min(right_pts[:, 1]))
             y_end = float(np.max(right_pts[:, 1]))
             all_edges.append({'type': 'V', 'coord': x_fit, 'start': y_start, 'end': y_end})
 
-    # Filter very short segments (noise)
-    all_edges = [s for s in all_edges if (s['end'] - s['start']) >= 40]
+    
 
     return all_edges
 
