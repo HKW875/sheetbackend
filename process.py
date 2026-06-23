@@ -204,11 +204,11 @@ def detect_circles_and_rectilinear(cleaned_mask):
 
                 # Adaptive tolerance based on radius
                 if r < 30:
-                    err_thresh = 0.10
+                    err_thresh = 0.04
                 elif r < 60:
-                    err_thresh = 0.10
+                    err_thresh = 0.04
                 else:
-                    err_thresh = 0.08
+                    err_thresh = 0.04
 
                 if rel_err < err_thresh and 10 < r < 200:
                     circles.append({'cx': float(cx), 'cy': float(cy), 'r': float(r),
