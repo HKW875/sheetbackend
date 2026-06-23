@@ -958,7 +958,10 @@ def build_clean_dxf(circles, segments, img_w, img_h, out_path, HAS_DXF=True):
     # =====================================================
     for e in edges:
 
-        (x1, y1), (x2, y2) = list(e.coords)
+        coords = list(e.coords)
+
+        x1, y1 = coords[0]
+        x2, y2 = coords[-1]
 
         if abs(y1 - y2) < 1e-6:
             layer = "H_LINES"
@@ -1017,7 +1020,10 @@ def _manhattanize(edges, tol):
     fixed = []
 
     for e in edges:
-        (x1, y1), (x2, y2) = list(e.coords)
+        coords = list(e.coords)
+
+        x1, y1 = coords[0]
+        x2, y2 = coords[-1]
 
         if abs(y2 - y1) < tol:
             y2 = y1
