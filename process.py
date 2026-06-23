@@ -969,7 +969,7 @@ def build_clean_dxf(circles, segments, img_w, img_h, out_path, HAS_DXF=True):
             layer = "V_LINES"
 
         msp.add_lwpolyline(
-            [(x1, y1), (x2, y2)],
+            list(e.coords),
             dxfattribs={"layer": layer}
         )
 
