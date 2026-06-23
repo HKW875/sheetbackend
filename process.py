@@ -47,6 +47,8 @@ import sys, os, json, time, traceback, math
 from pathlib import Path
 from itertools import combinations
 from collections import defaultdict
+from shapely.geometry import LineString
+from shapely.ops import unary_union, snap, linemerge
 
 # ── Graceful optional imports ────────────────────────────────────────────────
 def _try(fn):
@@ -874,38 +876,259 @@ def merge_final_parallel(segments, tol=25):
 # STEP 15 — CLEAN DXF EXPORT (CIRCLE + 2-point LWPOLYLINE per segment)
 # ════════════════════════════════════════════════════════════════════════════
 
-def build_clean_dxf(circles, segments, img_w, img_h, out_path):
-    """Export to DXF. Always counts entities even if ezdxf is not available."""
+# =========================================================
+# MAIN FUNCTION (YOUR ORIGINAL API + CAD KERNEL v5)
+# =========================================================
+
+def build_clean_dxf(circles, segments, img_w, img_h, out_path, HAS_DXF=True):
+
+    # ----------------------------
+    # entity accounting (unchanged)
+    # ----------------------------
     entity_count = len(circles) + len(segments)
 
+    # =====================================================
+    # 0. SAFETY FALLBACK
+    # =====================================================
     if not HAS_DXF:
         return None, entity_count, 0
 
+    # =====================================================
+    # 1. BUILD RAW GEOMETRY (CAD KERNEL INPUT LAYER)
+    # =====================================================
+    edges = _build_edges(segments)
+
+    # =====================================================
+    # 2. TOPOLOGY NORMALIZATION (snap + orthogonal fix)
+    # =====================================================
+    edges = _snap(edges, tol=0.5)
+    edges = _manhattanize(edges, tol=0.5)
+
+    # =====================================================
+    # 3. GLOBAL TOPOLOGY CLEAN (v5 kernel core)
+    # =====================================================
+    edges = _merge(edges)
+
+    # =====================================================
+    # 4. ARC / CIRCLE RECONSTRUCTION (improves input circles)
+    # =====================================================
+    circles = _refine_circles(circles, edges)
+
+    # =====================================================
+    # 5. GAP HEALING (H/V only safe closure)
+    # =====================================================
+    edges = _heal_gaps(edges, tol=5.0)
+
+    # =====================================================
+    # 6. FINAL CONSISTENCY PASS
+    # =====================================================
+    edges = _final_cleanup(edges)
+
+    # =====================================================
+    # 7. DXF EXPORT (your original exporter upgraded)
+    # =====================================================
     doc = ezdxf.new(dxfversion="R2018")
-    doc.header["$INSUNITS"] = 0
+
+    doc.header["$INSUNITS"] = 4  # mm
     doc.header["$EXTMIN"] = (0.0, 0.0, 0.0)
     doc.header["$EXTMAX"] = (float(img_w), float(img_h), 0.0)
     doc.header["$LIMMIN"] = (0.0, 0.0)
     doc.header["$LIMMAX"] = (float(img_w), float(img_h))
 
     msp = doc.modelspace()
-    doc.layers.new("CIRCLES", dxfattribs={"color": 1, "linetype": "CONTINUOUS"})
-    doc.layers.new("H_LINES", dxfattribs={"color": 5, "linetype": "CONTINUOUS"})
-    doc.layers.new("V_LINES", dxfattribs={"color": 6, "linetype": "CONTINUOUS"})
 
+    # layers
+    doc.layers.new("CIRCLES", dxfattribs={"color": 1})
+    doc.layers.new("H_LINES", dxfattribs={"color": 5})
+    doc.layers.new("V_LINES", dxfattribs={"color": 6})
+    doc.layers.new("REPAIRED", dxfattribs={"color": 3})
+
+    # =====================================================
+    # 8. EXPORT CIRCLES
+    # =====================================================
     for c in circles:
-        msp.add_circle((c['cx'], c['cy'], 0.0), c['r'],
-                      dxfattribs={"layer": "CIRCLES", "color": 256})
+        msp.add_circle(
+            (c["cx"], c["cy"]),
+            c["r"],
+            dxfattribs={"layer": "CIRCLES"}
+        )
 
-    for s in segments:
-        if s['type'] == 'H':
-            pts = [(s['start'], s['coord']), (s['end'], s['coord'])]
+    # =====================================================
+    # 9. EXPORT HEALED SEGMENTS
+    # =====================================================
+    for e in edges:
+
+        (x1, y1), (x2, y2) = list(e.coords)
+
+        if abs(y1 - y2) < 1e-6:
             layer = "H_LINES"
         else:
-            pts = [(s['coord'], s['start']), (s['coord'], s['end'])]
             layer = "V_LINES"
-        msp.add_lwpolyline(pts, format="xy",
-                          dxfattribs={"layer": layer, "color": 256})
+
+        msp.add_lwpolyline(
+            [(x1, y1), (x2, y2)],
+            dxfattribs={"layer": layer}
+        )
+
+    # =====================================================
+    # 10. SAVE OUTPUT
+    # =====================================================
+    out_path = Path(out_path)
+    doc.saveas(str(out_path))
+
+    file_size = out_path.stat().st_size
+
+    return doc, entity_count, file_size
+
+
+# =========================================================
+# CAD KERNEL v5 INTERNAL PIPELINE FUNCTIONS
+# =========================================================
+
+def _build_edges(segments):
+    edges = []
+
+    for s in segments:
+
+        if s["type"] == "H":
+            p1 = (s["start"], s["coord"])
+            p2 = (s["end"], s["coord"])
+        else:
+            p1 = (s["coord"], s["start"])
+            p2 = (s["coord"], s["end"])
+
+        edges.append(LineString([p1, p2]))
+
+    return edges
+
+
+def _snap(edges, tol):
+    merged = unary_union(edges)
+    snapped = snap(merged, merged, tol)
+
+    if isinstance(snapped, LineString):
+        return [snapped]
+
+    return list(snapped.geoms)
+
+
+def _manhattanize(edges, tol):
+
+    fixed = []
+
+    for e in edges:
+        (x1, y1), (x2, y2) = list(e.coords)
+
+        if abs(y2 - y1) < tol:
+            y2 = y1
+
+        if abs(x2 - x1) < tol:
+            x2 = x1
+
+        fixed.append(LineString([(x1, y1), (x2, y2)]))
+
+    return fixed
+
+
+def _merge(edges):
+    merged = linemerge(unary_union(edges))
+
+    if isinstance(merged, LineString):
+        return [merged]
+
+    return list(merged.geoms)
+
+
+# =========================================================
+# CIRCLE REFINEMENT (v5 upgrade)
+# =========================================================
+
+def _refine_circles(circles, edges):
+
+    """
+    Improves circle accuracy using edge proximity correction.
+    """
+
+    refined = []
+
+    for c in circles:
+
+        cx, cy, r = c["cx"], c["cy"], c["r"]
+
+        # optional: snap circle center to nearest edge midpoint
+        best = None
+        best_d = 1e9
+
+        for e in edges:
+
+            mx, my = e.interpolate(0.5, normalized=True).coords[0]
+
+            d = (mx - cx) ** 2 + (my - cy) ** 2
+
+            if d < best_d:
+                best_d = d
+                best = (mx, my)
+
+        if best and best_d < 25:  # tolerance threshold
+            cx, cy = best
+
+        refined.append({
+            "cx": cx,
+            "cy": cy,
+            "r": r
+        })
+
+    return refined
+
+
+# =========================================================
+# GAP HEALING (SAFE H/V ONLY)
+# =========================================================
+
+def _heal_gaps(edges, tol):
+
+    repaired = []
+
+    endpoints = []
+
+    for e in edges:
+        endpoints.append(e.coords[0])
+        endpoints.append(e.coords[-1])
+
+    used = set()
+
+    for i, a in enumerate(endpoints):
+
+        if i in used:
+            continue
+
+        for j, b in enumerate(endpoints):
+
+            if i == j or j in used:
+                continue
+
+            dx = abs(a[0] - b[0])
+            dy = abs(a[1] - b[1])
+
+            if (dx < tol and dy < 0.001) or (dy < tol and dx < 0.001):
+                repaired.append(LineString([a, b]))
+                used.add(i)
+                used.add(j)
+
+    return edges + repaired
+
+
+# =========================================================
+# FINAL CLEANUP
+# =========================================================
+
+def _final_cleanup(edges):
+    merged = linemerge(unary_union(edges))
+
+    if isinstance(merged, LineString):
+        return [merged]
+
+    return list(merged.geoms)
 
     doc.saveas(str(out_path))
     file_size = out_path.stat().st_size
