@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
-SheetForge — CV Pipeline  v14  (HoughCircles + Hierarchy Ring Merge +
-                                 Circle-Priority + Vector Connectivity +
-                                 Symmetry Completion)
+SheetForge — CV Pipeline  v13  (HoughCircles + Hierarchy Ring Merge + Circle-Priority)
 ================================================================
 Receives: image_path, options_json (from node child_process)
 Outputs:  JSON on stdout  { steps, analysis, dwg, dxfContent, pdfAvailable }
@@ -693,388 +691,6 @@ def merge_final_parallel(segments, tol=25):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# PASS A — VECTOR CONNECTIVITY ENFORCEMENT
-# Every segment endpoint must meet at least one other endpoint within tol.
-# Dangling ends are extended to the nearest crossing perpendicular segment,
-# snapped to the exact intersection, and the crossed segment is split there.
-# Segments that cannot connect within max_extend are dropped.
-# ════════════════════════════════════════════════════════════════════════════
-
-def _seg_endpoints(s):
-    """Return ((x1,y1),(x2,y2)) for a segment dict."""
-    if s['type'] == 'H':
-        return (s['start'], s['coord']), (s['end'], s['coord'])
-    else:
-        return (s['coord'], s['start']), (s['coord'], s['end'])
-
-
-def _pts_close(p1, p2, tol):
-    return math.hypot(p1[0]-p2[0], p1[1]-p2[1]) <= tol
-
-
-def _build_endpoint_set(segments, tol):
-    """Return set of all endpoints (rounded to tol grid)."""
-    pts = []
-    for s in segments:
-        a, b = _seg_endpoints(s)
-        pts.append(a)
-        pts.append(b)
-    return pts
-
-
-def _endpoint_connected(pt, all_endpoints, self_pts, tol):
-    """True if pt is near any endpoint not in self_pts."""
-    for ep in all_endpoints:
-        if ep in self_pts:
-            continue
-        if _pts_close(pt, ep, tol):
-            return True
-    return False
-
-
-def _build_ep_index(segments):
-    """Build list of (x, y, seg_idx, which) for all endpoints."""
-    eps = []
-    for i, s in enumerate(segments):
-        a, b = _seg_endpoints(s)
-        eps.append((a[0], a[1], i, 'a'))
-        eps.append((b[0], b[1], i, 'b'))
-    return eps
-
-
-def _connected_at(px, py, ep_index, own_idx, tol):
-    """True if any endpoint other than own_idx is within tol of (px, py)."""
-    for ex, ey, sidx, _ in ep_index:
-        if sidx == own_idx:
-            continue
-        if abs(ex - px) <= tol and abs(ey - py) <= tol:
-            return True
-    return False
-
-
-def enforce_vector_connectivity(segments, circles,
-                                 snap_tol=8.0, max_extend=120.0):
-    """
-    Pass A — guarantee every segment endpoint shares its coordinate with
-    at least one other segment endpoint.
-
-    Single-pass algorithm (fast, O(n²)):
-    1. Pre-build endpoint index.
-    2. For each segment check both endpoints.
-       - Connected → skip.
-       - Dangling → scan all perpendicular segments for a crossing within
-         max_extend in the correct direction.  Best (nearest) crossing wins.
-         • Snap the dangling endpoint to the intersection.
-         • Split the crossed segment at that point into two halves.
-    3. Segments that cannot connect in either endpoint are dropped.
-    4. Dedup collinear results of splits.
-    5. Hard-drop still-dangling segments (safety net).
-    """
-    if not segments:
-        return segments, circles
-
-    min_seg_len = 10.0
-    MAX_ITER = 2
-
-    for _iter in range(MAX_ITER):
-        ep_index = _build_ep_index(segments)
-        remove_ids = set()
-        new_halves = []     # (half1, half2) from splits
-        split_orig = set()  # original seg indices that were split
-
-        for idx, s in enumerate(segments):
-            if idx in remove_ids:
-                continue
-            sa, sb = _seg_endpoints(s)
-            px_a, py_a = sa
-            px_b, py_b = sb
-
-            conn_a = _connected_at(px_a, py_a, ep_index, idx, snap_tol)
-            conn_b = _connected_at(px_b, py_b, ep_index, idx, snap_tol)
-
-            if conn_a and conn_b:
-                continue   # fully connected, nothing to do
-
-            # Try to fix each dangling end
-            for conn, (px, py), which in [(conn_a, sa, 'a'), (conn_b, sb, 'b')]:
-                if conn:
-                    continue
-
-                best_d = max_extend + 1.0
-                best_ix = None
-                best_cross = None
-
-                if s['type'] == 'H':
-                    is_start = (which == 'a')
-                    for cidx, vs in enumerate(segments):
-                        if cidx == idx or cidx in remove_ids or vs['type'] != 'V':
-                            continue
-                        vx = vs['coord']
-                        vy1, vy2 = vs['start'], vs['end']
-                        if not (min(vy1, vy2) - snap_tol <= py <= max(vy1, vy2) + snap_tol):
-                            continue
-                        dx = vx - px
-                        if is_start and dx > snap_tol:   # start: extend leftward only
-                            continue
-                        if not is_start and dx < -snap_tol:  # end: extend rightward only
-                            continue
-                        d = abs(dx)
-                        if d < best_d:
-                            best_d = d
-                            best_ix = (vx, py)
-                            best_cross = cidx
-                else:   # V
-                    is_start = (which == 'a')
-                    for cidx, hs in enumerate(segments):
-                        if cidx == idx or cidx in remove_ids or hs['type'] != 'H':
-                            continue
-                        hy = hs['coord']
-                        hx1, hx2 = hs['start'], hs['end']
-                        if not (min(hx1, hx2) - snap_tol <= px <= max(hx1, hx2) + snap_tol):
-                            continue
-                        dy = hy - py
-                        if is_start and dy > snap_tol:
-                            continue
-                        if not is_start and dy < -snap_tol:
-                            continue
-                        d = abs(dy)
-                        if d < best_d:
-                            best_d = d
-                            best_ix = (px, hy)
-                            best_cross = cidx
-
-                if best_ix is not None and best_d <= max_extend:
-                    ix, iy = best_ix
-                    # Snap dangling endpoint
-                    sc = segments[idx].copy()
-                    if s['type'] == 'H':
-                        if which == 'a':
-                            sc['start'] = ix
-                        else:
-                            sc['end'] = ix
-                        if sc['start'] > sc['end']:
-                            sc['start'], sc['end'] = sc['end'], sc['start']
-                    else:
-                        if which == 'a':
-                            sc['start'] = iy
-                        else:
-                            sc['end'] = iy
-                        if sc['start'] > sc['end']:
-                            sc['start'], sc['end'] = sc['end'], sc['start']
-                    segments[idx] = sc
-
-                    # Split crossed segment at intersection (only once per seg)
-                    if best_cross not in split_orig:
-                        cross = segments[best_cross]
-                        split_coord = iy if cross['type'] == 'V' else ix
-                        h1 = cross.copy(); h2 = cross.copy()
-                        h1['end']   = split_coord
-                        h2['start'] = split_coord
-                        for h in (h1, h2):
-                            if h['start'] > h['end']:
-                                h['start'], h['end'] = h['end'], h['start']
-                        if h1['end'] - h1['start'] >= min_seg_len:
-                            new_halves.append(h1)
-                        if h2['end'] - h2['start'] >= min_seg_len:
-                            new_halves.append(h2)
-                        remove_ids.add(best_cross)
-                        split_orig.add(best_cross)
-                else:
-                    # Cannot connect this end — mark whole segment for removal
-                    remove_ids.add(idx)
-                    break  # no point checking other end
-
-        # Rebuild
-        segments = [s for i, s in enumerate(segments) if i not in remove_ids]
-        segments.extend(new_halves)
-        segments = dedup_parallel_segments(segments, tol=snap_tol * 2, slack=snap_tol)
-
-    # ── Hard-drop still-dangling (safety net) ────────────────────────────
-    ep_index = _build_ep_index(segments)
-    connected = []
-    for idx, s in enumerate(segments):
-        sa, sb = _seg_endpoints(s)
-        ca = _connected_at(sa[0], sa[1], ep_index, idx, snap_tol)
-        cb = _connected_at(sb[0], sb[1], ep_index, idx, snap_tol)
-        if ca or cb:   # keep if at least one end is connected
-            connected.append(s)
-
-    return connected, circles
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# PASS B — SYMMETRY ANALYSIS & COMPLETION
-# Detect reflective symmetry in the full DXF (segments + circles).
-# If ≥85 % of features have a mirror counterpart, synthesise missing mirrors.
-# Checks: vertical axis (x = cx_bbox) and horizontal axis (y = cy_bbox).
-# ════════════════════════════════════════════════════════════════════════════
-
-def _mirror_segment(s, axis, val):
-    """Mirror segment across axis='H' (horizontal axis y=val) or 'V' (vertical x=val)."""
-    sc = s.copy()
-    if axis == 'V':         # mirror left↔right
-        if s['type'] == 'H':
-            sc['start'] = 2 * val - s['end']
-            sc['end']   = 2 * val - s['start']
-        else:               # V segment: coord mirrors
-            sc['coord'] = 2 * val - s['coord']
-    else:                   # axis == 'H': mirror top↔bottom
-        if s['type'] == 'V':
-            sc['start'] = 2 * val - s['end']
-            sc['end']   = 2 * val - s['start']
-        else:               # H segment: coord mirrors
-            sc['coord'] = 2 * val - s['coord']
-    if sc['start'] > sc['end']:
-        sc['start'], sc['end'] = sc['end'], sc['start']
-    return sc
-
-
-def _mirror_circle(c, axis, val):
-    mc = c.copy()
-    if axis == 'V':
-        mc['cx'] = 2 * val - c['cx']
-    else:
-        mc['cy'] = 2 * val - c['cy']
-    return mc
-
-
-def _seg_match(s1, s2, tol):
-    """True if two segments represent the same edge within tol."""
-    if s1['type'] != s2['type']:
-        return False
-    if abs(s1['coord'] - s2['coord']) > tol:
-        return False
-    if abs(s1['start'] - s2['start']) > tol:
-        return False
-    if abs(s1['end'] - s2['end']) > tol:
-        return False
-    return True
-
-
-def _circle_match(c1, c2, tol):
-    centre_ok = math.hypot(c1['cx']-c2['cx'], c1['cy']-c2['cy']) <= tol * 2.0
-    radius_ok  = abs(c1['r'] - c2['r']) <= max(tol, c1['r'] * 0.20)
-    return centre_ok and radius_ok
-
-
-def _symmetry_score(segments, circles, axis, val, tol):
-    """
-    Fraction of features that have a near-mirror-image counterpart.
-    Returns (score 0–1, matched_count, total_count).
-    """
-    total = len(segments) + len(circles)
-    if total == 0:
-        return 1.0, 0, 0
-    matched = 0
-    for s in segments:
-        ms = _mirror_segment(s, axis, val)
-        if any(_seg_match(ms, other, tol) for other in segments):
-            matched += 1
-    for c in circles:
-        mc = _mirror_circle(c, axis, val)
-        if any(_circle_match(mc, other, tol) for other in circles):
-            matched += 1
-    return matched / total, matched, total
-
-
-def complete_symmetry(segments, circles, img_w, img_h,
-                       sym_threshold=0.85, tol_frac=0.03):
-    """
-    Pass B — detect reflective symmetry and fill in missing mirror features.
-
-    Axes tested:
-      • Vertical: x = midpoint of geometry bounding box (left↔right)
-      • Horizontal: y = midpoint of geometry bounding box (top↔bottom)
-
-    For each axis:
-      1. Score current geometry — fraction of features with mirror counterpart.
-      2. If score ≥ sym_threshold → axis declared symmetric.
-      3. For every feature WITHOUT a mirror counterpart, synthesise the mirror
-         and add it (only if it doesn't duplicate an existing feature).
-      4. Re-run dedup to collapse any newly collinear segments.
-
-    Returns (segments, circles, sym_report).
-    """
-    tol = max(img_w, img_h) * tol_frac
-    sym_report = {}
-    added_segs = 0
-    added_circles = 0
-
-    # Compute geometry bounding box (use both segments and circles)
-    all_xs, all_ys = [], []
-    for s in segments:
-        if s['type'] == 'H':
-            all_xs += [s['start'], s['end']]
-            all_ys += [s['coord'], s['coord']]
-        else:
-            all_xs += [s['coord'], s['coord']]
-            all_ys += [s['start'], s['end']]
-    for c in circles:
-        all_xs += [c['cx'] - c['r'], c['cx'] + c['r']]
-        all_ys += [c['cy'] - c['r'], c['cy'] + c['r']]
-
-    if not all_xs:
-        sym_report['error'] = 'no geometry'
-        return segments, circles, sym_report
-
-    geo_cx = (min(all_xs) + max(all_xs)) / 2.0
-    geo_cy = (min(all_ys) + max(all_ys)) / 2.0
-
-    for axis, val, label in [('V', geo_cx, 'vertical'), ('H', geo_cy, 'horizontal')]:
-        score, matched, total = _symmetry_score(segments, circles, axis, val, tol)
-        sym_report[label] = {
-            'score': round(score, 3),
-            'matched': matched,
-            'total': total,
-            'axis_val': round(val, 1),
-        }
-
-        if score < sym_threshold:
-            sym_report[label]['applied'] = False
-            continue
-
-        sym_report[label]['applied'] = True
-
-        # Synthesise missing segment mirrors
-        new_segs = []
-        for s in segments:
-            ms = _mirror_segment(s, axis, val)
-            if not any(_seg_match(ms, other, tol) for other in segments):
-                if not _seg_match(ms, s, tol * 0.5):
-                    new_segs.append(ms)
-
-        deduped_new = []
-        for ns in new_segs:
-            if not any(_seg_match(ns, ex, tol * 0.5) for ex in deduped_new):
-                deduped_new.append(ns)
-        segments = segments + deduped_new
-        added_segs += len(deduped_new)
-
-        # Synthesise missing circle mirrors
-        new_circs = []
-        for c in circles:
-            mc = _mirror_circle(c, axis, val)
-            if not any(_circle_match(mc, other, tol) for other in circles):
-                if not _circle_match(mc, c, tol * 0.5):
-                    new_circs.append(mc)
-
-        deduped_nc = []
-        for nc in new_circs:
-            if not any(_circle_match(nc, ex, tol * 0.5) for ex in deduped_nc):
-                deduped_nc.append(nc)
-        circles = circles + deduped_nc
-        added_circles += len(deduped_nc)
-
-    sym_report['added_segments'] = added_segs
-    sym_report['added_circles'] = added_circles
-
-    if added_segs > 0:
-        segments = dedup_parallel_segments(segments, tol=tol * 0.5, slack=tol * 0.3)
-
-    return segments, circles, sym_report
-
-
-# ════════════════════════════════════════════════════════════════════════════
 # STEP 15 — CLEAN DXF EXPORT (CIRCLE + 2-point LWPOLYLINE per segment)
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -1368,46 +984,6 @@ def main():
     steps.append(step_record("GEO-15: Final Intersection Recalculation",
                               f"{len(intersections)} final corners (yellow dots)", t0))
 
-    # ── STEP 16: Vector Connectivity Enforcement (Pass A) ─────────────────
-    t0 = now_ms()
-    snap_tol_conn   = float(opts.get("connSnapTol",   12.0))
-    max_extend_conn = float(opts.get("connMaxExtend", 150.0))
-    segs_before = len(segments)
-    segments, circles = enforce_vector_connectivity(
-        segments, circles,
-        snap_tol=snap_tol_conn,
-        max_extend=max_extend_conn,
-    )
-    segs_after = len(segments)
-    steps.append(step_record(
-        "GEO-16: Vector Connectivity Enforcement (extend-to-intersect / trim)",
-        f"{segs_before} → {segs_after} segments; all endpoints now connected", t0))
-
-    # ── STEP 17: Symmetry Analysis & Completion (Pass B) ──────────────────
-    t0 = now_ms()
-    sym_threshold = float(opts.get("symThreshold", 0.75))
-    tol_frac      = float(opts.get("symTolFrac",   0.05))
-    segs_before_sym = len(segments)
-    circs_before_sym = len(circles)
-    segments, circles, sym_report = complete_symmetry(
-        segments, circles, img_w, img_h,
-        sym_threshold=sym_threshold,
-        tol_frac=tol_frac,
-    )
-    sym_detail = (
-        f"V-axis score={sym_report.get('vertical',{}).get('score','?')} "
-        f"H-axis score={sym_report.get('horizontal',{}).get('score','?')} | "
-        f"+{sym_report.get('added_segments',0)} segs "
-        f"+{sym_report.get('added_circles',0)} circles added"
-    )
-    steps.append(step_record(
-        "GEO-17: Symmetry Analysis & Completion",
-        sym_detail, t0))
-
-    # Recalculate intersections once more after symmetry & connectivity
-    intersections = find_intersections(segments)
-    intersections = align_points_symmetrically(intersections, tol=align_tol)
-
     # ── Output dir ────────────────────────────────────────────────────────
     server_out_dir = Path(__file__).parent / "uploads" / "output"
     server_out_dir.mkdir(parents=True, exist_ok=True)
@@ -1421,7 +997,7 @@ def main():
     pdf_path = server_out_dir / pdf_name
     png_path = server_out_dir / png_name
 
-    # ── STEP 18: DXF Export ───────────────────────────────────────────────
+    # ── STEP 16: DXF Export ───────────────────────────────────────────────
     t0 = now_ms()
     _, entity_count, dxf_size = build_clean_dxf(circles, segments, img_w, img_h, dxf_path)
 
@@ -1434,21 +1010,21 @@ def main():
             pass
 
     steps.append(step_record(
-        "DXF-18: Clean export (CIRCLE + 2-point LWPOLYLINE, true position)",
+        "DXF-16: Clean export (CIRCLE + 2-point LWPOLYLINE, true position)",
         f"{entity_count} entities  |  {dxf_size // 1024 if dxf_size else 0} KB", t0))
 
-    # ── STEP 19: PNG Preview ──────────────────────────────────────────────
+    # ── STEP 17: PNG Preview ──────────────────────────────────────────────
     t0 = now_ms()
     png_ok = build_comparison_png(edges, circles, segments, intersections, img_w, img_h, png_path)
     png_size = png_path.stat().st_size if png_ok and png_path.exists() else 0
     steps.append(step_record(
-        "PNG-19: Side-by-side preview (Canny vs final shapes + yellow dots)",
+        "PNG-17: Side-by-side preview (Canny vs final shapes + yellow dots)",
         f"{png_size // 1024 if png_size else 0} KB" if png_ok else "FAILED", t0))
 
-    # ── STEP 20: PDF Export ───────────────────────────────────────────────
+    # ── STEP 18: PDF Export ───────────────────────────────────────────────
     t0 = now_ms()
     pdf_ok = export_pdf(edges, pdf_path, orig_bgr=bgr)
-    steps.append(step_record("PDF-20: Export edge preview", "OK" if pdf_ok else "FAILED", t0))
+    steps.append(step_record("PDF-18: Export edge preview", "OK" if pdf_ok else "FAILED", t0))
 
     # ── Analysis summary ──────────────────────────────────────────────────
     n_h = sum(1 for s in segments if s['type'] == 'H')
@@ -1473,10 +1049,8 @@ def main():
         "shapeSummary": (
             f"{len(circles)} circle(s), {n_h} horizontal + {n_v} vertical segments, "
             f"{len(intersections)} corner intersections (yellow dots) — "
-            f"contour-based H/V extraction, Union-Find dedup, corner snap, "
-            f"connectivity enforced, symmetry completed"
+            f"contour-based H/V extraction, Union-Find dedup, corner snap, symmetric align"
         ),
-        "symmetryReport": sym_report,
     }
 
     # Include segment and intersection data for verification
