@@ -16,3 +16,4 @@ reportlab>=4.2.0
 
 # EXIF/DPI reading from uploaded images
 Pillow==12.2.0
+Shapely==2.1.2
