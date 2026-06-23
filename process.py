@@ -443,6 +443,481 @@ def _extend_and_trim_edges(edges, img_w, img_h, max_extend=2000):
     return modified_edges
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# STEP 10.5 — RECTILINEAR GEOMETRIC PRIMITIVE FITTING
+# ════════════════════════════════════════════════════════════════════════════
+ 
+def _dedup_parallel_segments(raw_segments, tol=15.0, slack=20.0):
+    """
+    v11 — Robust duplicate-edge collapsing (replaces the old fixed-grid
+    round(coord/8)*8 bucketing from v10.2).
+ 
+    The CV trace frequently reports the same physical edge as 2-4 near-
+    parallel segments a few pixels apart (sub-pixel skeleton noise, slightly
+    different approxPolyDP corner picks across nearby vertices, inner vs
+    outer stroke edge survivors, etc). Two segments of the SAME orientation
+    (both 'H' or both 'V') are treated as traces of the SAME physical edge
+    iff BOTH:
+        a) their constant coordinate (y for H, x for V) differs by <= tol
+        b) their [start, end] spans overlap, or nearly touch within `slack`
+    Condition (b) is what keeps this safe on staircase / multi-step
+    features: two genuinely different edges that happen to sit at a similar
+    height (e.g. the two steps of a notch) do NOT get merged, because their
+    spans don't overlap — only condition (a) being true is not enough.
+ 
+    This is checked PAIRWISE (not just between sorted neighbours) with a
+    Union-Find, so 3+ mutually-close traces collapse transitively into one
+    cluster even when not every pair in the cluster individually satisfies
+    (a) on its own.
+ 
+    The representative segment for a cluster takes the MEDIAN constant
+    coordinate and MEDIAN start/end across all traces in it — robust to a
+    single noisy outlier trace, unlike the old approach's hard grid-snap
+    (which could just as easily split a real duplicate pair that straddled
+    a bucket boundary, or merge two real edges that happened to round into
+    the same bucket).
+    """
+    h_segs = [s for s in raw_segments if s['type'] == 'H']
+    v_segs = [s for s in raw_segments if s['type'] == 'V']
+ 
+    def cluster(segs):
+        n = len(segs)
+        if n == 0:
+            return []
+        parent = list(range(n))
+ 
+        def find(a):
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            return a
+ 
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+ 
+        for i, j in combinations(range(n), 2):
+            c1, s1, e1 = segs[i]['coord'], segs[i]['start'], segs[i]['end']
+            c2, s2, e2 = segs[j]['coord'], segs[j]['start'], segs[j]['end']
+            if abs(c1 - c2) <= tol:
+                overlap = min(e1, e2) - max(s1, s2)
+                if overlap > -slack:
+                    union(i, j)
+ 
+        groups = {}
+        for i in range(n):
+            r = find(i)
+            groups.setdefault(r, []).append(i)
+ 
+        med = lambda a: a[len(a) // 2] if len(a) % 2 else (a[len(a)//2 - 1] + a[len(a)//2]) / 2.0
+        reps = []
+        for idxs in groups.values():
+            consts = sorted(segs[i]['coord'] for i in idxs)
+            starts = sorted(segs[i]['start'] for i in idxs)
+            ends   = sorted(segs[i]['end']   for i in idxs)
+            reps.append({'coord': med(consts), 'start': med(starts), 'end': med(ends),
+                         'n_traces': len(idxs)})
+        return reps
+ 
+    merged = []
+    for r in cluster(h_segs):
+        merged.append({'type': 'H', 'coord': r['coord'], 'start': r['start'], 'end': r['end'],
+                       'n_traces': r['n_traces']})
+    for r in cluster(v_segs):
+        merged.append({'type': 'V', 'coord': r['coord'], 'start': r['start'], 'end': r['end'],
+                       'n_traces': r['n_traces']})
+    return merged
+ 
+ 
+def _snap_segment_corners(merged_segments, tol=60.0):
+    """
+    v11 — Extend-to-intersect corner snapping (NEW — there was no equivalent
+    stage in v10.2; segments were exported with whatever loose endpoints
+    Step 3 happened to produce, so adjacent H/V edges routinely fell a few
+    pixels short of actually touching at the corner).
+ 
+    After _dedup_parallel_segments there is exactly one segment per real
+    edge, but consecutive H/V segments still don't necessarily terminate at
+    the same point. Every corner of a rectilinear shape is, by construction,
+    the intersection of one horizontal line y=y_h and one vertical line
+    x=x_v — i.e. the point (x_v, y_h). This:
+        1. Collects every open endpoint of every H and V segment.
+        2. Greedily nearest-neighbour-matches H endpoints to V endpoints by
+           Euclidean distance (closest pairs first), capped at `tol` so the
+           match can never bridge two unrelated corners.
+        3. Overwrites each matched pair's endpoint with the shared
+           intersection (v.coord, h.coord) — literally extending or
+           trimming each line until it meets its neighbour, then stopping.
+ 
+    Mutates the segment dicts in place and returns the same list. Segments
+    with no match within `tol` (e.g. a genuinely open/dangling edge) are
+    left untouched.
+    """
+    h_segs = [s for s in merged_segments if s['type'] == 'H']
+    v_segs = [s for s in merged_segments if s['type'] == 'V']
+    if not h_segs or not v_segs:
+        return merged_segments
+ 
+    h_endpoints = []
+    for hi, s in enumerate(h_segs):
+        h_endpoints.append((hi, 'start', s['start'], s['coord']))
+        h_endpoints.append((hi, 'end',   s['end'],   s['coord']))
+ 
+    v_endpoints = []
+    for vi, s in enumerate(v_segs):
+        v_endpoints.append((vi, 'start', s['coord'], s['start']))
+        v_endpoints.append((vi, 'end',   s['coord'], s['end']))
+ 
+    pairs = []
+    for h in h_endpoints:
+        for v in v_endpoints:
+            d = math.hypot(h[2] - v[2], h[3] - v[3])
+            if d <= tol:
+                pairs.append((d, h, v))
+    pairs.sort(key=lambda t: t[0])
+ 
+    used_h, used_v, n_snapped = set(), set(), 0
+    for d, h, v in pairs:
+        hkey, vkey = (h[0], h[1]), (v[0], v[1])
+        if hkey in used_h or vkey in used_v:
+            continue
+        used_h.add(hkey)
+        used_v.add(vkey)
+ 
+        hi, h_end, _hx, hy = h
+        vi, v_end, vx, _vy = v
+        corner_x, corner_y = vx, hy
+        h_segs[hi][h_end] = corner_x
+        v_segs[vi][v_end] = corner_y
+        n_snapped += 1
+ 
+    # Defensive: corner correction should never flip a segment's direction,
+    # but guard against degenerate/near-zero-length edges after snapping.
+    for s in h_segs + v_segs:
+        if s['start'] > s['end']:
+            s['start'], s['end'] = s['end'], s['start']
+ 
+    return h_segs + v_segs
+ 
+ 
+def remove_unclosed_parallel_duplicates(final_shapes, dedup_tol=25.0, dedup_slack=20.0, closure_eps=0.5):
+    """
+    v12 — Final global, cross-shape duplicate-edge cleanup.
+ 
+    _dedup_parallel_segments and _snap_segment_corners both run PER poly
+    shape — each shape is only ever clustered/snapped against its OWN
+    segments. When the CV trace reports a duplicate of a real edge as part
+    of a DIFFERENT contour than the one its twin ended up belonging to
+    (e.g. a small stray contour that never got hierarchy-paired with the
+    main outline), that duplicate never gets a chance to cluster with its
+    twin in Step 3, and never finds a perpendicular neighbour close enough
+    to snap to in Step 4 — so it survives, untouched, as a short,
+    disconnected, parallel "ghost" of an edge that's already represented
+    correctly elsewhere in the drawing.
+ 
+    This pass re-clusters every H/V segment from every shape together
+    (the same Union-Find logic as _dedup_parallel_segments, just applied
+    globally instead of per-shape) and collapses every resulting cluster
+    down to EXACTLY ONE surviving segment:
+      - A cluster of size 1 (no duplicate anywhere) is left untouched —
+        deleting a genuinely unique open segment would silently punch a
+        real hole in the outline instead of removing a duplicate.
+      - A cluster of size > 1 is merged into one line. Each endpoint is
+        first classified CLOSED if it exactly coincides (within
+        `closure_eps`) with an endpoint of some perpendicular segment
+        anywhere in the drawing — i.e. it already is part of a real,
+        validated corner. The merge prefers CLOSED endpoint values over
+        open ones (so an already-correctly-snapped corner is never
+        loosened back open by averaging it with a sloppier duplicate), and
+        only falls back to the median across the cluster where no member
+        has a closed value on that side. If one member of the cluster is
+        fully closed on both ends, it is kept exactly as-is and every other
+        member is simply discarded as a redundant ghost.
+ 
+    This guarantees every edge ends up represented exactly once — never
+    zero times — which a naive "delete any unclosed duplicate" rule does
+    not: if both copies of an edge happen to be unclosed, deleting both
+    would leave a gap.
+ 
+    Mutates each shape's 'segments' list in place.
+    Returns (final_shapes, n_removed).
+    """
+    pool = []
+    for si, shape in enumerate(final_shapes):
+        if shape.get('type') != 'poly':
+            continue
+        for li, s in enumerate(shape.get('segments', [])):
+            pool.append({'shape': si, 'local': li, 'type': s['type'],
+                        'coord': s['coord'], 'start': s['start'], 'end': s['end']})
+ 
+    if not pool:
+        return final_shapes, 0
+ 
+    h_pool = [p for p in pool if p['type'] == 'H']
+    v_pool = [p for p in pool if p['type'] == 'V']
+ 
+    h_endpoints_all = [(p['start'], p['coord']) for p in h_pool] + [(p['end'], p['coord']) for p in h_pool]
+    v_endpoints_all = [(p['coord'], p['start']) for p in v_pool] + [(p['coord'], p['end']) for p in v_pool]
+ 
+    def is_closed(x, y, opposite_endpoints):
+        for ox, oy in opposite_endpoints:
+            if abs(ox - x) <= closure_eps and abs(oy - y) <= closure_eps:
+                return True
+        return False
+ 
+    for p in h_pool:
+        p['start_closed'] = is_closed(p['start'], p['coord'], v_endpoints_all)
+        p['end_closed'] = is_closed(p['end'], p['coord'], v_endpoints_all)
+    for p in v_pool:
+        p['start_closed'] = is_closed(p['coord'], p['start'], h_endpoints_all)
+        p['end_closed'] = is_closed(p['coord'], p['end'], h_endpoints_all)
+ 
+    def cluster(segs):
+        n = len(segs)
+        parent = list(range(n))
+ 
+        def find(a):
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            return a
+ 
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+ 
+        for i, j in combinations(range(n), 2):
+            if abs(segs[i]['coord'] - segs[j]['coord']) <= dedup_tol:
+                overlap = min(segs[i]['end'], segs[j]['end']) - max(segs[i]['start'], segs[j]['start'])
+                if overlap > -dedup_slack:
+                    union(i, j)
+ 
+        groups = {}
+        for i in range(n):
+            groups.setdefault(find(i), []).append(i)
+        return groups
+ 
+    med = lambda a: sorted(a)[len(a) // 2] if len(a) % 2 else \
+        (sorted(a)[len(a)//2 - 1] + sorted(a)[len(a)//2]) / 2.0
+ 
+    removed_keys = set()
+    updates = {}  # (shape, local) -> replacement {'coord','start','end'}
+ 
+    def resolve(segs, groups):
+        for idxs in groups.values():
+            if len(idxs) == 1:
+                continue  # unique segment, no duplicate anywhere -- leave it alone
+ 
+            members = [segs[i] for i in idxs]
+            fully_closed = [m for m in members if m['start_closed'] and m['end_closed']]
+ 
+            if fully_closed:
+                survivor = max(fully_closed, key=lambda m: m['end'] - m['start'])
+                new_coord, new_start, new_end = survivor['coord'], survivor['start'], survivor['end']
+            else:
+                survivor = max(members, key=lambda m: (m['start_closed'] + m['end_closed'], m['end'] - m['start']))
+                closed_starts = [m['start'] for m in members if m['start_closed']]
+                closed_ends = [m['end'] for m in members if m['end_closed']]
+                new_start = closed_starts[0] if closed_starts else med([m['start'] for m in members])
+                new_end = closed_ends[0] if closed_ends else med([m['end'] for m in members])
+                new_coord = med([m['coord'] for m in members])
+ 
+            survivor_key = (survivor['shape'], survivor['local'])
+            for m in members:
+                key = (m['shape'], m['local'])
+                if key != survivor_key:
+                    removed_keys.add(key)
+            updates[survivor_key] = {'coord': new_coord, 'start': new_start, 'end': new_end}
+ 
+    resolve(h_pool, cluster(h_pool))
+    resolve(v_pool, cluster(v_pool))
+ 
+    survivors = []  # flat list of dicts (mutated in place), one per surviving segment
+    for si, shape in enumerate(final_shapes):
+        if shape.get('type') != 'poly':
+            continue
+        for li, s in enumerate(shape.get('segments', [])):
+            key = (si, li)
+            if key in removed_keys:
+                continue
+            d = {'shape': si, 'local': li, 'type': s['type'],
+                 'coord': s['coord'], 'start': s['start'], 'end': s['end']}
+            if key in updates:
+                u = updates[key]
+                d['coord'], d['start'], d['end'] = u['coord'], u['start'], u['end']
+            survivors.append(d)
+ 
+    n_removed = len(removed_keys)
+    if n_removed == 0:
+        return final_shapes, 0
+ 
+    # Merging a non-fully-closed cluster can move a line's coordinate to a
+    # new median value that no longer exactly meets the perpendicular
+    # neighbour its OLD value used to touch (see e.g. the bottom-left edge
+    # in sheetforge_edit.dxf: two open duplicates at y=502.5 and y=519.25
+    # merge to y=510.875, which then needs its adjoining verticals re-snapped
+    # to that new value). One more extend-to-intersect pass over the
+    # consolidated global segment list fixes that residual gap.
+    _snap_segment_corners(survivors, tol=max(dedup_tol, dedup_slack))
+ 
+    by_key = {(d['shape'], d['local']): d for d in survivors}
+    for si, shape in enumerate(final_shapes):
+        if shape.get('type') != 'poly':
+            continue
+        new_segs = []
+        for li, s in enumerate(shape.get('segments', [])):
+            key = (si, li)
+            if key in removed_keys:
+                continue
+            d = by_key[key]
+            new_segs.append({'type': d['type'], 'coord': d['coord'], 'start': d['start'], 'end': d['end']})
+        shape['segments'] = new_segs
+        shape['n_segments'] = len(new_segs)
+ 
+    return final_shapes, n_removed
+ 
+ 
+def fit_rectilinear_to_polygon(poly_shape, original_contour, 
+                                approx_eps_factor=0.003, 
+                                orientation_ratio=1.2,
+                                dedup_tol=15.0,
+                                dedup_slack=20.0,
+                                corner_snap_tol=60.0):
+    """
+    v11: Extracts separate horizontal and vertical line segments, collapses
+    duplicate parallel traces of the same edge down to ONE line per side
+    (_dedup_parallel_segments), then extends every remaining line along its
+    axis until it intersects its perpendicular neighbour and stops there
+    (_snap_segment_corners) — so the exported segments form a fully
+    connected, closed rectilinear chain instead of a pile of loose,
+    near-duplicate strokes.
+ 
+    Returns: (updated_poly_shape, list_of_segments)
+    Each segment: {'type': 'H', 'coord': y, 'start': x1, 'end': x2}
+               or {'type': 'V', 'coord': x, 'start': y1, 'end': y2}
+    """
+    if isinstance(original_contour, list):
+        original_contour = np.array(original_contour, dtype=np.float32)
+    if original_contour.ndim == 3:
+        original_contour = original_contour.reshape(-1, 2)
+    
+    # Step 1: Get corners using approxPolyDP with tight epsilon
+    arc_len = cv2.arcLength(original_contour.reshape(-1, 1, 2), True)
+    epsilon = max(0.0005 * arc_len, 0.5)
+    approx = cv2.approxPolyDP(original_contour.reshape(-1, 1, 2), epsilon, True)
+    vertices = np.array([pt[0] for pt in approx], dtype=np.float32)
+    
+    if len(vertices) < 4:
+        poly_shape['rectilinear'] = False
+        return poly_shape, []
+    
+    # Step 2: Extract orthogonal edge segments from corner-to-corner edges
+    raw_segments = []
+    n = len(vertices)
+    for i in range(n):
+        p1 = vertices[i]
+        p2 = vertices[(i + 1) % n]
+        dx = abs(p2[0] - p1[0])
+        dy = abs(p2[1] - p1[1])
+        length = math.hypot(dx, dy)
+        
+        if length < 15:  # Skip very short noise segments
+            continue
+        
+        if dx > dy * 1.3:  # Clearly horizontal
+            y_avg = (p1[1] + p2[1]) / 2.0
+            x1 = min(p1[0], p2[0])
+            x2 = max(p1[0], p2[0])
+            raw_segments.append({'type': 'H', 'coord': float(y_avg), 'start': float(x1), 'end': float(x2)})
+        elif dy > dx * 1.3:  # Clearly vertical
+            x_avg = (p1[0] + p2[0]) / 2.0
+            y1 = min(p1[1], p2[1])
+            y2 = max(p1[1], p2[1])
+            raw_segments.append({'type': 'V', 'coord': float(x_avg), 'start': float(y1), 'end': float(y2)})
+        elif max(dx, dy) > 80:  # Long diagonal - force to dominant axis
+            if dx > dy:
+                y_avg = (p1[1] + p2[1]) / 2.0
+                x1 = min(p1[0], p2[0])
+                x2 = max(p1[0], p2[0])
+                raw_segments.append({'type': 'H', 'coord': float(y_avg), 'start': float(x1), 'end': float(x2)})
+            else:
+                x_avg = (p1[0] + p2[0]) / 2.0
+                y1 = min(p1[1], p2[1])
+                y2 = max(p1[1], p2[1])
+                raw_segments.append({'type': 'V', 'coord': float(x_avg), 'start': float(y1), 'end': float(y2)})
+    
+    # Step 3: Collapse duplicate parallel traces of the same physical edge
+    # down to a single representative line (v11 — see _dedup_parallel_segments
+    # for the union-find + median-cluster logic; replaces the old fixed-grid
+    # round(coord/8)*8 bucketing).
+    n_raw = len(raw_segments)
+    deduped_segments = _dedup_parallel_segments(raw_segments, tol=dedup_tol, slack=dedup_slack)
+ 
+    # Step 4: Extend every remaining line along its axis until it intersects
+    # its perpendicular neighbour, then stop (v11 — new stage; see
+    # _snap_segment_corners). This is what actually closes the chain into a
+    # connected outline instead of a pile of loose, almost-touching strokes.
+    final_segments = _snap_segment_corners(deduped_segments, tol=corner_snap_tol)
+ 
+    # Update poly_shape with segment info + cleaning telemetry
+    poly_shape['rectilinear'] = True
+    poly_shape['segments'] = final_segments
+    poly_shape['n_segments'] = len(final_segments)
+    poly_shape['n_raw_segments'] = n_raw
+    poly_shape['n_traces_collapsed'] = n_raw - len(final_segments)
+ 
+    return poly_shape, final_segments
+ 
+ 
+def apply_rectilinear_fitting(final_shapes, simplified_contours,
+                               dedup_tol=15.0, dedup_slack=20.0, corner_snap_tol=60.0):
+    """
+    v11: Apply rectilinear geometric primitive fitting to all polygon shapes
+    — duplicate-edge collapsing + extend-to-intersect corner snapping.
+    Returns shapes with 'segments' list containing connected H/V line segments.
+    Circles and rectangles are passed through unchanged.
+    """
+    fitted_shapes = []
+    
+    for shape in final_shapes:
+        if shape['type'] == 'poly':
+            # Find the corresponding original contour by matching center
+            best_contour = None
+            best_score = 0
+            
+            for cnt in simplified_contours:
+                cnt_pts = np.array([pt[0] for pt in cnt], dtype=np.float32)
+                if len(cnt_pts) < 3:
+                    continue
+                
+                cnt_cx = (cnt_pts[:,0].min() + cnt_pts[:,0].max()) / 2
+                cnt_cy = (cnt_pts[:,1].min() + cnt_pts[:,1].max()) / 2
+                shape_cx = shape.get('cx', 0)
+                shape_cy = shape.get('cy', 0)
+                
+                dist = math.hypot(cnt_cx - shape_cx, cnt_cy - shape_cy)
+                if dist < 50:  # Within 50px
+                    score = len(cnt_pts)
+                    if score > best_score:
+                        best_score = score
+                        best_contour = cnt_pts
+            
+            if best_contour is not None and len(best_contour) > 10:
+                fitted, segments = fit_rectilinear_to_polygon(
+                    shape.copy(), best_contour,
+                    dedup_tol=dedup_tol, dedup_slack=dedup_slack, corner_snap_tol=corner_snap_tol)
+                fitted['segments'] = segments
+                fitted_shapes.append(fitted)
+            else:
+                fitted_shapes.append(shape)
+        else:
+            fitted_shapes.append(shape)
+    
+    return fitted_shapes
+
+
 def detect_circles_and_rectilinear(cleaned_mask):
     """
     v14 — Three-stage circle detection with contour-hierarchy inner/outer
