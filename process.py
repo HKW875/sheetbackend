@@ -159,14 +159,11 @@ def clean_edge_preview(edges, min_blob_area=3):
 # ════════════════════════════════════════════════════════════════════════════
 
 # ---------------------------------------------------------
-# KASA ALGEBRAIC CIRCLE FIT
+# KASA FIT
 # ---------------------------------------------------------
 
 def _kasa_circle_fit(pts_xy):
-    """
-    Algebraic least-squares circle fit.
-    Returns (cx, cy, r)
-    """
+
     x = pts_xy[:, 0].astype(np.float64)
     y = pts_xy[:, 1].astype(np.float64)
 
@@ -199,14 +196,11 @@ def contour_circularity(cnt):
     if peri <= 1:
         return 0.0
 
-    circularity = (4.0 * math.pi * area) / (peri * peri)
-
-    return circularity
+    return (4.0 * math.pi * area) / (peri * peri)
 
 
 # ---------------------------------------------------------
-# RECTILINEAR TEST
-# Detect contours dominated by horizontal/vertical edges
+# RECTILINEAR DETECTION
 # ---------------------------------------------------------
 
 def is_rectilinear(cnt):
@@ -216,7 +210,7 @@ def is_rectilinear(cnt):
     if len(pts) < 10:
         return False
 
-    hv_count = 0
+    hv = 0
 
     for i in range(len(pts)):
 
@@ -226,28 +220,25 @@ def is_rectilinear(cnt):
         dx = abs(float(p2[0] - p1[0]))
         dy = abs(float(p2[1] - p1[1]))
 
-        # horizontal or vertical dominance
         if dx < 3 or dy < 3:
-            hv_count += 1
+            hv += 1
 
-    ratio = hv_count / len(pts)
-
-    return ratio > 0.75
+    return (hv / len(pts)) > 0.75
 
 
 # ---------------------------------------------------------
-# POINT INSIDE BBOX
+# BBOX TEST
 # ---------------------------------------------------------
 
 def point_inside_bbox(px, py, bbox):
 
     x1, y1, x2, y2 = bbox
 
-    return (x1 <= px <= x2) and (y1 <= py <= y2)
+    return x1 <= px <= x2 and y1 <= py <= y2
 
 
 # ---------------------------------------------------------
-# MAIN DETECTOR
+# MAIN
 # ---------------------------------------------------------
 
 def detect_circles_and_rectilinear(cleaned_mask):
@@ -262,7 +253,7 @@ def detect_circles_and_rectilinear(cleaned_mask):
     rectilinear = []
 
     # -----------------------------------------------------
-    # PASS 1: DETECT RECTILINEAR CONTAINERS
+    # FIND RECTILINEAR CONTAINERS
     # -----------------------------------------------------
 
     for cnt in contours:
@@ -283,7 +274,7 @@ def detect_circles_and_rectilinear(cleaned_mask):
             })
 
     # -----------------------------------------------------
-    # PASS 2: DETECT CIRCLES
+    # DETECT CIRCLES
     # -----------------------------------------------------
 
     for cnt in contours:
@@ -291,12 +282,16 @@ def detect_circles_and_rectilinear(cleaned_mask):
         if len(cnt) < 20:
             continue
 
+        # ALWAYS DEFINE pts EARLY
+        pts = cnt.reshape(-1, 2).astype(np.float32)
+
+        if len(pts) < 5:
+            continue
+
         area = cv2.contourArea(cnt)
 
         if area < 30:
             continue
-
-        pts = cnt.reshape(-1, 2).astype(np.float32)
 
         x = pts[:, 0]
         y = pts[:, 1]
@@ -307,10 +302,8 @@ def detect_circles_and_rectilinear(cleaned_mask):
         if w_bbox < 10 or h_bbox < 10:
             continue
 
-        aspect = min(w_bbox, h_bbox) / max(w_bbox, h_bbox)
-
         # -------------------------------------------------
-        # CIRCULARITY TEST
+        # CIRCULARITY
         # -------------------------------------------------
 
         circ = contour_circularity(cnt)
@@ -322,45 +315,44 @@ def detect_circles_and_rectilinear(cleaned_mask):
         # ELLIPSE FIT
         # -------------------------------------------------
 
-        if len(cnt) < 5:
-            continue
-
         try:
 
             ellipse = cv2.fitEllipse(cnt)
 
-            (cx, cy), (MA, ma), angle = ellipse
+            (ecx, ecy), (MA, ma), angle = ellipse
 
             major = max(MA, ma)
             minor = min(MA, ma)
 
             ellipse_ratio = minor / (major + 1e-9)
 
-            # Reject elongated ellipses
             if ellipse_ratio < 0.65:
                 continue
 
-        except Exception:
+        except cv2.error:
             continue
 
         # -------------------------------------------------
-        # KASA CIRCLE FIT
+        # KASA FIT
         # -------------------------------------------------
 
         try:
 
-            cx2, cy2, r = _kasa_circle_fit(pts)
-
-            dists = np.sqrt((x - cx2)**2 + (y - cy2)**2)
-
-            rms = np.sqrt(((dists - r)**2).mean())
-
-            rel_err = rms / (r + 1e-9)
+            cx, cy, r = _kasa_circle_fit(pts)
 
         except Exception:
             continue
 
-        # Adaptive tolerance
+        if r < 10 or r > 200:
+            continue
+
+        dists = np.sqrt((x - cx)**2 + (y - cy)**2)
+
+        rms = np.sqrt(((dists - r)**2).mean())
+
+        rel_err = rms / (r + 1e-9)
+
+        # adaptive tolerance
         if r < 30:
             err_thresh = 0.35
         elif r < 60:
@@ -372,37 +364,42 @@ def detect_circles_and_rectilinear(cleaned_mask):
             continue
 
         # -------------------------------------------------
-        # MUST BE INSIDE RECTILINEAR CONTAINER
+        # MUST BE INSIDE RECTILINEAR REGION
         # -------------------------------------------------
 
-        inside_rectilinear = False
+        inside = False
 
         for rect in rectilinear:
 
-            if point_inside_bbox(cx2, cy2, rect['bbox']):
+            if point_inside_bbox(cx, cy, rect['bbox']):
 
-                inside_rectilinear = True
+                inside = True
                 break
 
-        if not inside_rectilinear:
+        if not inside:
             continue
 
         circles.append({
-            'cx': float(cx2),
-            'cy': float(cy2),
+
+            'cx': float(cx),
+            'cy': float(cy),
             'r': float(r),
+
             'circularity': float(circ),
+
             'ellipse_ratio': float(ellipse_ratio),
+
             'rms': float(rel_err)
         })
 
     # -----------------------------------------------------
-    # MERGE DUPLICATE INNER/OUTER STROKES
+    # MERGE DUPLICATES
     # -----------------------------------------------------
 
     circles = sorted(circles, key=lambda c: c['rms'])
 
     merged = []
+
     used = [False] * len(circles)
 
     for i in range(len(circles)):
@@ -444,16 +441,14 @@ def detect_circles_and_rectilinear(cleaned_mask):
 
             'r': float(np.mean([c['r'] for c in group])),
 
+            'rms': float(min(c['rms'] for c in group])),
+
             'circularity': float(np.mean([c['circularity'] for c in group])),
 
-            'ellipse_ratio': float(np.mean([c['ellipse_ratio'] for c in group])),
-
-            'rms': float(min(c['rms'] for c in group))
+            'ellipse_ratio': float(np.mean([c['ellipse_ratio'] for c in group]))
         })
 
-    circles = merged
-
-    return circles, rectilinear
+    return merged, rectilinear
 
 
 # ════════════════════════════════════════════════════════════════════════════
