@@ -441,7 +441,7 @@ def detect_circles_and_rectilinear(cleaned_mask):
 
             'r': float(np.mean([c['r'] for c in group])),
 
-            'rms': float(min(c['rms'] for c in group])),
+            'rms': float(min(c['rms'] for c in group)),
 
             'circularity': float(np.mean([c['circularity'] for c in group])),
 
