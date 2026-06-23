@@ -270,6 +270,7 @@ def detect_circles_and_rectilinear(cleaned_mask):
 
             rectilinear.append({
                 'cnt': cnt,
+                'pts': cnt.reshape(-1, 2).astype(np.float32),
                 'bbox': (x, y, x + w, y + h)
             })
 
