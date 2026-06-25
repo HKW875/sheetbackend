@@ -462,8 +462,10 @@ def detect_circles_and_rectilinear(cleaned_mask):
     Stage 3 — Kasa LS fit on every remaining non-circle contour that is
                roughly round (aspect > 0.5) — catch anything Hough missed.
 
-    Circle-priority rule: any rectilinear bbox that is substantially
-    contained inside a detected circle is dropped.
+    Circle-priority rule v2 (FIXED): Only suppress rectilinear features that
+    are FULLY contained inside a detected circle (85% containment threshold),
+    not merely partially overlapping. This prevents bottom tabs from being
+    incorrectly dropped when they partially overlap with mounting holes.
 
     Returns (circles, rectilinear_contours).
     """
@@ -634,42 +636,69 @@ def detect_circles_and_rectilinear(cleaned_mask):
         sane.append(c)
     circles = _merge_circle_pool(sane)  # re-merge after refinement
 
-    # ── Circle-priority suppression of rectilinear shapes ────────────────
-    # Any rectilinear whose bounding-box centre lies within a circle AND
-    # whose bbox is substantially contained (>50% overlap) by that circle
-    # is discarded — the circle takes priority.
-    def _bbox_overlap_fraction(bbox, cx, cy, r):
-        """Fraction of bbox area covered by circle bounding square."""
-        bx0, by0, bx1, by1 = bbox
-        # Circle AABB
-        cx0, cy0, cx1, cy1 = cx - r, cy - r, cx + r, cy + r
-        ix0, iy0 = max(bx0, cx0), max(by0, cy0)
-        ix1, iy1 = min(bx1, cx1), min(by1, cy1)
-        if ix1 <= ix0 or iy1 <= iy0:
-            return 0.0
-        inter = (ix1 - ix0) * (iy1 - iy0)
-        bbox_area = max((bx1 - bx0) * (by1 - by0), 1.0)
-        return inter / bbox_area
+    # ── Circle-priority suppression of rectilinear shapes (v2 FIXED) ───────
+    # A feature is suppressed only if ALL of the following are true:
+    # 1. Its bounding box center is inside the circle (with small margin)
+    # 2. Its bbox area is significantly smaller than the circle (< 50% of circle area)
+    #    — this prevents the main shape from being suppressed by small circles
+    # 3. At least containment_threshold fraction (default 85%) of its bbox area
+    #    is inside the circle's bounding square
+    #
+    # This fixes the bug where bottom tabs were being lost because their rectangles
+    # partially overlapped with the detected mounting holes.
 
-    def _point_in_circle(px, py, cx, cy, r, margin=1.3):
+    def _bbox_area(bbox):
+        bx0, by0, bx1, by1 = bbox
+        return max((bx1 - bx0) * (by1 - by0), 1.0)
+
+    def _circle_bbox(cx, cy, r):
+        return (cx - r, cy - r, cx + r, cy + r)
+
+    def _intersection_area(bbox1, bbox2):
+        x0 = max(bbox1[0], bbox2[0])
+        y0 = max(bbox1[1], bbox2[1])
+        x1 = min(bbox1[2], bbox2[2])
+        y1 = min(bbox1[3], bbox2[3])
+        if x1 <= x0 or y1 <= y0:
+            return 0.0
+        return (x1 - x0) * (y1 - y0)
+
+    def _point_in_circle(px, py, cx, cy, r, margin=1.15):
         return math.hypot(px - cx, py - cy) < r * margin
 
     rectilinear = []
+    containment_threshold = 0.85
+    center_margin = 1.15
+
     for rc in rectilinear_candidates:
         bx0, by0, bx1, by1 = rc['bbox']
         bcx = (bx0 + bx1) / 2.0
         bcy = (by0 + by1) / 2.0
+        bbox_area = _bbox_area(rc['bbox'])
+
         suppressed = False
         for c in circles:
-            # Centre of rectilinear bbox inside circle (with margin)?
-            if _point_in_circle(bcx, bcy, c['cx'], c['cy'], c['r'], margin=1.25):
-                # AND substantial overlap
-                frac = _bbox_overlap_fraction(
-                    (bx0, by0, bx1, by1), c['cx'], c['cy'], c['r']
-                )
-                if frac > 0.45:
-                    suppressed = True
-                    break
+            cx, cy, r = c['cx'], c['cy'], c['r']
+
+            # Check 1: Center must be inside the circle
+            if not _point_in_circle(bcx, bcy, cx, cy, r, margin=center_margin):
+                continue
+
+            # Check 2: Bbox must be significantly smaller than the circle
+            # (don't suppress the main shape if a circle happens to overlap it)
+            circle_area = math.pi * r * r
+            if bbox_area > circle_area * 0.5:
+                continue
+
+            # Check 3: At least 85% of bbox must be inside the circle
+            circle_bbox = _circle_bbox(cx, cy, r)
+            inter_area = _intersection_area(rc['bbox'], circle_bbox)
+            containment = inter_area / bbox_area
+
+            if containment >= containment_threshold:
+                suppressed = True
+                break
+
         if not suppressed:
             rectilinear.append(rc)
 
@@ -685,63 +714,175 @@ def detect_circles_and_rectilinear(cleaned_mask):
 # STEP 9 — H/V EDGE EXTRACTION (Algebraic Median Fitting on Boundary Points)
 # ════════════════════════════════════════════════════════════════════════════
 
-def extract_hv_edges(rectilinear_contours):
+def _angle_to_cardinal(dx, dy, tol=15):
+    """Classify direction as H (horizontal), V (vertical), or D (diagonal/other)."""
+    angle = math.degrees(math.atan2(abs(dy), abs(dx)))
+    if angle <= tol:
+        return 'H'
+    elif angle >= 90 - tol:
+        return 'V'
+    return 'D'
+
+
+def extract_hv_edges_v2(rectilinear_contours, min_segment_len=30, direction_tol=20):
     """
-    Extract horizontal and vertical edges from rectilinear contours.
-    For each contour, fit lines to the top/bottom/left/right boundary points
-    using algebraic median fitting.
+    Traverse each contour and detect direction changes.
+    Extract line segments between consecutive corners.
     """
     all_edges = []
-
-    for r in rectilinear_contours:
-        pts = r['pts']
-        x, y = pts[:, 0], pts[:, 1]
-        x_min, x_max = float(x.min()), float(x.max())
-        y_min, y_max = float(y.min()), float(y.max())
-
-        margin = max(15, min(x_max - x_min, y_max - y_min) * 0.15)
-
-        # Top edge (horizontal)
-        top_mask = y <= y_min + margin
-        top_pts = pts[top_mask]
-        if len(top_pts) > 2:
-            y_fit = float(np.median(top_pts[:, 1]))
-            x_start = float(np.min(top_pts[:, 0]))
-            x_end = float(np.max(top_pts[:, 0]))
-            all_edges.append({'type': 'H', 'coord': y_fit, 'start': x_start, 'end': x_end})
-
-        # Bottom edge (horizontal)
-        bot_mask = y >= y_max - margin
-        bot_pts = pts[bot_mask]
-        if len(bot_pts) > 2:
-            y_fit = float(np.median(bot_pts[:, 1]))
-            x_start = float(np.min(bot_pts[:, 0]))
-            x_end = float(np.max(bot_pts[:, 0]))
-            all_edges.append({'type': 'H', 'coord': y_fit, 'start': x_start, 'end': x_end})
-
-        # Left edge (vertical)
-        left_mask = x <= x_min + margin
-        left_pts = pts[left_mask]
-        if len(left_pts) > 2:
-            x_fit = float(np.median(left_pts[:, 0]))
-            y_start = float(np.min(left_pts[:, 1]))
-            y_end = float(np.max(left_pts[:, 1]))
-            all_edges.append({'type': 'V', 'coord': x_fit, 'start': y_start, 'end': y_end})
-
-        # Right edge (vertical)
-        right_mask = x >= x_max - margin
-        right_pts = pts[right_mask]
-        if len(right_pts) > 2:
-            x_fit = float(np.median(right_pts[:, 0]))
-            y_start = float(np.min(right_pts[:, 1]))
-            y_end = float(np.max(right_pts[:, 1]))
-            all_edges.append({'type': 'V', 'coord': x_fit, 'start': y_start, 'end': y_end})
-
     
-
+    for rc in rectilinear_contours:
+        pts = rc['pts'].astype(np.float32)
+        if len(pts) < 10:
+            continue
+        
+        # Close the contour
+        pts_closed = np.vstack([pts, pts[0]])
+        n = len(pts_closed)
+        
+        # Smooth to reduce noise-induced direction changes
+        window = 5
+        smoothed = pts_closed.copy()
+        for i in range(n):
+            idx = np.arange(max(0, i - window), min(n, i + window + 1))
+            smoothed[i] = np.mean(pts_closed[idx], axis=0)
+        
+        # Detect direction changes
+        segments = []
+        current_dir = None
+        seg_start = 0
+        
+        for i in range(1, n):
+            dx = smoothed[i][0] - smoothed[i-1][0]
+            dy = smoothed[i][1] - smoothed[i-1][1]
+            if abs(dx) < 1 and abs(dy) < 1:
+                continue
+            
+            d = _angle_to_cardinal(dx, dy, tol=direction_tol)
+            if d == 'D':
+                continue
+            
+            if current_dir is None:
+                current_dir = d
+                seg_start = i - 1
+            elif d != current_dir:
+                if i - 1 - seg_start >= 3:
+                    segments.append((seg_start, i - 1, current_dir))
+                current_dir = d
+                seg_start = i - 1
+        
+        if current_dir is not None and n - 1 - seg_start >= 3:
+            segments.append((seg_start, n - 1, current_dir))
+        
+        # Merge consecutive same-direction segments
+        merged = []
+        for start, end, d in segments:
+            if merged and merged[-1][2] == d:
+                merged[-1] = (merged[-1][0], end, d)
+            else:
+                merged.append((start, end, d))
+        segments = merged
+        
+        # Fit lines to each segment
+        for start, end, d in segments:
+            seg_pts = smoothed[start:end+1]
+            if len(seg_pts) < 3:
+                continue
+            
+            if d == 'H':
+                y_coord = float(np.median(seg_pts[:, 1]))
+                x_start = float(np.min(seg_pts[:, 0]))
+                x_end = float(np.max(seg_pts[:, 0]))
+                if x_end - x_start >= min_segment_len:
+                    all_edges.append({'type': 'H', 'coord': y_coord, 'start': x_start, 'end': x_end})
+            else:
+                x_coord = float(np.median(seg_pts[:, 0]))
+                y_start = float(np.min(seg_pts[:, 1]))
+                y_end = float(np.max(seg_pts[:, 1]))
+                if y_end - y_start >= min_segment_len:
+                    all_edges.append({'type': 'V', 'coord': x_coord, 'start': y_start, 'end': y_end})
+    
     return all_edges
 
+def extract_hv_edges_hough(cleaned_mask, min_line_len=40, max_gap=20, angle_tol=5):
+    """
+    Run cv2.HoughLinesP on the cleaned mask to find ALL line segments.
+    Filter by orientation (H/V).
+    
+    Parameters:
+        cleaned_mask: binary mask with strokes as white (255)
+        min_line_len: minimum line length in pixels (default 40)
+        max_gap: maximum gap between segments to merge (default 20)
+        angle_tol: degrees from pure H/V to still classify (default 5)
+    """
+    edges = cv2.Canny(cleaned_mask, 30, 100)
+    
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi/180,
+        threshold=30,
+        minLineLength=min_line_len,
+        maxLineGap=max_gap
+    )
+    
+    h_lines = []
+    v_lines = []
+    
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            dx = x2 - x1
+            dy = y2 - y1
+            length = math.hypot(dx, dy)
+            if length < min_line_len:
+                continue
+            
+            angle = math.degrees(math.atan2(abs(dy), abs(dx)))
+            
+            if angle <= angle_tol:  # Horizontal
+                y_avg = (y1 + y2) / 2.0
+                h_lines.append({'type': 'H', 'coord': float(y_avg), 
+                                'start': float(min(x1, x2)), 'end': float(max(x1, x2))})
+            elif angle >= 90 - angle_tol:  # Vertical
+                x_avg = (x1 + x2) / 2.0
+                v_lines.append({'type': 'V', 'coord': float(x_avg),
+                                'start': float(min(y1, y2)), 'end': float(max(y1, y2))})
+    
+    return h_lines + v_lines
 
+def extract_hv_edges_combined(rectilinear_contours, cleaned_mask, 
+                              min_segment_len=30, direction_tol=20,
+                              hough_min_len=40, hough_max_gap=20, angle_tol=5):
+    """
+    PRIMARY REPLACEMENT for extract_hv_edges in process.py.
+    
+    Combines contour traversal (primary) with HoughLinesP (fallback).
+    Hough edges are only added if they don't overlap with contour edges.
+    """
+    edges_contour = extract_hv_edges_v2(rectilinear_contours, min_segment_len, direction_tol)
+    edges_hough = extract_hv_edges_hough(cleaned_mask, hough_min_len, hough_max_gap, angle_tol)
+    
+    all_edges = list(edges_contour)
+    
+    for h in edges_hough:
+        covered = False
+        for e in edges_contour:
+            if e['type'] != h['type']:
+                continue
+            coord_diff = abs(e['coord'] - h['coord'])
+            overlap = min(e['end'], h['end']) - max(e['start'], h['start'])
+            span_e = e['end'] - e['start']
+            span_h = h['end'] - h['start']
+            
+            if coord_diff < 25 and overlap > 0.5 * min(span_e, span_h):
+                covered = True
+                break
+        
+        if not covered:
+            all_edges.append(h)
+    
+    return all_edges
 # ════════════════════════════════════════════════════════════════════════════
 # STEPS 10-14 — DEDUP, SNAP, ALIGN, FILTER, MERGE
 # ════════════════════════════════════════════════════════════════════════════
@@ -1346,7 +1487,7 @@ def main():
 
     # ── STEP 8: H/V Edge Extraction ───────────────────────────────────────
     t0 = now_ms()
-    segments = extract_hv_edges(rectilinear)
+    segments = extract_hv_edges_combined(rectilinear, cleaned)
     steps.append(step_record("GEO-8: H/V Edge Extraction (algebraic median on boundary)",
                               f"{len(segments)} raw edges", t0))
 
