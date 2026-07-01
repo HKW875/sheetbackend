@@ -1,1646 +1,450 @@
 #!/usr/bin/env python3
-"""
-SheetForge — CV Pipeline  v13  (HoughCircles + Hierarchy Ring Merge + Circle-Priority)
-================================================================
-Receives: image_path, options_json (from node child_process)
-Outputs:  JSON on stdout  { steps, analysis, dwg, dxfContent, pdfAvailable }
-
-WHAT CHANGED IN v12 AND WHY
------------------------------
-v11 used approxPolyDP for corner detection and rectilinear fitting, which
-produced yellow dots at every vertex (including collinear points) and could
-not guarantee fully connected H/V chains. 
-
-FIX: Complete rewrite of the shape extraction pipeline:
-  1. SKIP approxPolyDP entirely — use algebraic least squares fitting instead.
-  2. Detect circles simultaneously using contour analysis + Kasa algebraic
-     circle fit on each contour's point cloud.
-  3. For rectilinear contours: extract H/V edges by fitting lines to boundary
-     points using algebraic median fitting, then deduplicate, snap corners,
-     align symmetrically, and remove unconnected dangling segments.
-  4. Yellow dots ONLY at H-V intersections (true direction changes), NEVER on
-     circles. All H/V segments form one continuous unbroken contour.
-  5. Multiple parallel lines are merged; only one representative line per
-     physical edge is kept.
-
-Pipeline:
-  1.  Load image
-  2.  Median Blur                (salt-and-pepper pre-clean)
-  3.  Adaptive Threshold         (binarise, strokes = WHITE)
-  4.  Morph Open + Close         (remove spurs, fill 1px gaps)
-  5.  Connected-Component Filter (remove EVERY blob < minBlobArea)
-  6.  Canny Edge Detection       (visualisation / PDF preview only)
-  7.  Contour Extraction          (findContours on cleaned mask, NO approxPolyDP)
-  8.  Circle Detection            (Kasa algebraic LS fit per contour)
-  9.  H/V Edge Extraction         (algebraic median fitting on boundary points)
-  10. Parallel Deduplication      (Union-Find clustering, median coords)
-  11. Corner Snapping             (extend/trim to exact H-V intersections)
-  12. Symmetric Alignment         (cluster + median align intersection points)
-  13. Unconnected Filter         (remove dangling segments)
-  14. Final Parallel Merge        (keep one line per physical edge)
-  15. DXF Export — CLEAN         (CIRCLE + 2-point LWPOLYLINE per segment)
-  16. PNG Preview                (side-by-side: Canny vs final shapes + yellow dots)
-  17. PDF Export                 (reportlab)
-"""
-
-import sys, os, json, time, traceback, math
-from pathlib import Path
-from itertools import combinations
-from collections import defaultdict
-from shapely.geometry import LineString
-from shapely.ops import unary_union, snap, linemerge
-
-# ── Graceful optional imports ────────────────────────────────────────────────
-def _try(fn):
-    try: return fn()
-    except Exception: return None
-
-cv2           = _try(lambda: __import__("cv2"))
-np            = _try(lambda: __import__("numpy"))
-ezdxf         = _try(lambda: __import__("ezdxf"))
-Image         = _try(lambda: __import__("PIL.Image", fromlist=["Image"]))
-reportlab_mod = _try(lambda: __import__("reportlab"))
-
-HAS_CV  = cv2 is not None and np is not None
-HAS_DXF = ezdxf is not None
-HAS_PIL = Image is not None
-HAS_RL  = reportlab_mod is not None
-
-def now_ms(): return int(time.time() * 1000)
-def step_record(name, details, t0):
-    return {"name": name, "status": "done", "duration": now_ms() - t0, "details": details}
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# STEP 1 — LOAD IMAGE
-# ════════════════════════════════════════════════════════════════════════════
-
-def load_image(image_path):
-    if not HAS_CV:
-        raise RuntimeError("OpenCV (cv2) is not installed.")
-    if not image_path or not os.path.exists(image_path):
-        raise FileNotFoundError(f"Image not found: {image_path}")
-
-    bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
-    if bgr is None or bgr.size == 0:
-        raise ValueError(f"cv2.imread returned None for: {image_path}")
-
-    dpi = 96.0
-    if HAS_PIL:
-        try:
-            pil  = Image.open(str(image_path))
-            xdpi = pil.info.get("dpi", (96, 96))
-            dpi  = float(xdpi[0]) if xdpi and xdpi[0] > 1 else 96.0
-        except Exception:
-            pass
-
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    img_h, img_w = bgr.shape[:2]
-    return bgr, gray, dpi, img_w, img_h
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# STEPS 2-5 — DENOISE / BINARISE / SPECKLE REMOVAL
-# ════════════════════════════════════════════════════════════════════════════
-
-def median_blur(gray, ksize=5):
-    if ksize % 2 == 0: ksize += 1
-    return cv2.medianBlur(gray, ksize)
-
-def adaptive_threshold_binarize(blurred):
-    return cv2.adaptiveThreshold(
-        blurred, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        blockSize=15, C=4,
-    )
-
-def morph_clean(binary):
-    open_kernel  = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
-    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  open_kernel,  iterations=1)
-    closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, close_kernel, iterations=1)
-    return closed
-
-def _remove_small_blobs_once(binary, min_area):
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
-    cleaned = np.zeros_like(binary)
-    removed_px = 0
-    removed_blobs = 0
-    for lbl in range(1, num_labels):
-        area = int(stats[lbl, cv2.CC_STAT_AREA])
-        if area >= min_area:
-            cleaned[labels == lbl] = 255
-        else:
-            removed_px += area
-            removed_blobs += 1
-    return cleaned, removed_blobs, removed_px
-
-def remove_small_blobs(binary, min_area, aggressive=True):
-    cleaned, removed_blobs, removed_px = _remove_small_blobs_once(binary, min_area)
-    if aggressive:
-        erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        eroded = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, erode_kernel, iterations=1)
-        cleaned2, rb2, rp2 = _remove_small_blobs_once(eroded, min_area)
-        if rb2 > 0:
-            cleaned = cleaned2
-            removed_blobs += rb2
-            removed_px += rp2
-    return cleaned, removed_blobs, removed_px
-
-def canny_edges(cleaned, low_threshold=20, high_threshold=80):
-    return cv2.Canny(cleaned, low_threshold, high_threshold)
-
-def clean_edge_preview(edges, min_blob_area=3):
-    edges_clean, removed_blobs, removed_px = remove_small_blobs(edges, min_blob_area)
-    return edges_clean, removed_blobs, removed_px
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# STEPS 7-8 — CONTOUR EXTRACTION + CIRCLE DETECTION (v13: HoughCircles +
-#              Contour Hierarchy inner/outer merge + Circle-Priority suppression)
-# ════════════════════════════════════════════════════════════════════════════
-
-def _kasa_circle_fit(pts_xy):
-    """Kasa algebraic least squares circle fit. Returns (cx, cy, r)."""
-    x, y = pts_xy[:, 0].copy(), pts_xy[:, 1].copy()
-    A = np.column_stack([x, y, np.ones(len(x))])
-    b = x**2 + y**2
-    res, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
-    cx = res[0] / 2.0
-    cy = res[1] / 2.0
-    r = math.sqrt(abs(res[2] + cx**2 + cy**2))
-    return cx, cy, r
-
-
-def _hough_circles(cleaned_mask):
-    """
-    HoughCircles prefilter: targeted sweep to find circles the contour
-    classifier might miss (e.g. thick-stroked rings that look boxy).
-    Returns list of {'cx','cy','r'} dicts.
-
-    Conservative thresholds are used so only geometrically convincing
-    circles are returned; spurious Hough noise is filtered by:
-      - high accumulator threshold (param2)
-      - minDist large enough to separate real circles
-      - radius sanity bounds (min 20px, max 30% of image diagonal)
-      - centre must lie within the image bounds
-    """
-    blurred = cv2.GaussianBlur(cleaned_mask, (9, 9), 2)
-    h, w = blurred.shape
-    img_diag = math.hypot(w, h)
-
-    raw = cv2.HoughCircles(
-        blurred,
-        cv2.HOUGH_GRADIENT,
-        dp=1.5,
-        minDist=max(40, int(img_diag * 0.06)),   # circles must be well-separated
-        param1=120,   # Canny high threshold
-        param2=65,    # accumulator threshold — high to avoid paper-texture arcs
-        minRadius=max(20, int(img_diag * 0.01)),
-        maxRadius=int(img_diag * 0.30),
-    )
-    results = []
-    if raw is not None:
-        for cx, cy, r in raw[0]:
-            # Centre must be reasonably inside the image
-            if cx - r < -r * 0.5 or cy - r < -r * 0.5:
-                continue
-            if cx + r > w + r * 0.5 or cy + r > h + r * 0.5:
-                continue
-            results.append({'cx': float(cx), 'cy': float(cy), 'r': float(r),
-                            'rms': 0.0, 'source': 'hough'})
-    return results
-
-
-def _stroke_width_radius(cleaned_mask, cx, cy, r):
-    """
-    Estimate the stroke half-width around a circle centre at radius r
-    by sampling pixel intensity along radial directions.
-    Returns half the stroke width in pixels.
-    """
-    N = 36
-    inner_hits, outer_hits = [], []
-    for k in range(N):
-        angle = 2 * math.pi * k / N
-        cos_a, sin_a = math.cos(angle), math.sin(angle)
-        # scan outward
-        for dr in range(int(r * 0.5), int(r * 1.8)):
-            px = int(round(cx + cos_a * dr))
-            py = int(round(cy + sin_a * dr))
-            if 0 <= py < cleaned_mask.shape[0] and 0 <= px < cleaned_mask.shape[1]:
-                if cleaned_mask[py, px] > 0:
-                    if not inner_hits or dr - inner_hits[-1] > 3:
-                        inner_hits.append(dr)
-                    outer_hits.append(dr)
-    if not outer_hits:
-        return 3.0
-    return max(3.0, float(np.median(outer_hits) - np.median(inner_hits)) / 2.0)
-
-
-def _merge_circle_pool(pool):
-    """
-    Merge nearby/duplicate circles in a pool using centre-distance + radius
-    similarity. Returns deduplicated list.
-    """
-    if not pool:
-        return []
-    pool = sorted(pool, key=lambda c: c['rms'])
-    used = [False] * len(pool)
-    merged = []
-    for i in range(len(pool)):
-        if used[i]:
-            continue
-        c1 = pool[i]
-        group = [c1]
-        used[i] = True
-        for j in range(i + 1, len(pool)):
-            if used[j]:
-                continue
-            c2 = pool[j]
-            dc = math.hypot(c1['cx'] - c2['cx'], c1['cy'] - c2['cy'])
-            dr = abs(c1['r'] - c2['r']) / max(c1['r'], c2['r'], 1e-9)
-            # Generous merge: centres within 60px AND radii within 40%
-            if dc < 60 and dr < 0.40:
-                group.append(c2)
-                used[j] = True
-        merged.append({
-            'cx':  float(np.mean([c['cx']  for c in group])),
-            'cy':  float(np.mean([c['cy']  for c in group])),
-            'r':   float(np.mean([c['r']   for c in group])),
-            'rms': float(min(c['rms'] for c in group)),
-        })
-    return merged
-
-
-def _line_segment_intersection(p1, p2, p3, p4):
-    """
-    Compute intersection of line segment (p1,p2) with line segment (p3,p4).
-    Returns (x, y) if they intersect within both segments, else None.
-    Uses parametric form with cross-product.
-    """
-    x1, y1 = p1
-    x2, y2 = p2
-    x3, y3 = p3
-    x4, y4 = p4
-
-    denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
-    if abs(denom) < 1e-9:
-        return None  # parallel or collinear
-
-    t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
-    u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / denom
-
-    if 0 <= t <= 1 and 0 <= u <= 1:
-        ix = x1 + t * (x2 - x1)
-        iy = y1 + t * (y2 - y1)
-        return (ix, iy)
-    return None
-
-
-def _extend_and_trim_edges(edges, img_w, img_h, max_extend=2000):
-    """
-    Extend any edge endpoint that is not attached to another edge
-    until it intersects with another edge, then trim it at that intersection.
-
-    edges: list of dicts with 'pts' (Nx2 numpy array of points along the edge)
-    Returns: list of edges with extended/trimmed points.
-    """
-    if not edges:
-        return edges
-
-    # Convert each edge to a line segment (start, end) for intersection tests
-    segments = []
-    for e in edges:
-        pts = e['pts']
-        if len(pts) < 2:
-            segments.append(None)
-            continue
-        p_start = (float(pts[0, 0]), float(pts[0, 1]))
-        p_end = (float(pts[-1, 0]), float(pts[-1, 1]))
-        # Compute direction vector
-        dx = p_end[0] - p_start[0]
-        dy = p_end[1] - p_start[1]
-        length = math.hypot(dx, dy)
-        if length < 1e-9:
-            segments.append(None)
-            continue
-        # Normalized direction
-        ux, uy = dx / length, dy / length
-        segments.append({
-            'start': p_start,
-            'end': p_end,
-            'dir': (ux, uy),
-            'length': length,
-            'pts': pts,
-        })
-
-    # Build endpoint connectivity: for each endpoint, find if it touches another edge
-    # Two endpoints are "attached" if they are within a small tolerance
-    attach_tol = 5.0  # pixels
-
-    def _endpoints_touch(i, which_i, j, which_j):
-        """Check if endpoint which_i of edge i touches endpoint which_j of edge j."""
-        if segments[i] is None or segments[j] is None:
-            return False
-        pi = segments[i]['start'] if which_i == 'start' else segments[i]['end']
-        pj = segments[j]['start'] if which_j == 'start' else segments[j]['end']
-        return math.hypot(pi[0] - pj[0], pi[1] - pj[1]) < attach_tol
-
-    # For each endpoint, determine if it's attached to any other edge
-    n = len(edges)
-    attached = {'start': [False] * n, 'end': [False] * n}
-    for i in range(n):
-        for j in range(n):
-            if i == j:
-                continue
-            for end_i in ['start', 'end']:
-                for end_j in ['start', 'end']:
-                    if _endpoints_touch(i, end_i, j, end_j):
-                        attached[end_i][i] = True
-
-    # Now extend unattached endpoints and find intersections
-    modified_edges = []
-    for i in range(n):
-        if segments[i] is None:
-            modified_edges.append(edges[i])
-            continue
-
-        seg = segments[i]
-        pts = seg['pts'].copy()
-        new_start = None
-        new_end = None
-
-        # Extend start if unattached
-        if not attached['start'][i]:
-            ux, uy = seg['dir']
-            # Extend backward from start
-            ext_x = seg['start'][0] - ux * max_extend
-            ext_y = seg['start'][1] - uy * max_extend
-            ext_end = (ext_x, ext_y)
-            best_inter = None
-            best_dist = float('inf')
-            for j in range(n):
-                if i == j or segments[j] is None:
-                    continue
-                # Check intersection with edge j's segment
-                inter = _line_segment_intersection(
-                    seg['start'], ext_end,
-                    segments[j]['start'], segments[j]['end']
-                )
-                if inter is not None:
-                    d = math.hypot(inter[0] - seg['start'][0], inter[1] - seg['start'][1])
-                    if d < best_dist and d > 1.0:  # must extend outward, not at origin
-                        best_dist = d
-                        best_inter = inter
-            if best_inter is not None:
-                new_start = best_inter
-
-        # Extend end if unattached
-        if not attached['end'][i]:
-            ux, uy = seg['dir']
-            ext_x = seg['end'][0] + ux * max_extend
-            ext_y = seg['end'][1] + uy * max_extend
-            ext_end = (ext_x, ext_y)
-            best_inter = None
-            best_dist = float('inf')
-            for j in range(n):
-                if i == j or segments[j] is None:
-                    continue
-                inter = _line_segment_intersection(
-                    seg['end'], ext_end,
-                    segments[j]['start'], segments[j]['end']
-                )
-                if inter is not None:
-                    d = math.hypot(inter[0] - seg['end'][0], inter[1] - seg['end'][1])
-                    if d < best_dist and d > 1.0:
-                        best_dist = d
-                        best_inter = inter
-            if best_inter is not None:
-                new_end = best_inter
-
-        # Rebuild the edge points
-        new_pts = []
-        if new_start is not None:
-            new_pts.append([new_start[0], new_start[1]])
-        # Add original interior points (skip first and last if replaced)
-        for k in range(len(pts)):
-            if k == 0 and new_start is not None:
-                continue
-            if k == len(pts) - 1 and new_end is not None:
-                continue
-            new_pts.append([float(pts[k, 0]), float(pts[k, 1])])
-        if new_end is not None:
-            new_pts.append([new_end[0], new_end[1]])
-
-        if len(new_pts) >= 2:
-            modified_edges.append({
-                'pts': np.array(new_pts, dtype=np.float32),
-                'bbox': edges[i].get('bbox', None),
-                'contour_idx': edges[i].get('contour_idx', -1),
-            })
-        else:
-            modified_edges.append(edges[i])
-
-    return modified_edges
-
-
-def detect_circles_and_rectilinear(cleaned_mask):
-    """
-    v14 — Three-stage circle detection with contour-hierarchy inner/outer
-    ring merging, then circle-priority suppression of rectilinear shapes.
-
-    NEW: Rectilinear edges are extended at unattached endpoints until they
-    intersect with another edge, then trimmed at that intersection point.
-    This ensures a closed, gap-free line drawing with no dangling edges.
-
-    Stage 1 — HoughCircles prefilter (broad, catches thick-stroked rings).
-    Stage 2 — Contour extraction with RETR_TREE hierarchy; inner/outer ring
-               pairs (child contour nested inside parent) are merged to a
-               single representative circle via Kasa algebraic LS fit on the
-               combined point cloud.
-    Stage 3 — Kasa LS fit on every remaining non-circle contour that is
-               roughly round (aspect > 0.5) — catch anything Hough missed.
-
-    Circle-priority rule v2 (FIXED): Only suppress rectilinear features that
-    are FULLY contained inside a detected circle (85% containment threshold),
-    not merely partially overlapping. This prevents bottom tabs from being
-    incorrectly dropped when they partially overlap with mounting holes.
-
-    Returns (circles, rectilinear_contours).
-    """
-    # ── Stage 1: HoughCircles prefilter ─────────────────────────────────
-    hough_circles = _hough_circles(cleaned_mask)
-
-    # ── Stage 2: Contour extraction with hierarchy ───────────────────────
-    contours, hierarchy = cv2.findContours(
-        cleaned_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE
-    )
-
-    circle_pool = list(hough_circles)   # start with Hough hits
-    rectilinear_candidates = []
-    contour_circle_idx = set()          # contour indices classified as circle
-
-    if hierarchy is not None and len(contours) > 0:
-        hier = hierarchy[0]  # shape: (N, 4) — next, prev, child, parent
-
-        # Build a lookup: for each contour, collect its children
-        children = defaultdict(list)
-        for idx in range(len(hier)):
-            parent_idx = hier[idx][3]
-            if parent_idx >= 0:
-                children[parent_idx].append(idx)
-
-        def _try_kasa_on_pts(pts):
-            if len(pts) < 20:
-                return None
-            pts = pts.astype(np.float32)
-            x, y = pts[:, 0], pts[:, 1]
-            w_bbox = float(x.max() - x.min())
-            h_bbox = float(y.max() - y.min())
-            if w_bbox < 10 or h_bbox < 10:
-                return None
-            aspect = min(w_bbox, h_bbox) / max(w_bbox, h_bbox)
-            if aspect < 0.45:
-                return None
-            try:
-                cx, cy, r = _kasa_circle_fit(pts)
-                dists = np.sqrt((x - cx)**2 + (y - cy)**2)
-                rms = np.sqrt(((dists - r)**2).mean())
-                rel_err = rms / (r + 1e-9)
-                if rel_err < 0.14 and 8 < r < 800:
-                    return {'cx': float(cx), 'cy': float(cy), 'r': float(r),
-                            'rms': float(rel_err), 'source': 'kasa'}
-            except Exception:
-                pass
-            return None
-
-        processed = set()
-
-        for i in range(len(contours)):
-            if i in processed:
-                continue
-
-            cnt_i = contours[i]
-            if len(cnt_i) < 10:
-                processed.add(i)
-                continue
-
-            # ── Try to pair with children (inner/outer ring detection) ──
-            # Combine this contour + its immediate children into one point cloud
-            child_ids = children.get(i, [])
-            combined_pts = cnt_i.reshape(-1, 2)
-            for ci in child_ids:
-                combined_pts = np.vstack([combined_pts, contours[ci].reshape(-1, 2)])
-
-            # Attempt Kasa fit on combined cloud (inner+outer ring together)
-            result = _try_kasa_on_pts(combined_pts)
-            if result is not None:
-                circle_pool.append(result)
-                contour_circle_idx.add(i)
-                for ci in child_ids:
-                    contour_circle_idx.add(ci)
-                processed.add(i)
-                for ci in child_ids:
-                    processed.add(ci)
-                continue
-
-            # ── Fallback: fit contour alone ──────────────────────────────
-            result = _try_kasa_on_pts(cnt_i.reshape(-1, 2))
-            if result is not None:
-                circle_pool.append(result)
-                contour_circle_idx.add(i)
-                processed.add(i)
-                continue
-
-            # ── Not a circle — rectilinear candidate ─────────────────────
-            pts = cnt_i.reshape(-1, 2).astype(np.float32)
-            x, y = pts[:, 0], pts[:, 1]
-            w_bbox = float(x.max() - x.min())
-            h_bbox = float(y.max() - y.min())
-            if w_bbox >= 10 and h_bbox >= 10 and len(pts) >= 20:
-                rectilinear_candidates.append({
-                    'pts': pts,
-                    'bbox': (float(x.min()), float(y.min()),
-                             float(x.max()), float(y.max())),
-                    'contour_idx': i,
-                })
-            processed.add(i)
-
-    # ── Stage 3: Merge circle pool → deduplicated circles ────────────────
-    circles = _merge_circle_pool(circle_pool)
-
-    # Sanity filter: drop circles whose centre is mostly outside the image
-    # or whose radius is implausible, then verify each remaining circle
-    # against the actual mask pixels using a Kasa residual check.
-    img_h, img_w = cleaned_mask.shape
-    img_diag = math.hypot(img_w, img_h)
-    # Max radius: cap at 12% of image width. This prevents the outer
-    # rectilinear border (whose rounded corners look like giant arcs) from
-    # being detected as a very large circle. Real circles in hand-drawn
-    # engineering sketches rarely exceed this fraction of the image.
-    max_r = min(img_w, img_h) * 0.12
-
-    sane = []
-    for c in circles:
-        cx, cy, r = c['cx'], c['cy'], c['r']
-        # Centre must be inside the image
-        if cx < 0 or cx > img_w or cy < 0 or cy > img_h:
-            continue
-        # Radius bounds
-        if r < 15 or r > max_r:
-            continue
-        # Verify: sample ring pixels and compute Kasa residual
-        # Sample points on a ring of width ±stroke around the fitted radius
-        stroke = max(8, r * 0.12)
-        N = 72
-        ring_pts = []
-        for k in range(N):
-            angle = 2 * math.pi * k / N
-            # scan inward/outward across expected stroke
-            for dr in range(int(-stroke), int(stroke) + 1, 2):
-                px = int(round(cx + math.cos(angle) * (r + dr)))
-                py = int(round(cy + math.sin(angle) * (r + dr)))
-                if 0 <= py < img_h and 0 <= px < img_w:
-                    if cleaned_mask[py, px] > 0:
-                        ring_pts.append([float(px), float(py)])
-        # Check angular coverage: at least 65% of sampled directions should hit ink
-        hit_directions = sum(
-            1 for k in range(N)
-            if any(
-                0 <= int(round(cy + math.sin(2*math.pi*k/N)*(r+dr))) < img_h and
-                0 <= int(round(cx + math.cos(2*math.pi*k/N)*(r+dr))) < img_w and
-                cleaned_mask[
-                    int(round(cy + math.sin(2*math.pi*k/N)*(r+dr))),
-                    int(round(cx + math.cos(2*math.pi*k/N)*(r+dr)))
-                ] > 0
-                for dr in range(int(-stroke), int(stroke)+1, 2)
-            )
-        )
-        if hit_directions < N * 0.60:
-            continue  # incomplete arc — likely a corner or partial arc
-        if len(ring_pts) < 20:
-            continue  # not enough ink on the ring — spurious
-        ring_pts = np.array(ring_pts, dtype=np.float32)
-        try:
-            kcx, kcy, kr = _kasa_circle_fit(ring_pts)
-            dists = np.sqrt((ring_pts[:, 0] - kcx)**2 + (ring_pts[:, 1] - kcy)**2)
-            rel_err = np.sqrt(((dists - kr)**2).mean()) / (kr + 1e-9)
-            if rel_err > 0.12:
-                continue  # ring pixels don't form a clean circle
-            # Replace Hough estimate with Kasa-refined one
-            c = {'cx': float(kcx), 'cy': float(kcy), 'r': float(kr),
-                 'rms': float(rel_err), 'source': 'hough_verified'}
-        except Exception:
-            pass
-        sane.append(c)
-    circles = _merge_circle_pool(sane)  # re-merge after refinement
-
-    # ── Circle-priority suppression of rectilinear shapes (v2 FIXED) ───────
-    # A feature is suppressed only if ALL of the following are true:
-    # 1. Its bounding box center is inside the circle (with small margin)
-    # 2. Its bbox area is significantly smaller than the circle (< 50% of circle area)
-    #    — this prevents the main shape from being suppressed by small circles
-    # 3. At least containment_threshold fraction (default 85%) of its bbox area
-    #    is inside the circle's bounding square
-    #
-    # This fixes the bug where bottom tabs were being lost because their rectangles
-    # partially overlapped with the detected mounting holes.
-
-    def _bbox_area(bbox):
-        bx0, by0, bx1, by1 = bbox
-        return max((bx1 - bx0) * (by1 - by0), 1.0)
-
-    def _circle_bbox(cx, cy, r):
-        return (cx - r, cy - r, cx + r, cy + r)
-
-    def _intersection_area(bbox1, bbox2):
-        x0 = max(bbox1[0], bbox2[0])
-        y0 = max(bbox1[1], bbox2[1])
-        x1 = min(bbox1[2], bbox2[2])
-        y1 = min(bbox1[3], bbox2[3])
-        if x1 <= x0 or y1 <= y0:
-            return 0.0
-        return (x1 - x0) * (y1 - y0)
-
-    def _point_in_circle(px, py, cx, cy, r, margin=1.15):
-        return math.hypot(px - cx, py - cy) < r * margin
-
-    rectilinear = []
-    containment_threshold = 0.85
-    center_margin = 1.15
-
-    for rc in rectilinear_candidates:
-        bx0, by0, bx1, by1 = rc['bbox']
-        bcx = (bx0 + bx1) / 2.0
-        bcy = (by0 + by1) / 2.0
-        bbox_area = _bbox_area(rc['bbox'])
-
-        suppressed = False
-        for c in circles:
-            cx, cy, r = c['cx'], c['cy'], c['r']
-
-            # Check 1: Center must be inside the circle
-            if not _point_in_circle(bcx, bcy, cx, cy, r, margin=center_margin):
-                continue
-
-            # Check 2: Bbox must be significantly smaller than the circle
-            # (don't suppress the main shape if a circle happens to overlap it)
-            circle_area = math.pi * r * r
-            if bbox_area > circle_area * 0.5:
-                continue
-
-            # Check 3: At least 85% of bbox must be inside the circle
-            circle_bbox = _circle_bbox(cx, cy, r)
-            inter_area = _intersection_area(rc['bbox'], circle_bbox)
-            containment = inter_area / bbox_area
-
-            if containment >= containment_threshold:
-                suppressed = True
-                break
-
-        if not suppressed:
-            rectilinear.append(rc)
-
-    # ── NEW: Extend and trim unattached rectilinear edges ───────────────
-    # Any edge endpoint not attached to another edge is extended along its
-    # direction until it intersects another edge, then trimmed there.
-    rectilinear = _extend_and_trim_edges(rectilinear, img_w, img_h)
-
-    return circles, rectilinear
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# STEP 9 — H/V EDGE EXTRACTION (Algebraic Median Fitting on Boundary Points)
-# ════════════════════════════════════════════════════════════════════════════
-
-def _angle_to_cardinal(dx, dy, tol=15):
-    """Classify direction as H (horizontal), V (vertical), or D (diagonal/other)."""
-    angle = math.degrees(math.atan2(abs(dy), abs(dx)))
-    if angle <= tol:
-        return 'H'
-    elif angle >= 90 - tol:
-        return 'V'
-    return 'D'
-
-
-def extract_hv_edges_v2(rectilinear_contours, min_segment_len=30, direction_tol=20):
-    """
-    Traverse each contour and detect direction changes.
-    Extract line segments between consecutive corners.
-    """
-    all_edges = []
-    
-    for rc in rectilinear_contours:
-        pts = rc['pts'].astype(np.float32)
-        if len(pts) < 10:
-            continue
-        
-        # Close the contour
-        pts_closed = np.vstack([pts, pts[0]])
-        n = len(pts_closed)
-        
-        # Smooth to reduce noise-induced direction changes
-        window = 5
-        smoothed = pts_closed.copy()
-        for i in range(n):
-            idx = np.arange(max(0, i - window), min(n, i + window + 1))
-            smoothed[i] = np.mean(pts_closed[idx], axis=0)
-        
-        # Detect direction changes
-        segments = []
-        current_dir = None
-        seg_start = 0
-        
-        for i in range(1, n):
-            dx = smoothed[i][0] - smoothed[i-1][0]
-            dy = smoothed[i][1] - smoothed[i-1][1]
-            if abs(dx) < 1 and abs(dy) < 1:
-                continue
-            
-            d = _angle_to_cardinal(dx, dy, tol=direction_tol)
-            if d == 'D':
-                continue
-            
-            if current_dir is None:
-                current_dir = d
-                seg_start = i - 1
-            elif d != current_dir:
-                if i - 1 - seg_start >= 3:
-                    segments.append((seg_start, i - 1, current_dir))
-                current_dir = d
-                seg_start = i - 1
-        
-        if current_dir is not None and n - 1 - seg_start >= 3:
-            segments.append((seg_start, n - 1, current_dir))
-        
-        # Merge consecutive same-direction segments
-        merged = []
-        for start, end, d in segments:
-            if merged and merged[-1][2] == d:
-                merged[-1] = (merged[-1][0], end, d)
-            else:
-                merged.append((start, end, d))
-        segments = merged
-        
-        # Fit lines to each segment
-        for start, end, d in segments:
-            seg_pts = smoothed[start:end+1]
-            if len(seg_pts) < 3:
-                continue
-            
-            if d == 'H':
-                y_coord = float(np.median(seg_pts[:, 1]))
-                x_start = float(np.min(seg_pts[:, 0]))
-                x_end = float(np.max(seg_pts[:, 0]))
-                if x_end - x_start >= min_segment_len:
-                    all_edges.append({'type': 'H', 'coord': y_coord, 'start': x_start, 'end': x_end})
-            else:
-                x_coord = float(np.median(seg_pts[:, 0]))
-                y_start = float(np.min(seg_pts[:, 1]))
-                y_end = float(np.max(seg_pts[:, 1]))
-                if y_end - y_start >= min_segment_len:
-                    all_edges.append({'type': 'V', 'coord': x_coord, 'start': y_start, 'end': y_end})
-    
-    return all_edges
-
-def extract_hv_edges_hough(cleaned_mask, min_line_len=40, max_gap=20, angle_tol=5):
-    """
-    Run cv2.HoughLinesP on the cleaned mask to find ALL line segments.
-    Filter by orientation (H/V).
-    
-    Parameters:
-        cleaned_mask: binary mask with strokes as white (255)
-        min_line_len: minimum line length in pixels (default 40)
-        max_gap: maximum gap between segments to merge (default 20)
-        angle_tol: degrees from pure H/V to still classify (default 5)
-    """
-    edges = cv2.Canny(cleaned_mask, 30, 100)
-    
-    lines = cv2.HoughLinesP(
-        edges,
-        rho=1,
-        theta=np.pi/180,
-        threshold=30,
-        minLineLength=min_line_len,
-        maxLineGap=max_gap
-    )
-    
-    h_lines = []
-    v_lines = []
-    
-    if lines is not None:
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
-            dx = x2 - x1
-            dy = y2 - y1
-            length = math.hypot(dx, dy)
-            if length < min_line_len:
-                continue
-            
-            angle = math.degrees(math.atan2(abs(dy), abs(dx)))
-            
-            if angle <= angle_tol:  # Horizontal
-                y_avg = (y1 + y2) / 2.0
-                h_lines.append({'type': 'H', 'coord': float(y_avg), 
-                                'start': float(min(x1, x2)), 'end': float(max(x1, x2))})
-            elif angle >= 90 - angle_tol:  # Vertical
-                x_avg = (x1 + x2) / 2.0
-                v_lines.append({'type': 'V', 'coord': float(x_avg),
-                                'start': float(min(y1, y2)), 'end': float(max(y1, y2))})
-    
-    return h_lines + v_lines
-
-def extract_hv_edges_combined(rectilinear_contours, cleaned_mask, 
-                              min_segment_len=30, direction_tol=20,
-                              hough_min_len=40, hough_max_gap=20, angle_tol=5):
-    """
-    PRIMARY REPLACEMENT for extract_hv_edges in process.py.
-    
-    Combines contour traversal (primary) with HoughLinesP (fallback).
-    Hough edges are only added if they don't overlap with contour edges.
-    """
-    edges_contour = extract_hv_edges_v2(rectilinear_contours, min_segment_len, direction_tol)
-    edges_hough = extract_hv_edges_hough(cleaned_mask, hough_min_len, hough_max_gap, angle_tol)
-    
-    all_edges = list(edges_contour)
-    
-    for h in edges_hough:
-        covered = False
-        for e in edges_contour:
-            if e['type'] != h['type']:
-                continue
-            coord_diff = abs(e['coord'] - h['coord'])
-            overlap = min(e['end'], h['end']) - max(e['start'], h['start'])
-            span_e = e['end'] - e['start']
-            span_h = h['end'] - h['start']
-            
-            if coord_diff < 25 and overlap > 0.5 * min(span_e, span_h):
-                covered = True
-                break
-        
-        if not covered:
-            all_edges.append(h)
-    
-    return all_edges
-# ════════════════════════════════════════════════════════════════════════════
-# STEPS 10-14 — DEDUP, SNAP, ALIGN, FILTER, MERGE
-# ════════════════════════════════════════════════════════════════════════════
-
-def dedup_parallel_segments(segments, tol=60, slack=80):
-    """Union-Find clustering of duplicate parallel segments."""
-    h_segs = [s.copy() for s in segments if s['type'] == 'H']
-    v_segs = [s.copy() for s in segments if s['type'] == 'V']
-
-    def cluster(segs_list):
-        if not segs_list: return []
-        n = len(segs_list)
-        parent = list(range(n))
-        def find(a):
-            while parent[a] != a:
-                parent[a] = parent[parent[a]]
-                a = parent[a]
-            return a
-        def union(a, b):
-            ra, rb = find(a), find(b)
-            if ra != rb: parent[ra] = rb
-        for i, j in combinations(range(n), 2):
-            if abs(segs_list[i]['coord'] - segs_list[j]['coord']) <= tol:
-                overlap = min(segs_list[i]['end'], segs_list[j]['end']) - max(segs_list[i]['start'], segs_list[j]['start'])
-                if overlap > -slack:
-                    union(i, j)
-        groups = defaultdict(list)
-        for i in range(n): groups[find(i)].append(i)
-        return [{'type': segs_list[0]['type'],
-                 'coord': float(np.median([segs_list[i]['coord'] for i in g])),
-                 'start': float(min(segs_list[i]['start'] for i in g)),
-                 'end': float(max(segs_list[i]['end'] for i in g))} for g in groups.values()]
-
-    return cluster(h_segs) + cluster(v_segs)
-
-def snap_segment_corners(segments, tol=100):
-    """Extend/trim H and V segments to meet at exact intersections."""
-    h_segs = [s.copy() for s in segments if s['type'] == 'H']
-    v_segs = [s.copy() for s in segments if s['type'] == 'V']
-    if not h_segs or not v_segs: return segments
-
-    h_ends = [(hi, 'start', s['start'], s['coord']) for hi, s in enumerate(h_segs)] + \
-             [(hi, 'end', s['end'], s['coord']) for hi, s in enumerate(h_segs)]
-    v_ends = [(vi, 'start', s['coord'], s['start']) for vi, s in enumerate(v_segs)] + \
-             [(vi, 'end', s['coord'], s['end']) for vi, s in enumerate(v_segs)]
-
-    pairs = []
-    for he in h_ends:
-        for ve in v_ends:
-            d = math.hypot(he[2]-ve[2], he[3]-ve[3])
-            if d <= tol: pairs.append((d, he, ve))
-    pairs.sort(key=lambda t: t[0])
-
-    used_h, used_v = set(), set()
-    for d, he, ve in pairs:
-        hk, vk = (he[0], he[1]), (ve[0], ve[1])
-        if hk in used_h or vk in used_v: continue
-        used_h.add(hk); used_v.add(vk)
-        h_segs[he[0]][he[1]] = ve[2]
-        v_segs[ve[0]][ve[1]] = he[3]
-
-    for s in h_segs + v_segs:
-        if s['start'] > s['end']: s['start'], s['end'] = s['end'], s['start']
-    return h_segs + v_segs
-
-def find_intersections(segments):
-    """Find all H-V intersection points."""
-    h_segs = [s for s in segments if s['type'] == 'H']
-    v_segs = [s for s in segments if s['type'] == 'V']
-    pts = []
-    for hs in h_segs:
-        for vs in v_segs:
-            ix, iy = vs['coord'], hs['coord']
-            if hs['start']-10 <= ix <= hs['end']+10 and vs['start']-10 <= iy <= vs['end']+10:
-                pts.append((float(ix), float(iy)))
-    unique = []
-    for p in pts:
-        if not any(math.hypot(p[0]-u[0], p[1]-u[1]) < 15 for u in unique):
-            unique.append(p)
-    return unique
-
-def align_points_symmetrically(points, tol=40):
-    """Align intersection points to be level and symmetrical via clustering."""
-    if not points: return []
-    pts = np.array(points)
-    x_vals = sorted(pts[:, 0])
-    y_vals = sorted(pts[:, 1])
-
-    def cluster(vals):
-        if not vals: return []
-        groups = [[vals[0]]]
-        for v in vals[1:]:
-            if v - groups[-1][-1] <= tol: groups[-1].append(v)
-            else: groups.append([v])
-        return [np.median(g) for g in groups]
-
-    x_groups = cluster(x_vals)
-    y_groups = cluster(y_vals)
-
-    def nearest(val, groups):
-        return min(groups, key=lambda g: abs(g - val))
-
-    aligned = [(nearest(p[0], x_groups), nearest(p[1], y_groups)) for p in pts]
-    unique = []
-    for p in aligned:
-        if not any(math.hypot(p[0]-u[0], p[1]-u[1]) < 10 for u in unique):
-            unique.append(p)
-    return unique
-
-def remove_unconnected_segments(segments, intersections, tol=30):
-    """Remove segments whose endpoints don't connect to any intersection."""
-    result = []
-    for s in segments:
-        if s['type'] == 'H':
-            y, x1, x2 = s['coord'], s['start'], s['end']
-            c1 = any(abs(p[0]-x1)<tol and abs(p[1]-y)<tol for p in intersections)
-            c2 = any(abs(p[0]-x2)<tol and abs(p[1]-y)<tol for p in intersections)
-            if c1 or c2: result.append(s)
-        else:
-            x, y1, y2 = s['coord'], s['start'], s['end']
-            c1 = any(abs(p[0]-x)<tol and abs(p[1]-y1)<tol for p in intersections)
-            c2 = any(abs(p[0]-x)<tol and abs(p[1]-y2)<tol for p in intersections)
-            if c1 or c2: result.append(s)
-    return result
-
-def merge_final_parallel(segments, tol=25):
-    """Final merge: keep only one line per unique physical edge."""
-    return dedup_parallel_segments(segments, tol=tol, slack=50)
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# STEP 15 — CLEAN DXF EXPORT (CIRCLE + 2-point LWPOLYLINE per segment)
-# ════════════════════════════════════════════════════════════════════════════
-
-# =========================================================
-# MAIN FUNCTION (YOUR ORIGINAL API + CAD KERNEL v5)
-# =========================================================
-
-def build_clean_dxf(circles, segments, img_w, img_h, out_path, HAS_DXF=True):
-
-    # ----------------------------
-    # entity accounting (unchanged)
-    # ----------------------------
-    entity_count = len(circles) + len(segments)
-
-    # =====================================================
-    # 0. SAFETY FALLBACK
-    # =====================================================
-    if not HAS_DXF:
-        return None, entity_count, 0
-
-    # =====================================================
-    # 1. BUILD RAW GEOMETRY (CAD KERNEL INPUT LAYER)
-    # =====================================================
-    edges = _build_edges(segments)
-
-    # =====================================================
-    # 2. TOPOLOGY NORMALIZATION (snap + orthogonal fix)
-    # =====================================================
-    edges = _snap(edges, tol=0.5)
-    edges = _manhattanize(edges, tol=0.5)
-
-    # =====================================================
-    # 3. GLOBAL TOPOLOGY CLEAN (v5 kernel core)
-    # =====================================================
-    edges = _merge(edges)
-
-    # =====================================================
-    # 4. ARC / CIRCLE RECONSTRUCTION (improves input circles)
-    # =====================================================
-    circles = _refine_circles(circles, edges)
-
-    # =====================================================
-    # 5. GAP HEALING (H/V only safe closure)
-    # =====================================================
-    edges = _heal_gaps(edges, tol=5.0)
-
-    # =====================================================
-    # 6. FINAL CONSISTENCY PASS
-    # =====================================================
-    edges = _final_cleanup(edges)
-
-    # =====================================================
-    # 7. DXF EXPORT (your original exporter upgraded)
-    # =====================================================
-    doc = ezdxf.new(dxfversion="R2018")
-
-    doc.header["$INSUNITS"] = 4  # mm
-    doc.header["$EXTMIN"] = (0.0, 0.0, 0.0)
-    doc.header["$EXTMAX"] = (float(img_w), float(img_h), 0.0)
-    doc.header["$LIMMIN"] = (0.0, 0.0)
-    doc.header["$LIMMAX"] = (float(img_w), float(img_h))
-
-    msp = doc.modelspace()
-
-    # layers
-    doc.layers.new("CIRCLES", dxfattribs={"color": 1})
-    doc.layers.new("H_LINES", dxfattribs={"color": 5})
-    doc.layers.new("V_LINES", dxfattribs={"color": 6})
-    doc.layers.new("REPAIRED", dxfattribs={"color": 3})
-
-    # =====================================================
-    # 8. EXPORT CIRCLES
-    # =====================================================
-    for c in circles:
-        msp.add_circle(
-            (c["cx"], c["cy"]),
-            c["r"],
-            dxfattribs={"layer": "CIRCLES"}
-        )
-
-    # =====================================================
-    # 9. EXPORT HEALED SEGMENTS
-    # =====================================================
-    for e in edges:
-
-        coords = list(e.coords)
-
-        x1, y1 = coords[0]
-        x2, y2 = coords[-1]
-
-        if abs(y1 - y2) < 1e-6:
-            layer = "H_LINES"
-        else:
-            layer = "V_LINES"
-
-        msp.add_lwpolyline(
-            list(e.coords),
-            dxfattribs={"layer": layer}
-        )
-
-    # =====================================================
-    # 10. SAVE OUTPUT
-    # =====================================================
-    out_path = Path(out_path)
-    doc.saveas(str(out_path))
-
-    file_size = out_path.stat().st_size
-
-    return doc, entity_count, file_size
-
-
-# =========================================================
-# CAD KERNEL v5 INTERNAL PIPELINE FUNCTIONS
-# =========================================================
-
-def _build_edges(segments):
-    edges = []
-
-    for s in segments:
-
-        if s["type"] == "H":
-            p1 = (s["start"], s["coord"])
-            p2 = (s["end"], s["coord"])
-        else:
-            p1 = (s["coord"], s["start"])
-            p2 = (s["coord"], s["end"])
-
-        edges.append(LineString([p1, p2]))
-
-    return edges
-
-
-def _snap(edges, tol):
-    merged = unary_union(edges)
-    snapped = snap(merged, merged, tol)
-
-    if isinstance(snapped, LineString):
-        return [snapped]
-
-    return list(snapped.geoms)
-
-
-def _manhattanize(edges, tol):
-
-    fixed = []
-
-    for e in edges:
-        coords = list(e.coords)
-
-        x1, y1 = coords[0]
-        x2, y2 = coords[-1]
-
-        if abs(y2 - y1) < tol:
-            y2 = y1
-
-        if abs(x2 - x1) < tol:
-            x2 = x1
-
-        fixed.append(LineString([(x1, y1), (x2, y2)]))
-
-    return fixed
-
-
-def _merge(edges):
-    merged = linemerge(unary_union(edges))
-
-    if isinstance(merged, LineString):
-        return [merged]
-
-    return list(merged.geoms)
-
-
-# =========================================================
-# CIRCLE REFINEMENT (v5 upgrade)
-# =========================================================
-
-def _refine_circles(circles, edges):
-
-    """
-    Improves circle accuracy using edge proximity correction.
-    """
-
-    refined = []
-
-    for c in circles:
-
-        cx, cy, r = c["cx"], c["cy"], c["r"]
-
-        # optional: snap circle center to nearest edge midpoint
-        best = None
-        best_d = 1e9
-
-        for e in edges:
-
-            mx, my = e.interpolate(0.5, normalized=True).coords[0]
-
-            d = (mx - cx) ** 2 + (my - cy) ** 2
-
-            if d < best_d:
-                best_d = d
-                best = (mx, my)
-
-        if best and best_d < 25:  # tolerance threshold
-            cx, cy = best
-
-        refined.append({
-            "cx": cx,
-            "cy": cy,
-            "r": r
-        })
-
-    return refined
-
-
-# =========================================================
-# GAP HEALING (SAFE H/V ONLY)
-# =========================================================
-
-def _heal_gaps(edges, tol):
-
-    repaired = []
-
-    endpoints = []
-
-    for e in edges:
-        endpoints.append(e.coords[0])
-        endpoints.append(e.coords[-1])
-
-    used = set()
-
-    for i, a in enumerate(endpoints):
-
-        if i in used:
-            continue
-
-        for j, b in enumerate(endpoints):
-
-            if i == j or j in used:
-                continue
-
-            dx = abs(a[0] - b[0])
-            dy = abs(a[1] - b[1])
-
-            if (dx < tol and dy < 0.001) or (dy < tol and dx < 0.001):
-                repaired.append(LineString([a, b]))
-                used.add(i)
-                used.add(j)
-
-    return edges + repaired
-
-
-# =========================================================
-# FINAL CLEANUP
-# =========================================================
-
-def _final_cleanup(edges):
-    merged = linemerge(unary_union(edges))
-
-    if isinstance(merged, LineString):
-        return [merged]
-
-    return list(merged.geoms)
-
-    doc.saveas(str(out_path))
-    file_size = out_path.stat().st_size
-    return doc, entity_count, file_size
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# STEP 16 — PNG PREVIEW (side-by-side comparison with yellow dots)
-# ════════════════════════════════════════════════════════════════════════════
-
-def build_comparison_png(edges, circles, segments, intersections, img_w, img_h, out_path):
-    if not HAS_CV or not np: return False
-
-    try:
-        left = np.zeros((img_h, img_w, 3), dtype=np.uint8)
-        left[:] = (15, 12, 10)
-        left[edges > 0] = (255, 255, 255)
-
-        right = np.zeros((img_h, img_w, 3), dtype=np.uint8)
-        right[:] = (15, 12, 10)
-
-        # Draw circles in blue (NO yellow dots on circles)
-        for c in circles:
-            cx, cy, r = int(round(c['cx'])), int(round(c['cy'])), int(round(c['r']))
-            cv2.circle(right, (cx, cy), r, (220, 80, 80), 2, cv2.LINE_AA)
-
-        # Draw H/V segments in green
-        for s in segments:
-            if s['type'] == 'H':
-                y = int(round(s['coord']))
-                x1 = int(round(s['start']))
-                x2 = int(round(s['end']))
-                cv2.line(right, (x1, y), (x2, y), (80, 200, 80), 2, cv2.LINE_AA)
-            else:
-                x = int(round(s['coord']))
-                y1 = int(round(s['start']))
-                y2 = int(round(s['end']))
-                cv2.line(right, (x, y1), (x, y2), (80, 200, 80), 2, cv2.LINE_AA)
-
-        # Draw YELLOW DOTS at intersections (direction changes ONLY)
-        for p in intersections:
-            px, py = int(round(p[0])), int(round(p[1]))
-            cv2.circle(right, (px, py), 7, (0, 255, 255), -1)   # Yellow fill
-            cv2.circle(right, (px, py), 9, (255, 128, 0), 2)     # Orange outline
-
-        sep = np.full((img_h, 4, 3), 40, dtype=np.uint8)
-        panel = np.concatenate([left, sep, right], axis=1)
-
-        ok = cv2.imwrite(str(out_path), panel)
-        return bool(ok and out_path.exists())
-    except Exception as e:
-        sys.stderr.write(f"PNG preview error: {e}\n")
-        return False
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# STEP 17 — PDF EXPORT
-# ════════════════════════════════════════════════════════════════════════════
-
-def export_pdf(edges, out_path, orig_bgr=None):
-    if not HAS_RL: return False
-
-    import tempfile, os as _os
-    from reportlab.lib.pagesizes import A4, landscape
-    from reportlab.pdfgen import canvas as rl_canvas
-    from reportlab.lib.utils import ImageReader
-
-    try:
-        page_w, page_h = landscape(A4)
-        c = rl_canvas.Canvas(str(out_path), pagesize=(page_w, page_h))
-
-        margin = 30
-        col_w = (page_w - margin * 3) / 2
-        col_h = page_h - margin * 2 - 40
-
-        c.setFillColorRGB(0.04, 0.05, 0.06)
-        c.rect(0, page_h - 36, page_w, 36, fill=1, stroke=0)
-        c.setFillColorRGB(0.9, 0.91, 0.93)
-        c.setFont("Helvetica-Bold", 13)
-        c.drawString(margin, page_h - 24, "SheetForge — Algebraic LS + Contour H/V Fitting Preview")
-        c.setFont("Helvetica", 9)
-        c.setFillColorRGB(0.5, 0.55, 0.6)
-        from datetime import datetime, timezone
-        c.drawRightString(page_w - margin, page_h - 24,
-                          f"Generated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC")
-
-        def _arr_to_reader(arr):
-            tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-            tmp.close()
-            cv2.imwrite(tmp.name, arr)
-            return ImageReader(tmp.name), tmp.name
-
-        tmp_files = []
-
-        left_x = margin
-        if orig_bgr is not None:
-            reader, tname = _arr_to_reader(orig_bgr)
-            tmp_files.append(tname)
-            _draw_panel(c, reader, left_x, margin, col_w, col_h, "Original Image")
-        else:
-            c.setFillColorRGB(0.08, 0.1, 0.13)
-            c.roundRect(left_x, margin, col_w, col_h, 6, fill=1, stroke=0)
-
-        right_x = margin * 2 + col_w
-        edges_bgr = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
-        reader, tname = _arr_to_reader(edges_bgr)
-        tmp_files.append(tname)
-        _draw_panel(c, reader, right_x, margin, col_w, col_h, "Canny Edge Detection")
-
-        c.setFillColorRGB(0.3, 0.35, 0.4)
-        c.setFont("Helvetica", 8)
-        c.drawCentredString(page_w / 2, 12,
-                            "SheetForge v13  •  HoughCircles + Hierarchy Ring Merge + Circle-Priority  •  Clean DXF")
-        c.save()
-
-        for f in tmp_files:
-            try: _os.unlink(f)
-            except Exception: pass
-
-        return True
-    except Exception as e:
-        sys.stderr.write(f"PDF export error: {e}\n{traceback.format_exc()}\n")
-        return False
-
-def _draw_panel(c, img_reader, x, y, w, h, title):
-    title_h = 22
-    img_h = h - title_h
-    c.setFillColorRGB(0.08, 0.1, 0.13)
-    c.roundRect(x, y, w, h, 6, fill=1, stroke=0)
-    c.setFillColorRGB(0.12, 0.15, 0.2)
-    c.roundRect(x, y + img_h, w, title_h, 6, fill=1, stroke=0)
-    c.setFillColorRGB(0.55, 0.65, 0.85)
-    c.setFont("Helvetica-Bold", 9)
-    c.drawCentredString(x + w / 2, y + img_h + 7, title)
-    pad = 8
-    c.drawImage(img_reader, x + pad, y + title_h + pad,
-                width=w - pad * 2, height=img_h - pad * 2,
-                preserveAspectRatio=True, anchor="c", mask="auto")
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# MAIN
-# ════════════════════════════════════════════════════════════════════════════
-
-def main():
-    image_path = sys.argv[1] if len(sys.argv) > 1 else None
-    opts = {}
-    if len(sys.argv) > 2:
-        try: opts = json.loads(sys.argv[2])
-        except Exception: pass
-
-    blur_ksize = int(opts.get("blurKsize", 7))
-    canny_low = int(opts.get("cannyLow", 20))
-    canny_high = int(opts.get("cannyHigh", 80))
-    min_blob_area = int(opts.get("minBlobArea", 20))
-    dedup_tol = float(opts.get("dedupTol", 60.0))
-    dedup_slack = float(opts.get("dedupSlack", 80.0))
-    corner_snap_tol = float(opts.get("cornerSnapTol", 100.0))
-    align_tol = float(opts.get("alignTol", 40.0))
-    filter_tol = float(opts.get("filterTol", 30.0))
-    final_merge_tol = float(opts.get("finalMergeTol", 25.0))
-
-    steps = []
-
-    # ── STEP 1: Load ──────────────────────────────────────────────────────
-    t0 = now_ms()
-    bgr, gray, dpi, img_w, img_h = load_image(image_path)
-    steps.append(step_record("CV-1: Load Image", f"{img_w}×{img_h}px  DPI={dpi:.0f}", t0))
-
-    # ── STEP 2: Median Blur ───────────────────────────────────────────────
-    t0 = now_ms()
-    blurred = median_blur(gray, ksize=blur_ksize)
-    steps.append(step_record(f"CV-2: Median Blur (ksize={blur_ksize})", "Noise reduced", t0))
-
-    # ── STEP 3: Adaptive Threshold ───────────────────────────────────────
-    t0 = now_ms()
-    binary = adaptive_threshold_binarize(blurred)
-    white_px = int(np.count_nonzero(binary))
-    steps.append(step_record("CV-3: Adaptive Threshold", f"{white_px} white px", t0))
-
-    # ── STEP 4: Morph Open + Close ───────────────────────────────────────
-    t0 = now_ms()
-    opened = morph_clean(binary)
-    opened_px = int(np.count_nonzero(opened))
-    steps.append(step_record("CV-4: MORPH_OPEN + MORPH_CLOSE",
-                              f"{white_px - opened_px} net px change", t0))
-
-    # ── STEP 5: Connected-Component Filter ─────────────────────────────────
-    t0 = now_ms()
-    cleaned, removed_blobs, removed_px = remove_small_blobs(opened, min_blob_area, aggressive=True)
-    steps.append(step_record(
-        f"CV-5: Connected-Component Filter (minBlobArea={min_blob_area}px)",
-        f"{removed_blobs} speckle blob(s) removed ({removed_px}px)", t0))
-
-    # ── STEP 6: Canny (visualisation only) ────────────────────────────────
-    t0 = now_ms()
-    edges_raw = canny_edges(cleaned, canny_low, canny_high)
-    edges, edge_dot_blobs, edge_dot_px = clean_edge_preview(edges_raw, min_blob_area=3)
-    edge_px = int(np.count_nonzero(edges))
-    steps.append(step_record(f"CV-6: Canny + dot cleanup",
-                              f"{edge_px} edge px, {edge_dot_blobs} stray dot(s) removed", t0))
-
-    # ── STEP 7: Contour Extraction + Circle Detection (Algebraic LS) ───────
-    t0 = now_ms()
-    circles, rectilinear = detect_circles_and_rectilinear(cleaned)
-    steps.append(step_record(
-        "LS-7: Contour Extraction + Algebraic Circle Detection (Kasa LS)",
-        f"{len(circles)} circle(s), {len(rectilinear)} rectilinear contour(s)", t0))
-
-    # ── STEP 8: H/V Edge Extraction ───────────────────────────────────────
-    t0 = now_ms()
-    segments = extract_hv_edges_combined(rectilinear, cleaned)
-    steps.append(step_record("GEO-8: H/V Edge Extraction (algebraic median on boundary)",
-                              f"{len(segments)} raw edges", t0))
-
-    # ── STEP 9: Parallel Deduplication ────────────────────────────────────
-    t0 = now_ms()
-    segments = dedup_parallel_segments(segments, tol=dedup_tol, slack=dedup_slack)
-    steps.append(step_record("GEO-9: Parallel Deduplication (Union-Find + median)",
-                              f"{len(segments)} segments after dedup", t0))
-
-    # ── STEP 10: Corner Snapping ────────────────────────────────────────────
-    t0 = now_ms()
-    segments = snap_segment_corners(segments, tol=corner_snap_tol)
-    steps.append(step_record("GEO-10: Corner Snapping (extend/trim to intersect)",
-                              "Segments snapped to exact intersections", t0))
-
-    # ── STEP 11: Find Intersections ───────────────────────────────────────
-    t0 = now_ms()
-    intersections = find_intersections(segments)
-    steps.append(step_record("GEO-11: Intersection Detection",
-                              f"{len(intersections)} H-V intersection points", t0))
-
-    # ── STEP 12: Symmetric Alignment ───────────────────────────────────────
-    t0 = now_ms()
-    intersections = align_points_symmetrically(intersections, tol=align_tol)
-    steps.append(step_record("GEO-12: Symmetric Alignment (cluster + median)",
-                              f"{len(intersections)} aligned points", t0))
-
-    # ── STEP 13: Remove Unconnected ─────────────────────────────────────────
-    t0 = now_ms()
-    segments = remove_unconnected_segments(segments, intersections, tol=filter_tol)
-    steps.append(step_record("GEO-13: Unconnected Segment Filter",
-                              f"{len(segments)} connected segments", t0))
-
-    # ── STEP 14: Final Parallel Merge ──────────────────────────────────────
-    t0 = now_ms()
-    segments = merge_final_parallel(segments, tol=final_merge_tol)
-    steps.append(step_record("GEO-14: Final Parallel Merge (one line per edge)",
-                              f"{len(segments)} final segments", t0))
-
-    # ── STEP 15: Recalculate intersections after final merge ──────────────
-    t0 = now_ms()
-    intersections = find_intersections(segments)
-    intersections = align_points_symmetrically(intersections, tol=align_tol)
-    steps.append(step_record("GEO-15: Final Intersection Recalculation",
-                              f"{len(intersections)} final corners (yellow dots)", t0))
-
-    # ── Output dir ────────────────────────────────────────────────────────
-    server_out_dir = Path(__file__).parent / "uploads" / "output"
-    server_out_dir.mkdir(parents=True, exist_ok=True)
-
-    ts_str = int(time.time())
-    dxf_name = f"design_{ts_str}.dxf"
-    pdf_name = f"design_{ts_str}.pdf"
-    png_name = f"preview_{ts_str}.png"
-
-    dxf_path = server_out_dir / dxf_name
-    pdf_path = server_out_dir / pdf_name
-    png_path = server_out_dir / png_name
-
-    # ── STEP 16: DXF Export ───────────────────────────────────────────────
-    t0 = now_ms()
-    _, entity_count, dxf_size = build_clean_dxf(circles, segments, img_w, img_h, dxf_path)
-
-    dxf_content_str = ""
-    if dxf_size and dxf_size > 0:
-        try:
-            with open(dxf_path, encoding="utf-8", errors="replace") as f:
-                dxf_content_str = f.read(200_000)
-        except Exception:
-            pass
-
-    steps.append(step_record(
-        "DXF-16: Clean export (CIRCLE + 2-point LWPOLYLINE, true position)",
-        f"{entity_count} entities  |  {dxf_size // 1024 if dxf_size else 0} KB", t0))
-
-    # ── STEP 17: PNG Preview ──────────────────────────────────────────────
-    t0 = now_ms()
-    png_ok = build_comparison_png(edges, circles, segments, intersections, img_w, img_h, png_path)
-    png_size = png_path.stat().st_size if png_ok and png_path.exists() else 0
-    steps.append(step_record(
-        "PNG-17: Side-by-side preview (Canny vs final shapes + yellow dots)",
-        f"{png_size // 1024 if png_size else 0} KB" if png_ok else "FAILED", t0))
-
-    # ── STEP 18: PDF Export ───────────────────────────────────────────────
-    t0 = now_ms()
-    pdf_ok = export_pdf(edges, pdf_path, orig_bgr=bgr)
-    steps.append(step_record("PDF-18: Export edge preview", "OK" if pdf_ok else "FAILED", t0))
-
-    # ── Analysis summary ──────────────────────────────────────────────────
-    n_h = sum(1 for s in segments if s['type'] == 'H')
-    n_v = sum(1 for s in segments if s['type'] == 'V')
-    analysis = {
-        "width": float(img_w),
-        "height": float(img_h),
-        "dpi": dpi,
-        "edgePixels": edge_px,
-        "edges": entity_count,
-        "circlesDetected": len(circles),
-        "segmentsDetected": len(segments),
-        "horizontalSegments": n_h,
-        "verticalSegments": n_v,
-        "intersections": len(intersections),
-        "speckleBlobsRemoved": removed_blobs,
-        "blurKsize": blur_ksize,
-        "cannyLow": canny_low,
-        "cannyHigh": canny_high,
-        "minBlobArea": min_blob_area,
-        "coordSystem": "origin=top-left px, Y-down, no approxPolyDP, algebraic LS fitting",
-        "shapeSummary": (
-            f"{len(circles)} circle(s), {n_h} horizontal + {n_v} vertical segments, "
-            f"{len(intersections)} corner intersections (yellow dots) — "
-            f"contour-based H/V extraction, Union-Find dedup, corner snap, symmetric align"
-        ),
-    }
-
-    # Include segment and intersection data for verification
-    result_data = {
-        "steps": steps,
-        "analysis": analysis,
-        "circles": circles,
-        "segments": segments,
-        "intersections": intersections,
-        "dwg": {
-            "entities": entity_count,
-            "fileSize": dxf_size or 0,
-            "filename": dxf_name if dxf_size else "",
-            "dxfAbsPath": str(dxf_path) if dxf_size else "",
-            "pdfFilename": pdf_name if pdf_ok else "",
-            "edgePngFilename": png_name if png_ok else "",
-            "edgePngPath": str(png_path) if png_ok else "",
-            "gcodeFiles": {},
-            "gcodeFilePaths": {},
-        },
-        "dxfContent": dxf_content_str,
-        "dxfAvailable": bool(dxf_size and dxf_size > 0),
-        "pdfAvailable": pdf_ok,
-        "pngAvailable": png_ok,
-        "gcodeAvailable": False,
-    }
-
-    print(json.dumps(result_data, ensure_ascii=False))
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print(json.dumps({
-            "error": str(e),
-            "traceback": traceback.format_exc(),
-            "steps": [],
-            "analysis": {},
-            "dwg": {"entities": 0, "fileSize": 0},
-            "dxfContent": "",
-        }))
-        sys.exit(1)
+AG='fileSize'
+AF='entities'
+AE='dxfContent'
+AD='analysis'
+AC='Helvetica-Bold'
+w='contour_idx'
+v=1.
+u='source'
+q=isinstance
+t=sum
+p=sorted
+m='bbox'
+l=set
+j='V'
+i='pts'
+h='rms'
+g=enumerate
+e=''
+d=any
+b=.0
+a='H'
+Z=min
+Y=str
+X=list
+W=Exception
+V=False
+U=True
+T=max
+S='cy'
+R='cx'
+Q='r'
+P='type'
+O=abs
+M=round
+K=range
+J='coord'
+H=None
+G='end'
+F=int
+E='start'
+D=len
+A=float
+import sys as c,os,json as n,time as r,traceback as s,math as I
+from pathlib import Path as x
+from itertools import combinations as AH
+from collections import defaultdict as A4
+from shapely.geometry import LineString as f
+from shapely.ops import unary_union as o,snap,linemerge as y
+def k(fn):
+	try:return fn()
+	except W:return
+C=k(lambda:__import__('cv2'))
+B=k(lambda:__import__('numpy'))
+z=k(lambda:__import__('ezdxf'))
+A0=k(lambda:__import__('PIL.Image',fromlist=['Image']))
+AI=k(lambda:__import__('reportlab'))
+A1=C is not H and B is not H
+Ak=z is not H
+AJ=A0 is not H
+AK=AI is not H
+def L():return F(r.time()*1000)
+def N(name,details,t0):return{'name':name,'status':'done','duration':L()-t0,'details':details}
+def AL(image_path):
+	B=image_path
+	if not A1:raise RuntimeError('OpenCV (cv2) is not installed.')
+	if not B or not os.path.exists(B):raise FileNotFoundError(f"Image not found: {B}")
+	D=C.imread(Y(B),C.IMREAD_COLOR)
+	if D is H or D.size==0:raise ValueError(f"cv2.imread returned None for: {B}")
+	F=96.
+	if AJ:
+		try:G=A0.open(Y(B));E=G.info.get('dpi',(96,96));F=A(E[0])if E and E[0]>1 else 96.
+		except W:pass
+	I=C.cvtColor(D,C.COLOR_BGR2GRAY);J,K=D.shape[:2];return D,I,F,K,J
+def AM(gray,ksize=5):
+	A=ksize
+	if A%2==0:A+=1
+	return C.medianBlur(gray,A)
+def AN(blurred):return C.adaptiveThreshold(blurred,255,C.ADAPTIVE_THRESH_GAUSSIAN_C,C.THRESH_BINARY_INV,blockSize=15,C=4)
+def AO(binary):A=C.getStructuringElement(C.MORPH_CROSS,(3,3));B=C.getStructuringElement(C.MORPH_ELLIPSE,(3,3));D=C.morphologyEx(binary,C.MORPH_OPEN,A,iterations=1);E=C.morphologyEx(D,C.MORPH_CLOSE,B,iterations=1);return E
+def A2(binary,min_area):
+	A=binary;J,L,M,N=C.connectedComponentsWithStats(A,connectivity=8);D=B.zeros_like(A);E=0;G=0
+	for H in K(1,J):
+		I=F(M[H,C.CC_STAT_AREA])
+		if I>=min_area:D[L==H]=255
+		else:E+=I;G+=1
+	return D,G,E
+def A3(binary,min_area,aggressive=U):
+	B=min_area;A,D,E=A2(binary,B)
+	if aggressive:
+		G=C.getStructuringElement(C.MORPH_ELLIPSE,(3,3));H=C.morphologyEx(A,C.MORPH_OPEN,G,iterations=1);I,F,J=A2(H,B)
+		if F>0:A=I;D+=F;E+=J
+	return A,D,E
+def AP(cleaned,low_threshold=20,high_threshold=80):return C.Canny(cleaned,low_threshold,high_threshold)
+def AQ(edges,min_blob_area=3):A,B,C=A3(edges,min_blob_area);return A,B,C
+def A5(pts_xy):E=pts_xy;A,F=E[:,0].copy(),E[:,1].copy();L=B.column_stack([A,F,B.ones(D(A))]);M=A**2+F**2;C,G,G,G=B.linalg.lstsq(L,M,rcond=H);J=C[0]/2.;K=C[1]/2.;N=I.sqrt(O(C[2]+J**2+K**2));return J,K,N
+def AR(cleaned_mask):
+	J=C.GaussianBlur(cleaned_mask,(9,9),2);K,L=J.shape;D=I.hypot(L,K);M=C.HoughCircles(J,C.HOUGH_GRADIENT,dp=1.5,minDist=T(40,F(D*.06)),param1=120,param2=65,minRadius=T(20,F(D*.01)),maxRadius=F(D*.3));N=[]
+	if M is not H:
+		for(E,G,B)in M[0]:
+			if E-B<-B*.5 or G-B<-B*.5:continue
+			if E+B>L+B*.5 or G+B>K+B*.5:continue
+			N.append({R:A(E),S:A(G),Q:A(B),h:b,u:'hough'})
+	return N
+def Al(cleaned_mask,cx,cy,r):
+	E=cleaned_mask;H=36;D,G=[],[]
+	for O in K(H):
+		J=2*I.pi*O/H;P,Q=I.cos(J),I.sin(J)
+		for C in K(F(r*.5),F(r*1.8)):
+			L=F(M(cx+P*C));N=F(M(cy+Q*C))
+			if 0<=N<E.shape[0]and 0<=L<E.shape[1]:
+				if E[N,L]>0:
+					if not D or C-D[-1]>3:D.append(C)
+					G.append(C)
+	if not G:return 3.
+	return T(3.,A(B.median(G)-B.median(D))/2.)
+def A6(pool):
+	C=pool
+	if not C:return[]
+	C=p(C,key=lambda c:c[h]);H=[V]*D(C);M=[]
+	for J in K(D(C)):
+		if H[J]:continue
+		E=C[J];F=[E];H[J]=U
+		for L in K(J+1,D(C)):
+			if H[L]:continue
+			G=C[L];N=I.hypot(E[R]-G[R],E[S]-G[S]);P=O(E[Q]-G[Q])/T(E[Q],G[Q],1e-09)
+			if N<60 and P<.4:F.append(G);H[L]=U
+		M.append({R:A(B.mean([A[R]for A in F])),S:A(B.mean([A[S]for A in F])),Q:A(B.mean([A[Q]for A in F])),h:A(Z(A[h]for A in F))})
+	return M
+def A7(p1,p2,p3,p4):
+	A,B=p1;E,F=p2;C,D=p3;I,J=p4;G=(A-E)*(D-J)-(B-F)*(C-I)
+	if O(G)<1e-09:return
+	H=((A-C)*(D-J)-(B-D)*(C-I))/G;K=-((A-E)*(B-D)-(B-F)*(A-C))/G
+	if 0<=H<=1 and 0<=K<=1:L=A+H*(E-A);M=B+H*(F-B);return L,M
+def AS(edges,img_w,img_h,max_extend=2000):
+	q='inf';l='dir';a=max_extend;O=edges
+	if not O:return O
+	C=[]
+	for r in O:
+		M=r[i]
+		if D(M)<2:C.append(H);continue
+		e=A(M[0,0]),A(M[0,1]);f=A(M[-1,0]),A(M[-1,1]);n=f[0]-e[0];o=f[1]-e[1];b=I.hypot(n,o)
+		if b<1e-09:C.append(H);continue
+		S,T=n/b,o/b;C.append({E:e,G:f,l:(S,T),'length':b,i:M})
+	s=5.
+	def t(i,which_i,j,which_j):
+		if C[i]is H or C[j]is H:return V
+		A=C[i][E]if which_i==E else C[i][G];B=C[j][E]if which_j==E else C[j][G];return I.hypot(A[0]-B[0],A[1]-B[1])<s
+	P=D(O);g={E:[V]*P,G:[V]*P}
+	for F in K(P):
+		for L in K(P):
+			if F==L:continue
+			for p in[E,G]:
+				for u in[E,G]:
+					if t(F,p,L,u):g[p][F]=U
+	c=[]
+	for F in K(P):
+		if C[F]is H:c.append(O[F]);continue
+		J=C[F];M=J[i].copy();W=H;X=H
+		if not g[E][F]:
+			S,T=J[l];h=J[E][0]-S*a;j=J[E][1]-T*a;k=h,j;Q=H;Y=A(q)
+			for L in K(P):
+				if F==L or C[L]is H:continue
+				N=A7(J[E],k,C[L][E],C[L][G])
+				if N is not H:
+					R=I.hypot(N[0]-J[E][0],N[1]-J[E][1])
+					if R<Y and R>v:Y=R;Q=N
+			if Q is not H:W=Q
+		if not g[G][F]:
+			S,T=J[l];h=J[G][0]+S*a;j=J[G][1]+T*a;k=h,j;Q=H;Y=A(q)
+			for L in K(P):
+				if F==L or C[L]is H:continue
+				N=A7(J[G],k,C[L][E],C[L][G])
+				if N is not H:
+					R=I.hypot(N[0]-J[G][0],N[1]-J[G][1])
+					if R<Y and R>v:Y=R;Q=N
+			if Q is not H:X=Q
+		Z=[]
+		if W is not H:Z.append([W[0],W[1]])
+		for d in K(D(M)):
+			if d==0 and W is not H:continue
+			if d==D(M)-1 and X is not H:continue
+			Z.append([A(M[d,0]),A(M[d,1])])
+		if X is not H:Z.append([X[0],X[1]])
+		if D(Z)>=2:c.append({i:B.array(Z,dtype=B.float32),m:O[F].get(m,H),w:O[F].get(w,-1)})
+		else:c.append(O[F])
+	return c
+def AT(cleaned_mask):
+	a=cleaned_mask;AQ=AR(a);j,A7=C.findContours(a,C.RETR_TREE,C.CHAIN_APPROX_NONE);x=X(AQ);A8=[];y=l()
+	if A7 is not H and D(j)>0:
+		A9=A7[0];AA=A4(X)
+		for AB in K(D(A9)):
+			AC=A9[AB][3]
+			if AC>=0:AA[AC].append(AB)
+		def AD(pts):
+			C=pts
+			if D(C)<20:return
+			C=C.astype(B.float32);F,G=C[:,0],C[:,1];H=A(F.max()-F.min());I=A(G.max()-G.min())
+			if H<10 or I<10:return
+			M=Z(H,I)/T(H,I)
+			if M<.45:return
+			try:
+				J,K,E=A5(C);N=B.sqrt((F-J)**2+(G-K)**2);O=B.sqrt(((N-E)**2).mean());L=O/(E+1e-09)
+				if L<.14 and 8<E<800:return{R:A(J),S:A(K),Q:A(E),h:A(L),u:'kasa'}
+			except W:pass
+		O=l()
+		for G in K(D(j)):
+			if G in O:continue
+			k=j[G]
+			if D(k)<10:O.add(G);continue
+			z=AA.get(G,[]);A0=k.reshape(-1,2)
+			for c in z:A0=B.vstack([A0,j[c].reshape(-1,2)])
+			e=AD(A0)
+			if e is not H:
+				x.append(e);y.add(G)
+				for c in z:y.add(c)
+				O.add(G)
+				for c in z:O.add(c)
+				continue
+			e=AD(k.reshape(-1,2))
+			if e is not H:x.append(e);y.add(G);O.add(G);continue
+			n=k.reshape(-1,2).astype(B.float32);o,p=n[:,0],n[:,1];AT=A(o.max()-o.min());AU=A(p.max()-p.min())
+			if AT>=10 and AU>=10 and D(n)>=20:A8.append({i:n,m:(A(o.min()),A(p.min()),A(o.max()),A(p.max())),w:G})
+			O.add(G)
+	q=A6(x);P,Y=a.shape;Ae=I.hypot(Y,P);AV=Z(Y,P)*.12;AE=[]
+	for E in q:
+		f,g,J=E[R],E[S],E[Q]
+		if f<0 or f>Y or g<0 or g>P:continue
+		if J<15 or J>AV:continue
+		r=T(8,J*.12);L=72;N=[]
+		for AW in K(L):
+			AF=2*I.pi*AW/L
+			for AG in K(F(-r),F(r)+1,2):
+				A1=F(M(f+I.cos(AF)*(J+AG)));A2=F(M(g+I.sin(AF)*(J+AG)))
+				if 0<=A2<P and 0<=A1<Y:
+					if a[A2,A1]>0:N.append([A(A1),A(A2)])
+		AX=t(1 for A in K(L)if d(0<=F(M(g+I.sin(2*I.pi*A/L)*(J+B)))<P and 0<=F(M(f+I.cos(2*I.pi*A/L)*(J+B)))<Y and a[F(M(g+I.sin(2*I.pi*A/L)*(J+B))),F(M(f+I.cos(2*I.pi*A/L)*(J+B)))]>0 for B in K(F(-r),F(r)+1,2)))
+		if AX<L*.6:continue
+		if D(N)<20:continue
+		N=B.array(N,dtype=B.float32)
+		try:
+			AH,AI,A3=A5(N);AY=B.sqrt((N[:,0]-AH)**2+(N[:,1]-AI)**2);AJ=B.sqrt(((AY-A3)**2).mean())/(A3+1e-09)
+			if AJ>.12:continue
+			E={R:A(AH),S:A(AI),Q:A(A3),h:A(AJ),u:'hough_verified'}
+		except W:pass
+		AE.append(E)
+	q=A6(AE)
+	def AZ(bbox,cx,cy,r):
+		A,B,C,D=bbox;I,J,K,L=cx-r,cy-r,cx+r,cy+r;E,F=T(A,I),T(B,J);G,H=Z(C,K),Z(D,L)
+		if G<=E or H<=F:return b
+		M=(G-E)*(H-F);N=T((C-A)*(D-B),v);return M/N
+	def Aa(px,py,cx,cy,r,margin=1.3):return I.hypot(px-cx,py-cy)<r*margin
+	s=[]
+	for AK in A8:
+		AL,AM,AN,AO=AK[m];Ab=(AL+AN)/2.;Ac=(AM+AO)/2.;AP=V
+		for E in q:
+			if Aa(Ab,Ac,E[R],E[S],E[Q],margin=1.25):
+				Ad=AZ((AL,AM,AN,AO),E[R],E[S],E[Q])
+				if Ad>.45:AP=U;break
+		if not AP:s.append(AK)
+	s=AS(s,Y,P);return q,s
+def AU(rectilinear_contours):
+	F=[]
+	for d in rectilinear_contours:
+		C=d[i];H,I=C[:,0],C[:,1];X,Y=A(H.min()),A(H.max());b,c=A(I.min()),A(I.max());K=T(15,Z(Y-X,c-b)*.15);e=I<=b+K;L=C[e]
+		if D(L)>2:Q=A(B.median(L[:,1]));R=A(B.min(L[:,0]));S=A(B.max(L[:,0]));F.append({P:a,J:Q,E:R,G:S})
+		f=I>=c-K;M=C[f]
+		if D(M)>2:Q=A(B.median(M[:,1]));R=A(B.min(M[:,0]));S=A(B.max(M[:,0]));F.append({P:a,J:Q,E:R,G:S})
+		g=H<=X+K;N=C[g]
+		if D(N)>2:U=A(B.median(N[:,0]));V=A(B.min(N[:,1]));W=A(B.max(N[:,1]));F.append({P:j,J:U,E:V,G:W})
+		h=H>=Y-K;O=C[h]
+		if D(O)>2:U=A(B.median(O[:,0]));V=A(B.min(O[:,1]));W=A(B.max(O[:,1]));F.append({P:j,J:U,E:V,G:W})
+	return F
+def A8(segments,tol=60,slack=80):
+	C=segments;H=[A.copy()for A in C if A[P]==a];I=[A.copy()for A in C if A[P]==j]
+	def F(segs_list):
+		C=segs_list
+		if not C:return[]
+		L=D(C);H=X(K(L))
+		def M(a):
+			while H[a]!=a:H[a]=H[H[a]];a=H[a]
+			return a
+		def Q(a,b):
+			A,B=M(a),M(b)
+			if A!=B:H[A]=B
+		for(F,I)in AH(K(L),2):
+			if O(C[F][J]-C[I][J])<=tol:
+				R=Z(C[F][G],C[I][G])-T(C[F][E],C[I][E])
+				if R>-slack:Q(F,I)
+		N=A4(X)
+		for F in K(L):N[M(F)].append(F)
+		return[{P:C[0][P],J:A(B.median([C[A][J]for A in D])),E:A(Z(C[A][E]for A in D)),G:A(T(C[A][G]for A in D))}for D in N.values()]
+	return F(H)+F(I)
+def AV(segments,tol=100):
+	H=segments;C=[A.copy()for A in H if A[P]==a];D=[A.copy()for A in H if A[P]==j]
+	if not C or not D:return H
+	R=[(B,E,A[E],A[J])for(B,A)in g(C)]+[(B,G,A[G],A[J])for(B,A)in g(C)];S=[(B,E,A[J],A[E])for(B,A)in g(D)]+[(B,G,A[J],A[G])for(B,A)in g(D)];K=[]
+	for A in R:
+		for B in S:
+			L=I.hypot(A[2]-B[2],A[3]-B[3])
+			if L<=tol:K.append((L,A,B))
+	K.sort(key=lambda t:t[0]);M,N=l(),l()
+	for(L,A,B)in K:
+		O,Q=(A[0],A[1]),(B[0],B[1])
+		if O in M or Q in N:continue
+		M.add(O);N.add(Q);C[A[0]][A[1]]=B[2];D[B[0]][B[1]]=A[3]
+	for F in C+D:
+		if F[E]>F[G]:F[E],F[G]=F[G],F[E]
+	return C+D
+def A9(segments):
+	H=segments;N=[A for A in H if A[P]==a];O=[A for A in H if A[P]==j];K=[]
+	for B in N:
+		for C in O:
+			L,M=C[J],B[J]
+			if B[E]-10<=L<=B[G]+10 and C[E]-10<=M<=C[G]+10:K.append((A(L),A(M)))
+	D=[]
+	for F in K:
+		if not d(I.hypot(F[0]-A[0],F[1]-A[1])<15 for A in D):D.append(F)
+	return D
+def AA(points,tol=40):
+	E=points
+	if not E:return[]
+	A=B.array(E);H=p(A[:,0]);J=p(A[:,1])
+	def F(vals):
+		C=vals
+		if not C:return[]
+		A=[[C[0]]]
+		for D in C[1:]:
+			if D-A[-1][-1]<=tol:A[-1].append(D)
+			else:A.append([D])
+		return[B.median(A)for A in A]
+	K=F(H);L=F(J)
+	def G(val,groups):return Z(groups,key=lambda g:O(g-val))
+	M=[(G(A[0],K),G(A[1],L))for A in A];C=[]
+	for D in M:
+		if not d(I.hypot(D[0]-A[0],D[1]-A[1])<10 for A in C):C.append(D)
+	return C
+def AW(segments,intersections,tol=30):
+	C=intersections;B=tol;D=[]
+	for A in segments:
+		if A[P]==a:
+			I,L,M=A[J],A[E],A[G];F=d(O(A[0]-L)<B and O(A[1]-I)<B for A in C);H=d(O(A[0]-M)<B and O(A[1]-I)<B for A in C)
+			if F or H:D.append(A)
+		else:
+			K,N,Q=A[J],A[E],A[G];F=d(O(A[0]-K)<B and O(A[1]-N)<B for A in C);H=d(O(A[0]-K)<B and O(A[1]-Q)<B for A in C)
+			if F or H:D.append(A)
+	return D
+def AX(segments,tol=25):return A8(segments,tol=tol,slack=50)
+def AY(circles,segments,img_w,img_h,out_path,HAS_DXF=U):
+	a='layer';Z='V_LINES';W='H_LINES';V='CIRCLES';L=img_h;K=img_w;J=segments;G='color';F=out_path;E=circles;M=D(E)+D(J)
+	if not HAS_DXF:return H,M,0
+	B=AZ(J);B=Aa(B,tol=.5);B=Ab(B,tol=.5);B=Ac(B);E=Ad(E,B);B=Ae(B,tol=5.);B=Af(B);C=z.new(dxfversion='R2018');C.header['$INSUNITS']=4;C.header['$EXTMIN']=b,b,b;C.header['$EXTMAX']=A(K),A(L),b;C.header['$LIMMIN']=b,b;C.header['$LIMMAX']=A(K),A(L);N=C.modelspace();C.layers.new(V,dxfattribs={G:1});C.layers.new(W,dxfattribs={G:5});C.layers.new(Z,dxfattribs={G:6});C.layers.new('REPAIRED',dxfattribs={G:3})
+	for I in E:N.add_circle((I[R],I[S]),I[Q],dxfattribs={a:V})
+	for P in B:
+		T=X(P.coords);f,c=T[0];g,d=T[-1]
+		if O(c-d)<1e-06:U=W
+		else:U=Z
+		N.add_lwpolyline(X(P.coords),dxfattribs={a:U})
+	F=x(F);C.saveas(Y(F));e=F.stat().st_size;return C,M,e
+def AZ(segments):
+	B=[]
+	for A in segments:
+		if A[P]==a:C=A[E],A[J];D=A[G],A[J]
+		else:C=A[J],A[E];D=A[J],A[G]
+		B.append(f([C,D]))
+	return B
+def Aa(edges,tol):
+	B=o(edges);A=snap(B,B,tol)
+	if q(A,f):return[A]
+	return X(A.geoms)
+def Ab(edges,tol):
+	E=[]
+	for G in edges:
+		F=X(G.coords);A,B=F[0];C,D=F[-1]
+		if O(D-B)<tol:D=B
+		if O(C-A)<tol:C=A
+		E.append(f([(A,B),(C,D)]))
+	return E
+def Ac(edges):
+	A=y(o(edges))
+	if q(A,f):return[A]
+	return X(A.geoms)
+def Ad(circles,edges):
+	F=[]
+	for A in circles:
+		B,C,K=A[R],A[S],A[Q];D=H;E=1e9
+		for L in edges:
+			G,I=L.interpolate(.5,normalized=U).coords[0];J=(G-B)**2+(I-C)**2
+			if J<E:E=J;D=G,I
+		if D and E<25:B,C=D
+		F.append({R:B,S:C,Q:K})
+	return F
+def Ae(edges,tol):
+	G=edges;H=[];A=[]
+	for I in G:A.append(I.coords[0]);A.append(I.coords[-1])
+	B=l()
+	for(C,D)in g(A):
+		if C in B:continue
+		for(E,F)in g(A):
+			if C==E or E in B:continue
+			J=O(D[0]-F[0]);K=O(D[1]-F[1])
+			if J<tol and K<.001 or K<tol and J<.001:H.append(f([D,F]));B.add(C);B.add(E)
+	return G+H
+def Af(edges):
+	A=y(o(edges))
+	if q(A,f):return[A]
+	return X(A.geoms);doc.saveas(Y(out_path));B=out_path.stat().st_size;return doc,entity_count,B
+def Ag(edges,circles,segments,intersections,img_w,img_h,out_path):
+	N=out_path;L=img_w;H=img_h
+	if not A1 or not B:return V
+	try:
+		I=B.zeros((H,L,3),dtype=B.uint8);I[:]=15,12,10;I[edges>0]=255,255,255;A=B.zeros((H,L,3),dtype=B.uint8);A[:]=15,12,10
+		for K in circles:b,d,e=F(M(K[R])),F(M(K[S])),F(M(K[Q]));C.circle(A,(b,d),e,(220,80,80),2,C.LINE_AA)
+		for D in segments:
+			if D[P]==a:O=F(M(D[J]));f=F(M(D[E]));g=F(M(D[G]));C.line(A,(f,O),(g,O),(80,200,80),2,C.LINE_AA)
+			else:T=F(M(D[J]));h=F(M(D[E]));i=F(M(D[G]));C.line(A,(T,h),(T,i),(80,200,80),2,C.LINE_AA)
+		for U in intersections:X,Z=F(M(U[0])),F(M(U[1]));C.circle(A,(X,Z),7,(0,255,255),-1);C.circle(A,(X,Z),9,(255,128,0),2)
+		j=B.full((H,4,3),40,dtype=B.uint8);k=B.concatenate([I,j,A],axis=1);l=C.imwrite(Y(N),k);return bool(l and N.exists())
+	except W as m:c.stderr.write(f"PNG preview error: {m}\n");return V
+def Ah(edges,out_path,orig_bgr=H):
+	O='Helvetica';L=orig_bgr
+	if not AK:return V
+	import tempfile as P,os as Q;from reportlab.lib.pagesizes import A4,landscape as R;from reportlab.pdfgen import canvas as S;from reportlab.lib.utils import ImageReader as T
+	try:
+		D,E=R(A4);A=S.Canvas(Y(out_path),pagesize=(D,E));B=30;F=(D-B*3)/2;G=E-B*2-40;A.setFillColorRGB(.04,.05,.06);A.rect(0,E-36,D,36,fill=1,stroke=0);A.setFillColorRGB(.9,.91,.93);A.setFont(AC,13);A.drawString(B,E-24,'SheetForge — Algebraic LS + Contour H/V Fitting Preview');A.setFont(O,9);A.setFillColorRGB(.5,.55,.6);from datetime import datetime as X,timezone as Z;A.drawRightString(D-B,E-24,f"Generated {X.now(Z.utc).strftime("%Y-%m-%d %H:%M")} UTC")
+		def M(arr):A=P.NamedTemporaryFile(suffix='.png',delete=V);A.close();C.imwrite(A.name,arr);return T(A.name),A.name
+		I=[];N=B
+		if L is not H:J,K=M(L);I.append(K);AB(A,J,N,B,F,G,'Original Image')
+		else:A.setFillColorRGB(.08,.1,.13);A.roundRect(N,B,F,G,6,fill=1,stroke=0)
+		a=B*2+F;b=C.cvtColor(edges,C.COLOR_GRAY2BGR);J,K=M(b);I.append(K);AB(A,J,a,B,F,G,'Canny Edge Detection');A.setFillColorRGB(.3,.35,.4);A.setFont(O,8);A.drawCentredString(D/2,12,'SheetForge v13  •  HoughCircles + Hierarchy Ring Merge + Circle-Priority  •  Clean DXF');A.save()
+		for d in I:
+			try:Q.unlink(d)
+			except W:pass
+		return U
+	except W as e:c.stderr.write(f"PDF export error: {e}\n{s.format_exc()}\n");return V
+def AB(c,img_reader,x,y,w,h,title):B=22;C=h-B;c.setFillColorRGB(.08,.1,.13);c.roundRect(x,y,w,h,6,fill=1,stroke=0);c.setFillColorRGB(.12,.15,.2);c.roundRect(x,y+C,w,B,6,fill=1,stroke=0);c.setFillColorRGB(.55,.65,.85);c.setFont(AC,9);c.drawCentredString(x+w/2,y+C+7,title);A=8;c.drawImage(img_reader,x+A,y+B+A,width=w-A*2,height=C-A*2,preserveAspectRatio=U,anchor='c',mask='auto')
+def Ai():
+	AI='intersections';AH='FAILED';AC='minBlobArea';AB='cannyHigh';A7='cannyLow';A6='blurKsize';AJ=c.argv[1]if D(c.argv)>1 else H;J={}
+	if D(c.argv)>2:
+		try:J=n.loads(c.argv[2])
+		except W:pass
+	X=F(J.get(A6,7));i=F(J.get(A7,20));k=F(J.get(AB,80));Z=F(J.get(AC,20));AK=A(J.get('dedupTol',6e1));AR=A(J.get('dedupSlack',8e1));AS=A(J.get('cornerSnapTol',1e2));l=A(J.get('alignTol',4e1));AZ=A(J.get('filterTol',3e1));Aa=A(J.get('finalMergeTol',25.));G=[];C=L();Ab,Ac,m,Q,R=AL(AJ);G.append(N('CV-1: Load Image',f"{Q}×{R}px  DPI={m:.0f}",C));C=L();Ad=AM(Ac,ksize=X);G.append(N(f"CV-2: Median Blur (ksize={X})",'Noise reduced',C));C=L();o=AN(Ad);p=F(B.count_nonzero(o));G.append(N('CV-3: Adaptive Threshold',f"{p} white px",C));C=L();q=AO(o);Ae=F(B.count_nonzero(q));G.append(N('CV-4: MORPH_OPEN + MORPH_CLOSE',f"{p-Ae} net px change",C));C=L();s,u,Af=A3(q,Z,aggressive=U);G.append(N(f"CV-5: Connected-Component Filter (minBlobArea={Z}px)",f"{u} speckle blob(s) removed ({Af}px)",C));C=L();Ai=AP(s,i,k);b,Aj,Ao=AQ(Ai,min_blob_area=3);v=F(B.count_nonzero(b));G.append(N(f"CV-6: Canny + dot cleanup",f"{v} edge px, {Aj} stray dot(s) removed",C));C=L();M,w=AT(s);G.append(N('LS-7: Contour Extraction + Algebraic Circle Detection (Kasa LS)',f"{D(M)} circle(s), {D(w)} rectilinear contour(s)",C));C=L();E=AU(w);G.append(N('GEO-8: H/V Edge Extraction (algebraic median on boundary)',f"{D(E)} raw edges",C));C=L();E=A8(E,tol=AK,slack=AR);G.append(N('GEO-9: Parallel Deduplication (Union-Find + median)',f"{D(E)} segments after dedup",C));C=L();E=AV(E,tol=AS);G.append(N('GEO-10: Corner Snapping (extend/trim to intersect)','Segments snapped to exact intersections',C));C=L();I=A9(E);G.append(N('GEO-11: Intersection Detection',f"{D(I)} H-V intersection points",C));C=L();I=AA(I,tol=l);G.append(N('GEO-12: Symmetric Alignment (cluster + median)',f"{D(I)} aligned points",C));C=L();E=AW(E,I,tol=AZ);G.append(N('GEO-13: Unconnected Segment Filter',f"{D(E)} connected segments",C));C=L();E=AX(E,tol=Aa);G.append(N('GEO-14: Final Parallel Merge (one line per edge)',f"{D(E)} final segments",C));C=L();I=A9(E);I=AA(I,tol=l);G.append(N('GEO-15: Final Intersection Recalculation',f"{D(I)} final corners (yellow dots)",C));S=x(__file__).parent/'uploads'/'output';S.mkdir(parents=U,exist_ok=U);d=F(r.time());y=f"design_{d}.dxf";z=f"design_{d}.pdf";A0=f"preview_{d}.png";f=S/y;Ak=S/z;T=S/A0;C=L();_,g,K=AY(M,E,Q,R,f);A1=e
+	if K and K>0:
+		try:
+			with open(f,encoding='utf-8',errors='replace')as Al:A1=Al.read(200000)
+		except W:pass
+	G.append(N('DXF-16: Clean export (CIRCLE + 2-point LWPOLYLINE, true position)',f"{g} entities  |  {K//1024 if K else 0} KB",C));C=L();O=Ag(b,M,E,I,Q,R,T);A2=T.stat().st_size if O and T.exists()else 0;G.append(N('PNG-17: Side-by-side preview (Canny vs final shapes + yellow dots)',f"{A2//1024 if A2 else 0} KB"if O else AH,C));C=L();h=Ah(b,Ak,orig_bgr=Ab);G.append(N('PDF-18: Export edge preview','OK'if h else AH,C));A4=t(1 for A in E if A[P]==a);A5=t(1 for A in E if A[P]==j);Am={'width':A(Q),'height':A(R),'dpi':m,'edgePixels':v,'edges':g,'circlesDetected':D(M),'segmentsDetected':D(E),'horizontalSegments':A4,'verticalSegments':A5,AI:D(I),'speckleBlobsRemoved':u,A6:X,A7:i,AB:k,AC:Z,'coordSystem':'origin=top-left px, Y-down, no approxPolyDP, algebraic LS fitting','shapeSummary':f"{D(M)} circle(s), {A4} horizontal + {A5} vertical segments, {D(I)} corner intersections (yellow dots) — contour-based H/V extraction, Union-Find dedup, corner snap, symmetric align"};An={'steps':G,AD:Am,'circles':M,'segments':E,AI:I,'dwg':{AF:g,AG:K or 0,'filename':y if K else e,'dxfAbsPath':Y(f)if K else e,'pdfFilename':z if h else e,'edgePngFilename':A0 if O else e,'edgePngPath':Y(T)if O else e,'gcodeFiles':{},'gcodeFilePaths':{}},AE:A1,'dxfAvailable':bool(K and K>0),'pdfAvailable':h,'pngAvailable':O,'gcodeAvailable':V};print(n.dumps(An,ensure_ascii=V))
+if __name__=='__main__':
+	try:Ai()
+	except W as Aj:print(n.dumps({'error':Y(Aj),'traceback':s.format_exc(),'steps':[],AD:{},'dwg':{AF:0,AG:0},AE:e}));c.exit(1)
